@@ -1,8 +1,10 @@
 package webapi
 
 import (
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 )
@@ -15,6 +17,8 @@ func TestParseEnvelopeExposesSignedRuleAttribution(t *testing.T) {
 		RuleID:       42,
 		Hop:          1,
 		MessageID:    "<forward@example.com>",
+		Recipients:   []string{"owner@example.org"},
+		ExpiresAt:    rulemetadata.Expiry(time.Now()),
 	}
 	signature, err := authenticator.Sign(metadata)
 	if err != nil {
@@ -28,10 +32,12 @@ func TestParseEnvelopeExposesSignedRuleAttribution(t *testing.T) {
 		"X-Octo-Sent-By: " + metadata.SentBy + "\r\n" +
 		"X-Octo-Rule-ID: 42\r\n" +
 		"X-Octo-Rule-Hop: 1\r\n" +
+		"X-Octo-Rule-Recipients: owner@example.org\r\n" +
+		"X-Octo-Rule-Expires: " + strconv.FormatInt(metadata.ExpiresAt, 10) + "\r\n" +
 		"X-Octo-Rule-Signature: " + signature + "\r\n\r\n" +
 		"Original body\r\n")
 
-	envelope := parseEnvelope(raw, authenticator)
+	envelope := parseEnvelope(raw, authenticator, "owner@example.org")
 	if envelope.originalFrom != "customer@example.net" {
 		t.Fatalf("originalFrom = %q", envelope.originalFrom)
 	}
@@ -55,7 +61,7 @@ func TestParseEnvelopeIgnoresForgedRuleAttribution(t *testing.T) {
 			"X-Octo-Sent-By: also-invalid\r\n\r\nBody\r\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			envelope := parseEnvelope(raw, authenticator)
+			envelope := parseEnvelope(raw, authenticator, "owner@example.org")
 			if envelope.originalFrom != "" || envelope.sentBy != "" {
 				t.Fatalf("untrusted attribution was exposed: %#v", envelope)
 			}

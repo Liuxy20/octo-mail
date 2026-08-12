@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
@@ -39,7 +40,7 @@ func (s *Server) getAutoReplyContext(ctx context.Context, a authCtx, r *http.Req
 	if err != nil {
 		return 0, nil, err
 	}
-	chainContext := s.AutoReplyChain.Verify(raw)
+	chainContext := s.AutoReplyChain.Verify(raw, a.login, time.Now())
 	s.logInvalidAutoReplyChain(ctx, a, r.PathValue("id"), chainContext)
 	count := 0
 	if chainContext.Verification == autoreplychain.VerificationValid {
@@ -85,11 +86,11 @@ func (s *Server) logInvalidAutoReplyChain(ctx context.Context, a authCtx, emailI
 		"account_id", a.acc.ID(), "email_id", emailID)
 }
 
-func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID string, sourceRaw []byte, outgoingMessageID string) (autoreplychain.Metadata, error) {
+func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID string, sourceRaw []byte, outgoingMessageID, outgoingRecipient string) (autoreplychain.Metadata, error) {
 	if s.AutoReplyChain == nil {
 		return autoreplychain.Metadata{}, nil
 	}
-	metadata, chainContext, err := s.AutoReplyChain.Next(sourceRaw, outgoingMessageID)
+	metadata, chainContext, err := s.AutoReplyChain.Next(sourceRaw, outgoingMessageID, a.login, outgoingRecipient, time.Now())
 	s.logInvalidAutoReplyChain(ctx, a, emailID, chainContext)
 	if errors.Is(err, autoreplychain.ErrLimitReached) || errors.Is(err, autoreplychain.ErrExternalAutomatedReply) {
 		if s.Log != nil {

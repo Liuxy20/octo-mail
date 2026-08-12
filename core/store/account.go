@@ -282,6 +282,7 @@ type DraftSendClaim struct {
 // so version validation and the no-side-effect decision are serialized across
 // all nodes.
 type DraftSendClaimTx interface {
+	FindDraftSendClaim(emailID int64) (claim DraftSendClaim, found bool, err error)
 	ClaimDraftSend(emailID int64, draftVersion int, contentDigest []byte) (claim DraftSendClaim, claimed bool, err error)
 }
 

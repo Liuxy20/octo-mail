@@ -2,11 +2,27 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/jackc/pgx/v5"
 )
+
+func (pt *pgTx) FindDraftSendClaim(emailID int64) (store.DraftSendClaim, bool, error) {
+	claim, err := scanDraftSendClaim(pt.tx.QueryRow(pt.ctx,
+		`SELECT email_id,draft_version,content_digest,status,COALESCE(message_id,0),
+		        submission_ids,created_at,updated_at
+		 FROM draft_send_claims WHERE account_id=$1 AND email_id=$2`,
+		pt.acc.id, emailID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.DraftSendClaim{}, false, nil
+	}
+	if err != nil {
+		return store.DraftSendClaim{}, false, fmt.Errorf("read Draft send claim: %w", err)
+	}
+	return claim, true, nil
+}
 
 func (pt *pgTx) ClaimDraftSend(emailID int64, draftVersion int, contentDigest []byte) (store.DraftSendClaim, bool, error) {
 	command, err := pt.tx.Exec(pt.ctx,
@@ -16,13 +32,12 @@ func (pt *pgTx) ClaimDraftSend(emailID int64, draftVersion int, contentDigest []
 	if err != nil {
 		return store.DraftSendClaim{}, false, fmt.Errorf("claim Draft send: %w", err)
 	}
-	claim, err := scanDraftSendClaim(pt.tx.QueryRow(pt.ctx,
-		`SELECT email_id,draft_version,content_digest,status,COALESCE(message_id,0),
-		        submission_ids,created_at,updated_at
-		 FROM draft_send_claims WHERE account_id=$1 AND email_id=$2`,
-		pt.acc.id, emailID))
+	claim, found, err := pt.FindDraftSendClaim(emailID)
 	if err != nil {
-		return store.DraftSendClaim{}, false, fmt.Errorf("read Draft send claim: %w", err)
+		return store.DraftSendClaim{}, false, err
+	}
+	if !found {
+		return store.DraftSendClaim{}, false, fmt.Errorf("read Draft send claim: inserted claim not found")
 	}
 	return claim, command.RowsAffected() == 1, nil
 }

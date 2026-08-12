@@ -96,7 +96,7 @@ func (s *Server) updateAgentMailboxAutomation(ctx context.Context, a authCtx, r 
 	if err != nil {
 		return 0, nil, err
 	}
-	if err := dir.SetAgentOutboundMode(ctx, a.principal.ID, mailboxID, mode); err != nil {
+	if err := dir.SetAgentOutboundMode(ctx, a.principal.ID, mailboxID, a.spaceID, mode); err != nil {
 		switch {
 		case errors.Is(err, directory.ErrMailboxNotFound):
 			return 0, nil, errStatus(http.StatusForbidden, "mailbox_not_owned", "mailbox is not owned by the current user")

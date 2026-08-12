@@ -201,16 +201,16 @@ func (d *Directory) ExchangeAgentAuthorization(ctx context.Context, deviceCode, 
 	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless committed
 
 	var (
-		status, challenge, botID, botProfile, clientName string
-		ownerPrincipalID, accountID                      *int64
-		expires                                          time.Time
-		outboundMode                                     string
+		status, challenge, botID, botProfile, clientName, spaceID string
+		ownerPrincipalID, accountID                               *int64
+		expires                                                   time.Time
+		outboundMode                                              string
 	)
 	err = tx.QueryRow(ctx,
-		`SELECT status,code_challenge,bot_id,bot_profile,client_name,
+		`SELECT status,code_challenge,bot_id,bot_profile,client_name,space_id,
 		        owner_principal_id,account_id,expires_at,outbound_mode
 		 FROM agent_auth_requests WHERE device_hash=$1 FOR UPDATE`, deviceHash[:]).
-		Scan(&status, &challenge, &botID, &botProfile, &clientName, &ownerPrincipalID, &accountID, &expires, &outboundMode)
+		Scan(&status, &challenge, &botID, &botProfile, &clientName, &spaceID, &ownerPrincipalID, &accountID, &expires, &outboundMode)
 	if err == pgx.ErrNoRows {
 		return directory.AgentAuthorizationCredential{}, directory.ErrAuthorizationNotFound
 	}
@@ -231,7 +231,7 @@ func (d *Directory) ExchangeAgentAuthorization(ctx context.Context, deviceCode, 
 	case "exchanged":
 		return directory.AgentAuthorizationCredential{}, directory.ErrAuthorizationUsed
 	case "approved":
-		if ownerPrincipalID == nil || accountID == nil {
+		if ownerPrincipalID == nil || accountID == nil || strings.TrimSpace(spaceID) == "" {
 			return directory.AgentAuthorizationCredential{}, fmt.Errorf("approved authorization has no mailbox")
 		}
 	default:
@@ -274,9 +274,9 @@ func (d *Directory) ExchangeAgentAuthorization(ctx context.Context, deviceCode, 
 	var bindingID int64
 	err = tx.QueryRow(ctx,
 		`INSERT INTO agent_bindings
-		 (tenant_id,account_id,owner_principal_id,bot_id,bot_profile,client_name,outbound_mode,auto_reply_enabled)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,($7='automatic_send')) RETURNING id`,
-		tenantID, *accountID, *ownerPrincipalID, botID, botProfile, clientName, outboundMode).Scan(&bindingID)
+		 (tenant_id,account_id,owner_principal_id,space_id,bot_id,bot_profile,client_name,outbound_mode,auto_reply_enabled)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,($8='automatic_send')) RETURNING id`,
+		tenantID, *accountID, *ownerPrincipalID, spaceID, botID, botProfile, clientName, outboundMode).Scan(&bindingID)
 	if err != nil {
 		return directory.AgentAuthorizationCredential{}, err
 	}
@@ -315,7 +315,11 @@ func (d *Directory) ExchangeAgentAuthorization(ctx context.Context, deviceCode, 
 	}, nil
 }
 
-func (d *Directory) RevokeAgentBinding(ctx context.Context, ownerPrincipalID, accountID int64) error {
+func (d *Directory) RevokeAgentBinding(ctx context.Context, ownerPrincipalID, accountID int64, spaceID string) error {
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return directory.ErrAuthorizationSpaceMismatch
+	}
 	tx, err := d.s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -333,21 +337,27 @@ func (d *Directory) RevokeAgentBinding(ctx context.Context, ownerPrincipalID, ac
 	if _, err := tx.Exec(ctx,
 		`UPDATE agent_binding_credentials SET revoked_at=now()
 		 WHERE revoked_at IS NULL AND binding_id IN (
-		   SELECT id FROM agent_bindings WHERE account_id=$1 AND status='active'
-		 )`, accountID); err != nil {
+		   SELECT id FROM agent_bindings
+		   WHERE account_id=$1 AND owner_principal_id=$2 AND space_id=$3 AND status='active'
+		 )`, accountID, ownerPrincipalID, spaceID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE agent_bindings SET status='revoked',revoked_at=now()
-		 WHERE account_id=$1 AND status='active'`, accountID); err != nil {
+		 WHERE account_id=$1 AND owner_principal_id=$2 AND space_id=$3 AND status='active'`,
+		accountID, ownerPrincipalID, spaceID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-func (d *Directory) SetAgentOutboundMode(ctx context.Context, ownerPrincipalID, accountID int64, mode directory.AgentOutboundMode) error {
+func (d *Directory) SetAgentOutboundMode(ctx context.Context, ownerPrincipalID, accountID int64, spaceID string, mode directory.AgentOutboundMode) error {
 	if ownerPrincipalID <= 0 || accountID <= 0 {
 		return directory.ErrMailboxNotFound
+	}
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return directory.ErrAuthorizationSpaceMismatch
 	}
 	if !mode.Valid() {
 		return fmt.Errorf("invalid Agent outbound mode %q", mode)
@@ -371,9 +381,9 @@ func (d *Directory) SetAgentOutboundMode(ctx context.Context, ownerPrincipalID, 
 	}
 	command, err := tx.Exec(ctx,
 		`UPDATE agent_bindings
-		 SET outbound_mode=$3,auto_reply_enabled=($3='automatic_send')
-		 WHERE account_id=$1 AND owner_principal_id=$2 AND status='active'`,
-		accountID, ownerPrincipalID, string(mode))
+		 SET outbound_mode=$4,auto_reply_enabled=($4='automatic_send')
+		 WHERE account_id=$1 AND owner_principal_id=$2 AND space_id=$3 AND status='active'`,
+		accountID, ownerPrincipalID, spaceID, string(mode))
 	if err != nil {
 		return err
 	}
@@ -400,7 +410,20 @@ func (d *Directory) AuthenticateAgentCredential(ctx context.Context, token strin
 		 JOIN agent_bindings b ON b.id=c.binding_id AND b.status='active'
 		 JOIN accounts acc ON acc.id=b.account_id AND acc.tenant_id=b.tenant_id AND NOT acc.disabled
 		 JOIN principals p ON p.id=acc.principal_id AND p.tenant_id=acc.tenant_id
-		 WHERE c.key_prefix=$1 AND c.revoked_at IS NULL`, prefix).
+		 WHERE c.key_prefix=$1 AND c.revoked_at IS NULL AND b.space_id <> ''
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM agent_mailbox_registrations registration
+		       WHERE registration.account_id=b.account_id AND registration.tenant_id=b.tenant_id
+		         AND registration.owner_principal_id=b.owner_principal_id
+		         AND registration.space_id=b.space_id
+		     ) OR EXISTS (
+		       SELECT 1 FROM gateway_identities gateway
+		       WHERE gateway.default_account_id=b.account_id AND gateway.tenant_id=b.tenant_id
+		         AND gateway.owner_principal_id=b.owner_principal_id
+		         AND gateway.space_id=b.space_id AND NOT gateway.disabled
+		     )
+		   )`, prefix).
 		Scan(&credentialID, &bindingID, &tenantID, &accountID, &principalID, &login, &credJSON)
 	if err == pgx.ErrNoRows {
 		auth.VerifyAPIKeyDummy(secret)
@@ -432,7 +455,20 @@ func (d *Directory) AgentAutomationAllowed(ctx context.Context, credentialID int
 		`SELECT b.outbound_mode
 		 FROM agent_binding_credentials c
 		 JOIN agent_bindings b ON b.id=c.binding_id AND b.status='active'
-		 WHERE c.id=$1 AND c.revoked_at IS NULL`, credentialID).
+		 WHERE c.id=$1 AND c.revoked_at IS NULL AND b.space_id <> ''
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM agent_mailbox_registrations registration
+		       WHERE registration.account_id=b.account_id AND registration.tenant_id=b.tenant_id
+		         AND registration.owner_principal_id=b.owner_principal_id
+		         AND registration.space_id=b.space_id
+		     ) OR EXISTS (
+		       SELECT 1 FROM gateway_identities gateway
+		       WHERE gateway.default_account_id=b.account_id AND gateway.tenant_id=b.tenant_id
+		         AND gateway.owner_principal_id=b.owner_principal_id
+		         AND gateway.space_id=b.space_id AND NOT gateway.disabled
+		     )
+		   )`, credentialID).
 		Scan(&outboundMode)
 	if err == pgx.ErrNoRows {
 		return false, nil

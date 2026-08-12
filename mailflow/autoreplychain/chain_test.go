@@ -5,7 +5,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+const testRecipient = "bot@octo.test"
+
+var testNow = time.Unix(1_800_000_000, 0)
 
 func TestSignedReplyChain(t *testing.T) {
 	chain := mustChain(t, 4)
@@ -13,7 +18,7 @@ func TestSignedReplyChain(t *testing.T) {
 
 	for count := 1; count <= 4; count++ {
 		messageID := "<reply-" + strconv.Itoa(count) + "@octo.test>"
-		metadata, context, err := chain.Next(source, messageID)
+		metadata, context, err := next(chain, source, messageID)
 		if err != nil {
 			t.Fatalf("Next count %d: %v", count, err)
 		}
@@ -27,20 +32,20 @@ func TestSignedReplyChain(t *testing.T) {
 			t.Fatalf("IsFinalCount(%d) mismatch", count)
 		}
 		source = message(messageID, Headers(metadata))
-		verified := chain.Verify(source)
+		verified := verify(chain, source)
 		if verified.Verification != VerificationValid || verified.Count != count || verified.TraceID != metadata.TraceID {
 			t.Fatalf("Verify count %d = %#v", count, verified)
 		}
 	}
 
-	if _, context, err := chain.Next(source, "<reply-5@octo.test>"); !errors.Is(err, ErrLimitReached) || !chain.LimitReached(context) {
+	if _, context, err := next(chain, source, "<reply-5@octo.test>"); !errors.Is(err, ErrLimitReached) || !chain.LimitReached(context) {
 		t.Fatalf("fifth reply = context %#v err %v", context, err)
 	}
 }
 
 func TestTamperedOrReplayedMetadataIsInvalid(t *testing.T) {
 	chain := mustChain(t, 4)
-	metadata, _, err := chain.Next(message("<human@example.net>", nil), "<reply-1@octo.test>")
+	metadata, _, err := next(chain, message("<human@example.net>", nil), "<reply-1@octo.test>")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,10 +72,10 @@ func TestTamperedOrReplayedMetadataIsInvalid(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			if got := chain.Verify(tc.raw); got.Verification != VerificationInvalid || got.Count != 0 {
+			if got := verify(chain, tc.raw); got.Verification != VerificationInvalid || got.Count != 0 {
 				t.Fatalf("Verify = %#v", got)
 			}
-			next, _, err := chain.Next(tc.raw, "<new@octo.test>")
+			next, _, err := next(chain, tc.raw, "<new@octo.test>")
 			if tc.blocked {
 				if !errors.Is(err, ErrExternalAutomatedReply) {
 					t.Fatalf("Next = %#v, %v", next, err)
@@ -92,18 +97,33 @@ func TestWrongKeyAndFinalPromptState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata, _, _ := chain.Next(message("<human@example.net>", nil), "<one@octo.test>")
+	metadata, _, _ := next(chain, message("<human@example.net>", nil), "<one@octo.test>")
 	raw := message("<one@octo.test>", Headers(metadata))
-	if got := other.Verify(raw); got.Verification != VerificationInvalid {
+	if got := verify(other, raw); got.Verification != VerificationInvalid {
 		t.Fatalf("wrong key verification = %#v", got)
 	}
 
-	second, _, _ := chain.Next(raw, "<two@octo.test>")
+	second, _, _ := next(chain, raw, "<two@octo.test>")
 	thirdRaw := message("<two@octo.test>", Headers(second))
-	third, _, _ := chain.Next(thirdRaw, "<three@octo.test>")
-	context := chain.Verify(message("<three@octo.test>", Headers(third)))
+	third, _, _ := next(chain, thirdRaw, "<three@octo.test>")
+	context := verify(chain, message("<three@octo.test>", Headers(third)))
 	if !chain.NextReplyIsFinal(context) {
 		t.Fatalf("count 3 should make next reply final: %#v", context)
+	}
+}
+
+func TestSignedMetadataIsRecipientBoundAndExpires(t *testing.T) {
+	chain := mustChain(t, 4)
+	metadata, _, err := next(chain, message("<human@example.net>", nil), "<one@octo.test>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := message("<one@octo.test>", Headers(metadata))
+	if got := chain.Verify(raw, "other@octo.test", testNow); got.Verification != VerificationInvalid {
+		t.Fatalf("cross-recipient verification = %#v", got)
+	}
+	if got := chain.Verify(raw, testRecipient, time.Unix(metadata.ExpiresAt+1, 0)); got.Verification != VerificationInvalid {
+		t.Fatalf("expired verification = %#v", got)
 	}
 }
 
@@ -121,26 +141,26 @@ func TestExternalAutomatedSourceCannotRestartChain(t *testing.T) {
 		}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			context := chain.Verify(raw)
+			context := verify(chain, raw)
 			if !chain.BlocksAutomaticReply(context) {
 				t.Fatalf("source should be blocked: %#v", context)
 			}
-			if _, gotContext, err := chain.Next(raw, "<reply@octo.test>"); !errors.Is(err, ErrExternalAutomatedReply) || !gotContext.Automated {
+			if _, gotContext, err := next(chain, raw, "<reply@octo.test>"); !errors.Is(err, ErrExternalAutomatedReply) || !gotContext.Automated {
 				t.Fatalf("Next = context %#v err %v", gotContext, err)
 			}
 		})
 	}
 
-	first, _, err := chain.Next(message("<human@example.net>", nil), "<one@octo.test>")
+	first, _, err := next(chain, message("<human@example.net>", nil), "<one@octo.test>")
 	if err != nil {
 		t.Fatal(err)
 	}
 	signed := message("<one@octo.test>", Headers(first))
-	context := chain.Verify(signed)
+	context := verify(chain, signed)
 	if chain.BlocksAutomaticReply(context) || !context.Automated || context.Verification != VerificationValid {
 		t.Fatalf("valid OCTO automated source was blocked: %#v", context)
 	}
-	second, _, err := chain.Next(signed, "<two@octo.test>")
+	second, _, err := next(chain, signed, "<two@octo.test>")
 	if err != nil || second.Count != 2 {
 		t.Fatalf("valid chain did not continue: %#v, %v", second, err)
 	}
@@ -152,7 +172,7 @@ func TestChainContinuesAcrossInstancesWithSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, _, err := beforeRestart.Next(message("<human@example.net>", nil), "<one@octo.test>")
+	first, _, err := next(beforeRestart, message("<human@example.net>", nil), "<one@octo.test>")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +181,7 @@ func TestChainContinuesAcrossInstancesWithSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, context, err := afterRestart.Next(message("<one@octo.test>", Headers(first)), "<two@octo.test>")
+	second, context, err := next(afterRestart, message("<one@octo.test>", Headers(first)), "<two@octo.test>")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +216,14 @@ func mustChain(t *testing.T, max int) *Chain {
 		t.Fatal(err)
 	}
 	return chain
+}
+
+func next(chain *Chain, source []byte, messageID string) (Metadata, Context, error) {
+	return chain.Next(source, messageID, testRecipient, testRecipient, testNow)
+}
+
+func verify(chain *Chain, raw []byte) Context {
+	return chain.Verify(raw, testRecipient, testNow)
 }
 
 func message(messageID string, headers map[string]string) []byte {

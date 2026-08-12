@@ -515,7 +515,7 @@ func (t *tenantScope) AgentMailboxes(ctx context.Context, principalID int64, spa
 		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
 		 LEFT JOIN LATERAL (
 		   SELECT id,bot_id,bot_profile,outbound_mode FROM agent_bindings
-		   WHERE account_id=acc.id AND status='active'
+		   WHERE account_id=acc.id AND space_id=$3 AND status='active'
 		   ORDER BY id DESC LIMIT 1
 		 ) binding ON true
 		 WHERE acc.tenant_id=$1 AND p.id=$2 AND NOT acc.disabled

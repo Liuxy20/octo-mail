@@ -99,13 +99,13 @@ func (p *Processor) Process(ctx context.Context, accountID, sourceEmailID int64,
 	if accountID <= 0 || sourceEmailID <= 0 || len(raw) == 0 || int64(len(raw)) > maxMessageSize {
 		return errors.New("invalid mail rule input")
 	}
-	parsed, err := parseMessageWithLimit(raw, maxMessageSize, p.RuleMetadata)
-	if err != nil {
-		return fmt.Errorf("parse stored message: %w", err)
-	}
 	tenantID, sender, rules, err := p.loadContext(ctx, accountID)
 	if err != nil {
 		return err
+	}
+	parsed, err := parseMessageWithLimit(raw, maxMessageSize, p.RuleMetadata, sender, time.Now())
+	if err != nil {
+		return fmt.Errorf("parse stored message: %w", err)
 	}
 	var firstErr error
 	for _, candidate := range rules {
@@ -253,10 +253,10 @@ func (p *Processor) finishExecution(ctx context.Context, accountID, executionID 
 }
 
 func parseMessage(raw []byte) (parsedMessage, error) {
-	return parseMessageWithLimit(raw, defaultMaxForwardMessageSize, nil)
+	return parseMessageWithLimit(raw, defaultMaxForwardMessageSize, nil, "", time.Time{})
 }
 
-func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rulemetadata.Authenticator) (parsedMessage, error) {
+func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rulemetadata.Authenticator, expectedRecipient string, now time.Time) (parsedMessage, error) {
 	reader := bytes.NewReader(raw)
 	part, err := moxmessage.Parse(nil, false, reader)
 	if err != nil {
@@ -287,7 +287,7 @@ func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rule
 		}
 	}
 	if authenticator != nil {
-		if metadata, ok := authenticator.VerifyHeader(header); ok {
+		if metadata, ok := authenticator.VerifyHeader(header, expectedRecipient, now); ok {
 			parsed.hop = metadata.Hop
 			parsed.sourceRuleID = metadata.RuleID
 		}
@@ -470,6 +470,8 @@ func composeForwardWithLimit(from string, targets []string, source parsedMessage
 			RuleID:       ruleID,
 			Hop:          source.hop + 1,
 			MessageID:    messageID,
+			Recipients:   targets,
+			ExpiresAt:    rulemetadata.Expiry(time.Now()),
 		}
 		signature, err := authenticator.Sign(metadata)
 		if err != nil {
@@ -479,6 +481,12 @@ func composeForwardWithLimit(from string, targets []string, source parsedMessage
 		composer.Header(rulemetadata.HeaderSentBy, metadata.SentBy)
 		composer.Header(rulemetadata.HeaderRuleID, strconv.FormatInt(metadata.RuleID, 10))
 		composer.Header(rulemetadata.HeaderRuleHop, strconv.Itoa(metadata.Hop))
+		recipients, err := rulemetadata.CanonicalRecipients(metadata.Recipients)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize rule metadata recipients: %w", err)
+		}
+		composer.Header(rulemetadata.HeaderRecipients, recipients)
+		composer.Header(rulemetadata.HeaderExpires, strconv.FormatInt(metadata.ExpiresAt, 10))
 		composer.Header(rulemetadata.HeaderSignature, signature)
 	}
 	composer.Header("MIME-Version", "1.0")

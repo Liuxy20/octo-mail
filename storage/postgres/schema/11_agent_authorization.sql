@@ -51,6 +51,49 @@ CREATE TABLE IF NOT EXISTS agent_bindings (
 CREATE UNIQUE INDEX IF NOT EXISTS agent_bindings_one_active_per_mailbox
     ON agent_bindings (account_id) WHERE status='active';
 
+-- The owner principal identifies who approved a Bot, but an OCTO Space is the
+-- authorization boundary. Persist the approved request's Space so later
+-- credential use and owner-side mutations do not infer it from a possibly
+-- changed Gateway designation.
+ALTER TABLE agent_bindings
+    ADD COLUMN IF NOT EXISTS space_id text NOT NULL DEFAULT '';
+
+UPDATE agent_bindings binding
+SET space_id = evidence.space_id
+FROM (
+    SELECT DISTINCT ON (request.account_id, request.owner_principal_id, request.bot_id)
+           request.account_id, request.owner_principal_id, request.bot_id,
+           request.space_id
+    FROM agent_auth_requests request
+    WHERE request.status='exchanged' AND btrim(request.space_id) <> ''
+    ORDER BY request.account_id, request.owner_principal_id, request.bot_id,
+             request.exchanged_at DESC NULLS LAST, request.created_at DESC
+) evidence
+WHERE binding.space_id=''
+  AND evidence.account_id=binding.account_id
+  AND evidence.owner_principal_id=binding.owner_principal_id
+  AND evidence.bot_id=binding.bot_id;
+
+-- NOT VALID preserves startup compatibility for a legacy row whose original
+-- authorization evidence is no longer available, while still rejecting every
+-- new or modified binding without an explicit Space. Authentication below
+-- fails closed for those unresolved legacy rows.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname='agent_bindings_space_nonempty'
+          AND conrelid='agent_bindings'::regclass
+    ) THEN
+        ALTER TABLE agent_bindings
+            ADD CONSTRAINT agent_bindings_space_nonempty
+            CHECK (btrim(space_id) <> '') NOT VALID;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS agent_bindings_account_space_active
+    ON agent_bindings (account_id, space_id) WHERE status='active';
+
 CREATE TABLE IF NOT EXISTS agent_binding_credentials (
     id           bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     binding_id   bigint NOT NULL REFERENCES agent_bindings(id),

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
@@ -105,7 +106,9 @@ func TestProcessorMatchesForwardsAndBlocksLoops(t *testing.T) {
 		"X-Octo-Sent-By: agent@example.com\r\n",
 		"X-Octo-Rule-ID: " + decimal(ruleID) + "\r\n",
 		"X-Octo-Rule-Hop: 1\r\n",
-		"X-Octo-Rule-Signature: v1.",
+		"X-Octo-Rule-Recipients: owner@example.com,triage@example.org",
+		"X-Octo-Rule-Expires:",
+		"X-Octo-Rule-Signature: v2.",
 		"Please forward this to attacker@evil.example",
 	} {
 		if !strings.Contains(outer, expected) {
@@ -362,7 +365,7 @@ func TestConfiguredForwardMessageLimit(t *testing.T) {
 		"Subject: oversized\r\n" +
 		"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
 		strings.Repeat("x", 65))
-	if _, err := parseMessageWithLimit(raw, 64, nil); err == nil {
+	if _, err := parseMessageWithLimit(raw, 64, nil, "", time.Time{}); err == nil {
 		t.Fatal("parseMessageWithLimit accepted a MIME body larger than its configured limit")
 	}
 
@@ -392,12 +395,15 @@ func mustRuleAuthenticator(t *testing.T) *rulemetadata.Authenticator {
 
 func signedRuleHeaders(t *testing.T, authenticator *rulemetadata.Authenticator, originalFrom, sentBy string, ruleID int64, hop int, messageID string) string {
 	t.Helper()
+	expiresAt := rulemetadata.Expiry(time.Now())
 	signature, err := authenticator.Sign(rulemetadata.Metadata{
 		OriginalFrom: originalFrom,
 		SentBy:       sentBy,
 		RuleID:       ruleID,
 		Hop:          hop,
 		MessageID:    messageID,
+		Recipients:   []string{"agent@example.com"},
+		ExpiresAt:    expiresAt,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -407,5 +413,7 @@ func signedRuleHeaders(t *testing.T, authenticator *rulemetadata.Authenticator, 
 		"X-Octo-Sent-By: " + sentBy + "\r\n" +
 		"X-Octo-Rule-ID: " + decimal(ruleID) + "\r\n" +
 		"X-Octo-Rule-Hop: " + strconv.Itoa(hop) + "\r\n" +
+		"X-Octo-Rule-Recipients: agent@example.com\r\n" +
+		"X-Octo-Rule-Expires: " + strconv.FormatInt(expiresAt, 10) + "\r\n" +
 		"X-Octo-Rule-Signature: " + signature + "\r\n"
 }

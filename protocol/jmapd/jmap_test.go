@@ -317,7 +317,7 @@ func TestAgentCredentialJMAPReadOnly(t *testing.T) {
 	if name != "error" || denied["type"] != "forbidden" {
 		t.Fatalf("Agent Email/set = %s %v, want forbidden", name, denied)
 	}
-	if err := agentDir.RevokeAgentBinding(ctx, principalID, accountID); err != nil {
+	if err := agentDir.RevokeAgentBinding(ctx, principalID, accountID, "space-jmap"); err != nil {
 		t.Fatal(err)
 	}
 	revokedRequest, _ := http.NewRequest(http.MethodGet, hs.URL+"/jmap/session", nil)

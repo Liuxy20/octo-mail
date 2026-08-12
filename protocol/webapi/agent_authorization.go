@@ -207,7 +207,7 @@ func (s *Server) revokeAgentMailboxBinding(ctx context.Context, a authCtx, r *ht
 	if err != nil {
 		return 0, nil, err
 	}
-	if err := dir.RevokeAgentBinding(ctx, a.principal.ID, mailboxID); err != nil {
+	if err := dir.RevokeAgentBinding(ctx, a.principal.ID, mailboxID, a.spaceID); err != nil {
 		return 0, nil, agentAuthorizationStatusError(err)
 	}
 	return http.StatusNoContent, nil, nil

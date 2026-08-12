@@ -146,6 +146,15 @@ func TestUnknownSubmissionPreservesSentAndDraftClaims(t *testing.T) {
 	if unknown.calls.Load() != callsAfterUnknown {
 		t.Fatalf("unknown Draft was submitted again: calls %d -> %d", callsAfterUnknown, unknown.calls.Load())
 	}
+	status, result = request(http.MethodPatch, "/webapi/v0/drafts/"+draftID,
+		`{"to":["person@example.net"],"subject":"edited unknown draft","text":"changed"}`)
+	if status != http.StatusConflict || result["error"].(map[string]any)["code"] != "draft_send_result_unknown" {
+		t.Fatalf("edit unknown Draft = %d %#v", status, result)
+	}
+	status, result = request(http.MethodDelete, "/webapi/v0/drafts/"+draftID, "")
+	if status != http.StatusConflict || result["error"].(map[string]any)["code"] != "draft_send_result_unknown" {
+		t.Fatalf("delete unknown Draft = %d %#v", status, result)
+	}
 
 	var sent, drafts, queueRows, processingClaims int
 	if err := db.Pool.QueryRow(ctx,

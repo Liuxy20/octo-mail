@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,13 @@ func TestFTSProjectionAndRebuild(t *testing.T) {
 		t.Skipf("postgres not available (%v)", err)
 	}
 	defer s.Close()
+	var trigramIndex string
+	mustScan(t, s, ctx,
+		`SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='fts_search_text_trgm_idx'`,
+		&trigramIndex)
+	if !strings.Contains(strings.ToLower(trigramIndex), "using gin") || !strings.Contains(trigramIndex, "gin_trgm_ops") {
+		t.Fatalf("substring search index = %q, want GIN gin_trgm_ops", trigramIndex)
+	}
 	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, fts, projection_cursor RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}

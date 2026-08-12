@@ -1,0 +1,5 @@
+{"file":".coding/spec/backend/index.md","reason":"Backend pre-development checklist and package-wide contracts."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Idempotent PostgreSQL schema, transactional credential lifecycle, and GC changes."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Agent authorization isolation, protocol compatibility, and required real-infrastructure gates."}
+{"file":".coding/spec/backend/error-handling.md","reason":"Preserve WebAPI status/error conventions for blocked Draft mutations."}
+{"file":".coding/spec/guides/cross-layer-thinking-guide.md","reason":"Trace Admin provisioning, authorization, storage, protocol, SMTP metadata, and rollout boundaries."}

@@ -109,7 +109,7 @@ func TestDraftBCCIsStoredButStrippedBeforeSubmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	envelope := parseEnvelope(raw, nil)
+	envelope := parseEnvelope(raw, nil, "")
 	if len(envelope.bcc) != 1 || envelope.bcc[0] != "hidden@example.com" {
 		t.Fatalf("stored Draft Bcc = %v, want hidden@example.com", envelope.bcc)
 	}
@@ -131,7 +131,7 @@ func TestForwardAttributionDoesNotChangeReplyTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	envelope := parseEnvelope(raw, nil)
+	envelope := parseEnvelope(raw, nil, "")
 	if envelope.from != "forwarder@example.com" || envelope.originalFrom != "" || envelope.sentBy != "" {
 		t.Fatalf("forward attribution = %#v", envelope)
 	}
@@ -145,7 +145,7 @@ func TestForwardAttributionDoesNotChangeReplyTarget(t *testing.T) {
 }
 
 func TestReplyRecipientsPreferExplicitReplyTo(t *testing.T) {
-	envelope := parseEnvelope([]byte("From: sender@example.com\r\nReply-To: replies@example.net\r\nTo: recipient@example.com\r\n\r\nbody\r\n"), nil)
+	envelope := parseEnvelope([]byte("From: sender@example.com\r\nReply-To: replies@example.net\r\nTo: recipient@example.com\r\n\r\nbody\r\n"), nil, "")
 	to, _ := replyRecipients(envelope, "recipient@example.com", false)
 	if len(to) != 1 || to[0] != "replies@example.net" {
 		t.Fatalf("reply recipients = %v, want replies@example.net", to)

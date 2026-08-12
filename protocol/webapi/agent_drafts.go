@@ -267,7 +267,7 @@ func (s *Server) createAgentReplyDraft(ctx context.Context, a authCtx, r *http.R
 	if err != nil {
 		return 0, nil, err
 	}
-	env := parseEnvelope(sourceRaw, nil)
+	env := parseEnvelope(sourceRaw, nil, "")
 	to, cc := replyRecipients(env, a.login, false)
 	if len(to) == 0 {
 		return 0, nil, errStatus(http.StatusUnprocessableEntity, "no_recipients", "original has no reply recipient")

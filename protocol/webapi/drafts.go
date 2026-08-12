@@ -117,7 +117,7 @@ func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (i
 	if err != nil {
 		return 0, nil, err
 	}
-	existingEnvelope := parseEnvelope(existingRaw, nil)
+	existingEnvelope := parseEnvelope(existingRaw, nil, "")
 	inReplyTo := ""
 	if len(existingEnvelope.references) > 0 {
 		inReplyTo = existingEnvelope.references[len(existingEnvelope.references)-1]
@@ -146,6 +146,15 @@ func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (i
 		current, mailbox, err := loadDraftMessage(tx, a.acc, r.PathValue("id"))
 		if err != nil {
 			return err
+		}
+		claimTx, ok := tx.(store.DraftSendClaimTx)
+		if !ok {
+			return errStatus(http.StatusNotImplemented, "draft_send_claim_unavailable", "durable Draft sending is unavailable")
+		}
+		if _, found, err := claimTx.FindDraftSendClaim(current.EffectiveEmailID()); err != nil {
+			return err
+		} else if found {
+			return errStatus(http.StatusConflict, "draft_send_result_unknown", "this Draft was already submitted or has an unknown submission result; it cannot be edited")
 		}
 		policyTx, policyCapable := tx.(store.OutboundPolicyDraftTx)
 		if policyCapable {
@@ -317,7 +326,7 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 		if closeErr != nil {
 			return closeErr
 		}
-		env := parseEnvelope(raw, nil)
+		env := parseEnvelope(raw, nil, "")
 		rcpts = allRecipients(env.to, env.cc, env.bcc)
 		if len(rcpts) == 0 {
 			return errStatus(http.StatusUnprocessableEntity, "no_recipients", "draft has no recipients")
@@ -404,6 +413,15 @@ func (s *Server) deleteDraft(ctx context.Context, a authCtx, r *http.Request) (i
 
 func removeDraftAuthorized(ctx context.Context, a authCtx, id string) error {
 	return removeDraftWithCheck(ctx, a.acc, id, func(tx store.Tx, message store.Message) error {
+		claimTx, ok := tx.(store.DraftSendClaimTx)
+		if !ok {
+			return errStatus(http.StatusNotImplemented, "draft_send_claim_unavailable", "durable Draft sending is unavailable")
+		}
+		if claim, found, err := claimTx.FindDraftSendClaim(message.EffectiveEmailID()); err != nil {
+			return err
+		} else if found && claim.Status == "processing" {
+			return errStatus(http.StatusConflict, "draft_send_result_unknown", "this Draft has an unknown submission result and cannot be deleted")
+		}
 		hasPolicy := false
 		if policyTx, ok := tx.(store.OutboundPolicyDraftTx); ok {
 			_, found, err := policyTx.FindOutboundPolicyDraftByEmailID(message.EffectiveEmailID())

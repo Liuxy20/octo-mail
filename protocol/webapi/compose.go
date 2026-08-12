@@ -109,6 +109,8 @@ func writeTrustedHeaders(b *bytes.Buffer, headers map[string]string) error {
 		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderSubmitted): true,
 		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderTraceID):   true,
 		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderCount):     true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderRecipient): true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderExpires):   true,
 		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderSignature): true,
 	}
 	names := make([]string, 0, len(headers))

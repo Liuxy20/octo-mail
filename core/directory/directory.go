@@ -225,8 +225,8 @@ type AgentAuthorizationDirectory interface {
 	AgentAuthorization(ctx context.Context, ownerPrincipalID int64, spaceID, userCode string) (AgentAuthorization, error)
 	ApproveAgentAuthorization(ctx context.Context, ownerPrincipalID int64, spaceID, userCode string, accountID int64, outboundMode AgentOutboundMode) error
 	ExchangeAgentAuthorization(ctx context.Context, deviceCode, codeVerifier string) (AgentAuthorizationCredential, error)
-	RevokeAgentBinding(ctx context.Context, ownerPrincipalID, accountID int64) error
-	SetAgentOutboundMode(ctx context.Context, ownerPrincipalID, accountID int64, mode AgentOutboundMode) error
+	RevokeAgentBinding(ctx context.Context, ownerPrincipalID, accountID int64, spaceID string) error
+	SetAgentOutboundMode(ctx context.Context, ownerPrincipalID, accountID int64, spaceID string, mode AgentOutboundMode) error
 	AuthenticateAgentCredential(ctx context.Context, token string) (TenantScope, Principal, int64, int64, error)
 	AgentAutomationAllowed(ctx context.Context, credentialID int64, operation string) (bool, error)
 }

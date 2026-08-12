@@ -19,7 +19,8 @@ import (
 // The sweep, per run:
 //  1. Hard-delete expunged message rows, capturing their (tenant_id, blob_ref),
 //     and in the same statement delete the message's projection/workflow rows
-//     (fts, thread_refs, outbound_policy_drafts, agent_outbound_drafts) — those
+//     (fts, thread_refs, outbound_policy_drafts, agent_outbound_drafts,
+//     draft_send_claims) — those
 //     tables have no FK to messages (they are deliberately decoupled from the
 //     delivery write path), so GC is what keeps them from accumulating orphans.
 //  2. For each distinct freed (tenant, ref), delete the blob IFF no live message
@@ -52,7 +53,7 @@ func (s *Store) CollectGarbage(ctx context.Context, limit int) (rowsDeleted int6
 		// by tenant, so resolve it via accounts in the RETURNING projection.
 		rows, e := tx.Query(ctx,
 			`WITH doomed AS (
-			     SELECT account_id, id FROM messages
+			     SELECT account_id, id, COALESCE(email_id,id) AS effective_email_id FROM messages
 			     WHERE expunged
 			     ORDER BY account_id, id
 			     FOR UPDATE SKIP LOCKED
@@ -73,11 +74,33 @@ func (s *Store) CollectGarbage(ctx context.Context, limit int) (rowsDeleted int6
 			 ), del_policy_drafts AS (
 			     DELETE FROM outbound_policy_drafts p
 			     USING doomed d
-			     WHERE p.account_id=d.account_id AND p.email_id=d.id
+			     WHERE p.account_id=d.account_id AND p.email_id=d.effective_email_id
+			       AND NOT EXISTS (
+			         SELECT 1 FROM messages live
+			         WHERE live.account_id=d.account_id
+			           AND COALESCE(live.email_id,live.id)=d.effective_email_id
+			           AND NOT live.expunged
+			       )
 			 ), del_agent_drafts AS (
 			     DELETE FROM agent_outbound_drafts a
 			     USING doomed d
-			     WHERE a.account_id=d.account_id AND a.email_id=d.id
+			     WHERE a.account_id=d.account_id AND a.email_id=d.effective_email_id
+			       AND NOT EXISTS (
+			         SELECT 1 FROM messages live
+			         WHERE live.account_id=d.account_id
+			           AND COALESCE(live.email_id,live.id)=d.effective_email_id
+			           AND NOT live.expunged
+			       )
+			 ), del_draft_send_claims AS (
+			     DELETE FROM draft_send_claims claim
+			     USING doomed d
+			     WHERE claim.account_id=d.account_id AND claim.email_id=d.effective_email_id
+			       AND NOT EXISTS (
+			         SELECT 1 FROM messages live
+			         WHERE live.account_id=d.account_id
+			           AND COALESCE(live.email_id,live.id)=d.effective_email_id
+			           AND NOT live.expunged
+			       )
 			 )
 			 SELECT a.tenant_id, del.blob_ref FROM del JOIN accounts a ON a.id=del.account_id`, limit)
 		if e != nil {

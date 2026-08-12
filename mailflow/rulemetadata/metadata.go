@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"net/textproto"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -21,12 +23,16 @@ const (
 	HeaderSentBy       = "X-Octo-Sent-By"
 	HeaderRuleID       = "X-Octo-Rule-ID"
 	HeaderRuleHop      = "X-Octo-Rule-Hop"
+	HeaderRecipients   = "X-Octo-Rule-Recipients"
+	HeaderExpires      = "X-Octo-Rule-Expires"
 	HeaderSignature    = "X-Octo-Rule-Signature"
 
-	signatureVersion = "v1"
-	minKeyBytes      = 32
-	maxAddressBytes  = 320
-	maxHop           = 1_000_000
+	signatureVersion  = "v2"
+	minKeyBytes       = 32
+	maxAddressBytes   = 320
+	maxHop            = 1_000_000
+	signatureValidity = 24 * time.Hour
+	clockSkew         = 5 * time.Minute
 )
 
 // Metadata is the complete server-owned rule-forwarding tuple. MessageID binds
@@ -37,6 +43,8 @@ type Metadata struct {
 	RuleID       int64
 	Hop          int
 	MessageID    string
+	Recipients   []string
+	ExpiresAt    int64
 }
 
 // Authenticator signs and verifies metadata with a deployment-wide key.
@@ -61,15 +69,15 @@ func (a *Authenticator) Sign(metadata Metadata) (string, error) {
 
 // Verify checks a raw RFC 5322 message. Missing, partial, duplicated, malformed,
 // or tampered metadata is rejected as one unit.
-func (a *Authenticator) Verify(raw []byte) (Metadata, bool) {
+func (a *Authenticator) Verify(raw []byte, expectedRecipient string, now time.Time) (Metadata, bool) {
 	header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
 	if err != nil {
 		return Metadata{}, false
 	}
-	return a.VerifyHeader(header)
+	return a.VerifyHeader(header, expectedRecipient, now)
 }
 
-func (a *Authenticator) VerifyHeader(header textproto.MIMEHeader) (Metadata, bool) {
+func (a *Authenticator) VerifyHeader(header textproto.MIMEHeader, expectedRecipient string, now time.Time) (Metadata, bool) {
 	originalFrom, ok := singleHeader(header, HeaderOriginalFrom)
 	if !ok {
 		return Metadata{}, false
@@ -90,6 +98,14 @@ func (a *Authenticator) VerifyHeader(header textproto.MIMEHeader) (Metadata, boo
 	if !ok {
 		return Metadata{}, false
 	}
+	recipientsText, ok := singleHeader(header, HeaderRecipients)
+	if !ok {
+		return Metadata{}, false
+	}
+	expiresText, ok := singleHeader(header, HeaderExpires)
+	if !ok {
+		return Metadata{}, false
+	}
 	signatureText, ok := singleHeader(header, HeaderSignature)
 	if !ok {
 		return Metadata{}, false
@@ -102,14 +118,24 @@ func (a *Authenticator) VerifyHeader(header textproto.MIMEHeader) (Metadata, boo
 	if err != nil {
 		return Metadata{}, false
 	}
+	expiresAt, err := strconv.ParseInt(expiresText, 10, 64)
+	if err != nil || expiresAt <= now.Unix() || expiresAt > now.Add(signatureValidity+clockSkew).Unix() {
+		return Metadata{}, false
+	}
 	metadata, err := canonicalMetadata(Metadata{
 		OriginalFrom: originalFrom,
 		SentBy:       sentBy,
 		RuleID:       ruleID,
 		Hop:          hop,
 		MessageID:    messageID,
+		Recipients:   strings.Split(recipientsText, ","),
+		ExpiresAt:    expiresAt,
 	})
 	if err != nil {
+		return Metadata{}, false
+	}
+	expectedRecipient = canonicalAddress(expectedRecipient)
+	if expectedRecipient == "" || !containsRecipient(metadata.Recipients, expectedRecipient) {
 		return Metadata{}, false
 	}
 	signature, ok := decodeSignature(signatureText)
@@ -124,6 +150,7 @@ func (a *Authenticator) mac(metadata Metadata) []byte {
 	fmt.Fprintf(mac, "%s\n%s\n%s\n%d\n%d\n%s",
 		signatureVersion, metadata.OriginalFrom, metadata.SentBy,
 		metadata.RuleID, metadata.Hop, metadata.MessageID)
+	fmt.Fprintf(mac, "\n%s\n%d", strings.Join(metadata.Recipients, ","), metadata.ExpiresAt)
 	return mac.Sum(nil)
 }
 
@@ -142,7 +169,62 @@ func canonicalMetadata(metadata Metadata) (Metadata, error) {
 	if !validMessageID(metadata.MessageID) {
 		return Metadata{}, errors.New("invalid rule metadata Message-ID")
 	}
+	if metadata.ExpiresAt <= 0 {
+		return Metadata{}, errors.New("invalid rule metadata expiry")
+	}
+	canonicalRecipients, err := canonicalizeRecipients(metadata.Recipients)
+	if err != nil {
+		return Metadata{}, err
+	}
+	metadata.Recipients = canonicalRecipients
 	return metadata, nil
+}
+
+func canonicalizeRecipients(recipients []string) ([]string, error) {
+	canonicalRecipients := make([]string, 0, len(recipients))
+	seen := map[string]bool{}
+	for _, recipient := range recipients {
+		recipient = canonicalAddress(recipient)
+		if recipient == "" {
+			return nil, errors.New("invalid rule metadata recipient")
+		}
+		if !seen[recipient] {
+			seen[recipient] = true
+			canonicalRecipients = append(canonicalRecipients, recipient)
+		}
+	}
+	if len(canonicalRecipients) == 0 {
+		return nil, errors.New("missing rule metadata recipient")
+	}
+	sort.Strings(canonicalRecipients)
+	return canonicalRecipients, nil
+}
+
+func Expiry(now time.Time) int64 { return now.Add(signatureValidity).Unix() }
+
+func CanonicalRecipients(recipients []string) (string, error) {
+	canonical, err := canonicalizeRecipients(recipients)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(canonical, ","), nil
+}
+
+func canonicalAddress(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || len(value) > maxAddressBytes || !strings.Contains(value, "@") || strings.ContainsAny(value, "\r\n\t ,") {
+		return ""
+	}
+	return value
+}
+
+func containsRecipient(recipients []string, expected string) bool {
+	for _, recipient := range recipients {
+		if recipient == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func singleHeader(header textproto.MIMEHeader, name string) (string, bool) {

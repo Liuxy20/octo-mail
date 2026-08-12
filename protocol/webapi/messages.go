@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
@@ -206,7 +207,7 @@ func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (in
 		data, _ := io.ReadAll(br)
 		br.Close()
 		text, html, cc := parseBodies(data)
-		envelope := parseEnvelope(data, s.RuleMetadata)
+		envelope := parseEnvelope(data, s.RuleMetadata, a.login)
 		detail.BodyText, detail.BodyHTML, detail.Cc = text, html, cc
 		detail.Bcc = envelope.bcc
 		detail.OriginalFrom, detail.SentBy = envelope.originalFrom, envelope.sentBy
@@ -389,7 +390,7 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	if err != nil {
 		return 0, nil, err
 	}
-	env := parseEnvelope(sourceRaw, nil)
+	env := parseEnvelope(sourceRaw, nil, "")
 	to, cc = replyRecipients(env, a.login, all)
 	subject = ensurePrefix(env.subject, "Re: ")
 	inReplyTo = env.messageID
@@ -399,22 +400,31 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	}
 	messageID := ""
 	trustedHeaders := map[string]string(nil)
-	if isAgentAutomaticReply(a, r) && s.AutoReplyChain != nil {
-		messageID, err = genMessageID(a.senderDomain())
-		if err != nil {
-			return 0, nil, internalErr("message_id_failed", err)
+	if isAgentAutomaticReply(a, r) {
+		// RFC 3834 loop labelling is required independently of the optional OCTO
+		// count-chain. A configured maximum of zero disables only the local count
+		// limit; it must not make an Agent auto-reply look human-generated to the
+		// receiving MTA.
+		trustedHeaders = map[string]string{
+			autoreplychain.HeaderSubmitted: autoreplychain.SubmittedAutoReplied,
 		}
-		metadata, err := s.nextAutoReplyMetadata(ctx, a, id, sourceRaw, messageID)
-		if err != nil {
-			return 0, nil, err
-		}
-		if s.AutoReplyChain.IsFinalCount(metadata.Count) {
-			req.Text = autoreplychain.AppendFinalNotice(req.Text)
-			if len(req.Text) > 100000 {
-				return 0, nil, errStatus(http.StatusRequestEntityTooLarge, "automatic_reply_too_large", "final automatic reply exceeds the plain-text size limit")
+		if s.AutoReplyChain != nil {
+			messageID, err = genMessageID(a.senderDomain())
+			if err != nil {
+				return 0, nil, internalErr("message_id_failed", err)
 			}
+			metadata, err := s.nextAutoReplyMetadata(ctx, a, id, sourceRaw, messageID, to[0])
+			if err != nil {
+				return 0, nil, err
+			}
+			if s.AutoReplyChain.IsFinalCount(metadata.Count) {
+				req.Text = autoreplychain.AppendFinalNotice(req.Text)
+				if len(req.Text) > 100000 {
+					return 0, nil, errStatus(http.StatusRequestEntityTooLarge, "automatic_reply_too_large", "final automatic reply exceeds the plain-text size limit")
+				}
+			}
+			trustedHeaders = autoreplychain.Headers(metadata)
 		}
-		trustedHeaders = autoreplychain.Headers(metadata)
 	}
 	raw, _, err := compose(composeInput{
 		From: a.login, To: to, Cc: cc, Subject: subject,
@@ -510,7 +520,7 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 		br := a.acc.MessageReader(ctx, msgs[0])
 		data, _ := io.ReadAll(br)
 		br.Close()
-		env := parseEnvelope(data, nil)
+		env := parseEnvelope(data, nil, "")
 		text, _, _ := parseBodies(data)
 		subject = ensurePrefix(env.subject, "Fwd: ")
 		originalFrom = env.from
@@ -657,7 +667,7 @@ func summarize(ctx context.Context, acc store.Account, m store.Message, mbNames 
 		br := acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
-		env := parseEnvelope(data, nil)
+		env := parseEnvelope(data, nil, "")
 		subject, from, to, preview = env.subject, env.from, env.to, previewText(data)
 	}
 	sum := messageSummary{
@@ -732,7 +742,7 @@ type envelope struct {
 	sentBy       string
 }
 
-func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator) envelope {
+func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator, expectedRecipient string) envelope {
 	var e envelope
 	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
 	if err != nil && part.Envelope == nil {
@@ -765,7 +775,7 @@ func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator) e
 			e.references = refs
 		}
 		if ruleAuthenticator != nil {
-			if metadata, ok := ruleAuthenticator.VerifyHeader(h); ok {
+			if metadata, ok := ruleAuthenticator.VerifyHeader(h, expectedRecipient, time.Now()); ok {
 				e.originalFrom = validAttributionAddress(metadata.OriginalFrom)
 				e.sentBy = validAttributionAddress(metadata.SentBy)
 			}

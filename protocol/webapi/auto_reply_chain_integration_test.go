@@ -239,7 +239,7 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("read manual sent raw = %d", status)
 	}
-	if manualContext := chain.Verify(manualRaw); manualContext.Verification != autoreplychain.VerificationMissing {
+	if manualContext := chain.Verify(manualRaw, "support@example.com", time.Now()); manualContext.Verification != autoreplychain.VerificationMissing {
 		t.Fatalf("manual reply unexpectedly joined automatic chain: %#v", manualContext)
 	}
 
@@ -293,7 +293,7 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("read final sent raw = %d", status)
 	}
-	verified := chain.Verify(sentRaw)
+	verified := chain.Verify(sentRaw, "bot-a@example.net", time.Now())
 	if verified.Verification != autoreplychain.VerificationValid || verified.Count != 4 {
 		t.Fatalf("final sent metadata = %#v", verified)
 	}
@@ -373,6 +373,32 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 	if status != http.StatusOK || forgedContext["autoReplyCount"] != float64(0) || forgedContext["limitReached"] != false {
 		t.Fatalf("forged context = %d %#v", status, forgedContext)
 	}
+
+	// A zero configured maximum leaves AutoReplyChain nil. That disables only
+	// OCTO's counter; RFC 3834 still requires the outgoing automatic reply to be
+	// labelled so a remote vacation responder does not treat it as human mail.
+	server.AutoReplyChain = nil
+	unlimitedSource := &store.Message{}
+	if _, err := target.Deliver(ctx, unlimitedSource, mem("From: sender@example.net\r\nTo: support@example.com\r\nSubject: unlimited\r\nMessage-ID: <unlimited@example.net>\r\n\r\nhello\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	unlimitedSourceID := "E" + strconv.FormatInt(unlimitedSource.EffectiveEmailID(), 10)
+	status, unlimitedAccepted, _ := do(http.MethodPost, "/webapi/v0/messages/"+unlimitedSourceID+"/reply", map[string]any{
+		"text": "automatic reply without a local count limit",
+	}, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "auto-reply-unlimited"})
+	if status != http.StatusAccepted {
+		t.Fatalf("unlimited automatic reply = %d %#v", status, unlimitedAccepted)
+	}
+	status, _, unlimitedRaw := do(http.MethodGet, "/webapi/v0/messages/"+unlimitedAccepted["messageId"].(string)+"/raw", nil, requestAuth{bearer: agentToken})
+	if status != http.StatusOK {
+		t.Fatalf("read unlimited sent raw = %d", status)
+	}
+	if !bytes.Contains(unlimitedRaw, []byte("Auto-Submitted: auto-replied")) {
+		t.Fatalf("unlimited automatic reply missing Auto-Submitted: %.500q", unlimitedRaw)
+	}
+	if bytes.Contains(unlimitedRaw, []byte(autoreplychain.HeaderTraceID+":")) {
+		t.Fatalf("unlimited automatic reply unexpectedly carried count-chain metadata: %.500q", unlimitedRaw)
+	}
 }
 
 func signedAutomaticReplySource(t *testing.T, chain *autoreplychain.Chain, count int) []byte {
@@ -380,16 +406,16 @@ func signedAutomaticReplySource(t *testing.T, chain *autoreplychain.Chain, count
 	raw := []byte("From: bot-a@example.net\r\nTo: support@example.com\r\nSubject: chain\r\nMessage-ID: <initial@example.net>\r\n\r\nstart\r\n")
 	for i := 1; i <= count; i++ {
 		messageID := fmt.Sprintf("<chain-%d@example.net>", i)
-		metadata, _, err := chain.Next(raw, messageID)
+		metadata, _, err := chain.Next(raw, messageID, "support@example.com", "support@example.com", time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
 		var headers strings.Builder
 		headers.WriteString("From: bot-a@example.net\r\nTo: support@example.com\r\nSubject: chain\r\nMessage-ID: " + messageID + "\r\n")
-		headers.WriteString(autoreplychain.HeaderSubmitted + ": " + autoreplychain.SubmittedAutoReplied + "\r\n")
-		headers.WriteString(autoreplychain.HeaderTraceID + ": " + metadata.TraceID + "\r\n")
-		headers.WriteString(autoreplychain.HeaderCount + ": " + strconv.Itoa(metadata.Count) + "\r\n")
-		headers.WriteString(autoreplychain.HeaderSignature + ": " + metadata.Signature + "\r\n\r\nreply\r\n")
+		for name, value := range autoreplychain.Headers(metadata) {
+			headers.WriteString(name + ": " + value + "\r\n")
+		}
+		headers.WriteString("\r\nreply\r\n")
 		raw = []byte(headers.String())
 	}
 	return raw

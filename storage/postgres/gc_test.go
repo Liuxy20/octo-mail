@@ -137,6 +137,10 @@ func TestCollectGarbageCascadesProjections(t *testing.T) {
 			 VALUES ($1,$2,'agent_pending_confirmation','pending_confirmation',decode(repeat('00',32),'hex'),$3)`,
 			accID, id, "agent-"+string(rune('0'+uid)))
 		must(t, e)
+		_, e = s.Pool.Exec(ctx,
+			`INSERT INTO draft_send_claims (account_id,email_id,draft_version,content_digest)
+			 VALUES ($1,$2,1,decode(repeat('11',32),'hex'))`, accID, id)
+		must(t, e)
 		return id
 	}
 	doomed := ins(1, true)
@@ -150,13 +154,13 @@ func TestCollectGarbageCascadesProjections(t *testing.T) {
 	count := func(table string, id int64) int {
 		var n int
 		idColumn := "message_id"
-		if table == "outbound_policy_drafts" || table == "agent_outbound_drafts" {
+		if table == "outbound_policy_drafts" || table == "agent_outbound_drafts" || table == "draft_send_claims" {
 			idColumn = "email_id"
 		}
 		must(t, s.Pool.QueryRow(ctx, `SELECT count(*) FROM `+table+` WHERE account_id=$1 AND `+idColumn+`=$2`, accID, id).Scan(&n))
 		return n
 	}
-	for _, table := range []string{"fts", "thread_refs", "outbound_policy_drafts", "agent_outbound_drafts"} {
+	for _, table := range []string{"fts", "thread_refs", "outbound_policy_drafts", "agent_outbound_drafts", "draft_send_claims"} {
 		if n := count(table, doomed); n != 0 {
 			t.Fatalf("%s orphan for GC'd message: %d rows remain, want 0", table, n)
 		}
@@ -165,4 +169,51 @@ func TestCollectGarbageCascadesProjections(t *testing.T) {
 		}
 	}
 	t.Logf("OK: GC cascaded projection + draft metadata deletes for the expunged message; live rows untouched")
+
+	// Effective Email identity can outlive its original physical row after a
+	// JMAP mailbox move: a sibling carries email_id=root while the root row is
+	// expunged. GC must not delete workflow/idempotency state until the sibling
+	// is also expunged.
+	var rootID, siblingID int64
+	must(t, s.Pool.QueryRow(ctx,
+		`INSERT INTO messages (account_id,mailbox_id,uid,createseq,modseq,expunged,blob_ref,size,received_at,save_date)
+		 VALUES ($1,$2,10,10,10,true,$3,4,now(),now()) RETURNING id`,
+		accID, mbID, string(ref)).Scan(&rootID))
+	must(t, s.Pool.QueryRow(ctx,
+		`INSERT INTO messages (account_id,mailbox_id,uid,email_id,createseq,modseq,expunged,blob_ref,size,received_at,save_date)
+		 VALUES ($1,$2,11,$3,11,11,false,$4,4,now(),now()) RETURNING id`,
+		accID, mbID, rootID, string(ref)).Scan(&siblingID))
+	_, err = s.Pool.Exec(ctx,
+		`INSERT INTO outbound_policy_drafts
+		 (account_id,email_id,status,policy_version,reasons,source,content_digest,idempotency_key)
+		 VALUES ($1,$2,'pending_confirmation','v1','[]','owner_direct',decode(repeat('22',32),'hex'),'sibling-policy')`, accID, rootID)
+	must(t, err)
+	_, err = s.Pool.Exec(ctx,
+		`INSERT INTO agent_outbound_drafts
+		 (account_id,email_id,draft_type,status,content_digest,idempotency_key)
+		 VALUES ($1,$2,'agent_pending_confirmation','pending_confirmation',decode(repeat('22',32),'hex'),'sibling-agent')`, accID, rootID)
+	must(t, err)
+	_, err = s.Pool.Exec(ctx,
+		`INSERT INTO draft_send_claims (account_id,email_id,draft_version,content_digest)
+		 VALUES ($1,$2,1,decode(repeat('22',32),'hex'))`, accID, rootID)
+	must(t, err)
+	if _, _, err := s.CollectGarbage(ctx, 100); err != nil {
+		t.Fatalf("CollectGarbage with live sibling: %v", err)
+	}
+	for _, table := range []string{"outbound_policy_drafts", "agent_outbound_drafts", "draft_send_claims"} {
+		if n := count(table, rootID); n != 1 {
+			t.Fatalf("live sibling lost %s state: %d, want 1", table, n)
+		}
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE messages SET expunged=true WHERE id=$1`, siblingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CollectGarbage(ctx, 100); err != nil {
+		t.Fatalf("CollectGarbage after last sibling expunged: %v", err)
+	}
+	for _, table := range []string{"outbound_policy_drafts", "agent_outbound_drafts", "draft_send_claims"} {
+		if n := count(table, rootID); n != 0 {
+			t.Fatalf("orphaned effective Email %s state remains: %d", table, n)
+		}
+	}
 }
