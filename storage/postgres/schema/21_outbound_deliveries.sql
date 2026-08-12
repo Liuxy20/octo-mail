@@ -23,30 +23,16 @@ CREATE TABLE IF NOT EXISTS outbound_deliveries (
     delivered_at     timestamptz,
     failed_at        timestamptz,
     updated_at       timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (account_id, queue_id),
-    FOREIGN KEY (account_id, message_id)
-        REFERENCES messages (account_id, id) ON DELETE CASCADE
+    PRIMARY KEY (account_id, queue_id)
 ) PARTITION BY HASH (account_id);
 
--- Replace the initial development constraint in databases that created this
--- table before delivery rows followed Sent-message garbage collection.
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'outbound_deliveries_account_id_message_id_fkey'
-          AND conrelid = 'outbound_deliveries'::regclass
-          AND confdeltype = 'c'
-    ) THEN
-        ALTER TABLE outbound_deliveries
-            DROP CONSTRAINT IF EXISTS outbound_deliveries_account_id_message_id_fkey;
-        ALTER TABLE outbound_deliveries
-            ADD CONSTRAINT outbound_deliveries_account_id_message_id_fkey
-            FOREIGN KEY (account_id, message_id)
-            REFERENCES messages (account_id, id) ON DELETE CASCADE;
-    END IF;
-END $$;
+-- message_id is the stable/effective JMAP Email id, not necessarily the id of
+-- the physical row that currently keeps the Email live. A physical-row foreign
+-- key would cascade delivery history when a mailbox move expunges the original
+-- row but leaves a sibling with email_id=message_id. GC removes this projection
+-- only after the effective Email has no live sibling.
+ALTER TABLE outbound_deliveries
+    DROP CONSTRAINT IF EXISTS outbound_deliveries_account_id_message_id_fkey;
 
 CREATE TABLE IF NOT EXISTS outbound_deliveries_p0
     PARTITION OF outbound_deliveries FOR VALUES WITH (MODULUS 4, REMAINDER 0);

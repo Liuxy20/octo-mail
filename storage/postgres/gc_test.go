@@ -197,6 +197,10 @@ func TestCollectGarbageCascadesProjections(t *testing.T) {
 		`INSERT INTO draft_send_claims (account_id,email_id,draft_version,content_digest)
 		 VALUES ($1,$2,1,decode(repeat('22',32),'hex'))`, accID, rootID)
 	must(t, err)
+	_, err = s.Pool.Exec(ctx,
+		`INSERT INTO outbound_deliveries (account_id,queue_id,message_id,recipient,status)
+		 VALUES ($1,$2,$3,'recipient@example.net','queued')`, accID, rootID, rootID)
+	must(t, err)
 	if _, _, err := s.CollectGarbage(ctx, 100); err != nil {
 		t.Fatalf("CollectGarbage with live sibling: %v", err)
 	}
@@ -204,6 +208,13 @@ func TestCollectGarbageCascadesProjections(t *testing.T) {
 		if n := count(table, rootID); n != 1 {
 			t.Fatalf("live sibling lost %s state: %d, want 1", table, n)
 		}
+	}
+	var deliveryRows int
+	must(t, s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbound_deliveries WHERE account_id=$1 AND message_id=$2`,
+		accID, rootID).Scan(&deliveryRows))
+	if deliveryRows != 1 {
+		t.Fatalf("live sibling lost outbound delivery history: %d rows, want 1", deliveryRows)
 	}
 	if _, err := s.Pool.Exec(ctx, `UPDATE messages SET expunged=true WHERE id=$1`, siblingID); err != nil {
 		t.Fatal(err)
@@ -215,5 +226,11 @@ func TestCollectGarbageCascadesProjections(t *testing.T) {
 		if n := count(table, rootID); n != 0 {
 			t.Fatalf("orphaned effective Email %s state remains: %d", table, n)
 		}
+	}
+	must(t, s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbound_deliveries WHERE account_id=$1 AND message_id=$2`,
+		accID, rootID).Scan(&deliveryRows))
+	if deliveryRows != 0 {
+		t.Fatalf("orphaned outbound delivery history remains: %d rows", deliveryRows)
 	}
 }

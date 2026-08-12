@@ -20,7 +20,7 @@ import (
 //  1. Hard-delete expunged message rows, capturing their (tenant_id, blob_ref),
 //     and in the same statement delete the message's projection/workflow rows
 //     (fts, thread_refs, outbound_policy_drafts, agent_outbound_drafts,
-//     draft_send_claims) — those
+//     draft_send_claims, outbound_deliveries) — those
 //     tables have no FK to messages (they are deliberately decoupled from the
 //     delivery write path), so GC is what keeps them from accumulating orphans.
 //  2. For each distinct freed (tenant, ref), delete the blob IFF no live message
@@ -95,6 +95,16 @@ func (s *Store) CollectGarbage(ctx context.Context, limit int) (rowsDeleted int6
 			     DELETE FROM draft_send_claims claim
 			     USING doomed d
 			     WHERE claim.account_id=d.account_id AND claim.email_id=d.effective_email_id
+			       AND NOT EXISTS (
+			         SELECT 1 FROM messages live
+			         WHERE live.account_id=d.account_id
+			           AND COALESCE(live.email_id,live.id)=d.effective_email_id
+			           AND NOT live.expunged
+			       )
+			 ), del_outbound_deliveries AS (
+			     DELETE FROM outbound_deliveries delivery
+			     USING doomed d
+			     WHERE delivery.account_id=d.account_id AND delivery.message_id=d.effective_email_id
 			       AND NOT EXISTS (
 			         SELECT 1 FROM messages live
 			         WHERE live.account_id=d.account_id
