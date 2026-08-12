@@ -18,10 +18,10 @@ import (
 //
 // The sweep, per run:
 //  1. Hard-delete expunged message rows, capturing their (tenant_id, blob_ref),
-//     and in the same statement delete the message's projection rows (fts,
-//     thread_refs) — those tables have no FK to messages (they are deliberately
-//     decoupled from the delivery write path), so GC is what keeps them from
-//     accumulating orphans and degrading the GIN index.
+//     and in the same statement delete the message's projection/workflow rows
+//     (fts, thread_refs, outbound_policy_drafts, agent_outbound_drafts) — those
+//     tables have no FK to messages (they are deliberately decoupled from the
+//     delivery write path), so GC is what keeps them from accumulating orphans.
 //  2. For each distinct freed (tenant, ref), delete the blob IFF no live message
 //     row and no queue row still reference it in that tenant. This respects both
 //     content-addressed dedup and JMAP sibling sharing (AddSibling reuses one
@@ -70,6 +70,14 @@ func (s *Store) CollectGarbage(ctx context.Context, limit int) (rowsDeleted int6
 			     DELETE FROM thread_refs r
 			     USING doomed d
 			     WHERE r.account_id=d.account_id AND r.message_id=d.id
+			 ), del_policy_drafts AS (
+			     DELETE FROM outbound_policy_drafts p
+			     USING doomed d
+			     WHERE p.account_id=d.account_id AND p.email_id=d.id
+			 ), del_agent_drafts AS (
+			     DELETE FROM agent_outbound_drafts a
+			     USING doomed d
+			     WHERE a.account_id=d.account_id AND a.email_id=d.id
 			 )
 			 SELECT a.tenant_id, del.blob_ref FROM del JOIN accounts a ON a.id=del.account_id`, limit)
 		if e != nil {

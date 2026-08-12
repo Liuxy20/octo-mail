@@ -3,6 +3,7 @@ package jmapd_test
 import (
 	"bufio"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -119,7 +120,7 @@ func TestEventSource(t *testing.T) {
 	defer hs.Close()
 
 	// Open the SSE stream.
-	req, _ := http.NewRequestWithContext(ctx, "GET", hs.URL+"/jmap/eventsource", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", hs.URL+"/jmap/eventsource?types=Email&closeafter=no&ping=1", nil)
 	req.SetBasicAuth("u1@example.com", "x")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -139,8 +140,9 @@ func TestEventSource(t *testing.T) {
 			if err != nil {
 				return b.String()
 			}
-			if strings.HasPrefix(line, "data:") {
-				return strings.TrimSpace(line)
+			b.WriteString(line)
+			if line == "\n" {
+				return b.String()
 			}
 		}
 		return ""
@@ -149,6 +151,9 @@ func TestEventSource(t *testing.T) {
 	// Initial state event on connect.
 	if ev := readEvent(); !strings.Contains(ev, "StateChange") {
 		t.Fatalf("no initial StateChange event: %q", ev)
+	}
+	if ev := readEvent(); !strings.Contains(ev, "event: ping") || !strings.Contains(ev, `"interval":1`) {
+		t.Fatalf("no RFC 8620 ping event: %q", ev)
 	}
 
 	// Deliver a message → the coordinator/local Comm should push a new state.
@@ -160,6 +165,53 @@ func TestEventSource(t *testing.T) {
 
 	if ev := readEvent(); !strings.Contains(ev, "StateChange") {
 		t.Fatalf("no StateChange event after delivery: %q", ev)
+	}
+
+	// closeafter=state is the standard fallback for buffering proxies. The
+	// server must return exactly one state event and then close the response.
+	closeReq, _ := http.NewRequestWithContext(ctx, "GET", hs.URL+"/jmap/eventsource?types=Email&closeafter=state&ping=0", nil)
+	closeReq.SetBasicAuth("u1@example.com", "x")
+	closeResp, err := http.DefaultClient.Do(closeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBody, err := io.ReadAll(closeResp.Body)
+	closeResp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(closeBody), "StateChange") {
+		t.Fatalf("closeafter response missing StateChange: %q", closeBody)
+	}
+	var lastEventID string
+	for _, line := range strings.Split(string(closeBody), "\n") {
+		if strings.HasPrefix(line, "id: ") {
+			lastEventID = strings.TrimPrefix(line, "id: ")
+		}
+	}
+	if lastEventID == "" {
+		t.Fatalf("closeafter response missing event id: %q", closeBody)
+	}
+
+	// A reconnect carrying the current Last-Event-ID must wait for a later
+	// change instead of immediately returning the same state in a busy loop.
+	reconnectReq, _ := http.NewRequestWithContext(ctx, "GET", hs.URL+"/jmap/eventsource?types=Email&closeafter=state&ping=0", nil)
+	reconnectReq.SetBasicAuth("u1@example.com", "x")
+	reconnectReq.Header.Set("Last-Event-ID", lastEventID)
+	reconnectResp, err := http.DefaultClient.Do(reconnectReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("Subject: reconnect\r\n\r\nnew\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	reconnectBody, err := io.ReadAll(reconnectResp.Body)
+	reconnectResp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(reconnectBody), "StateChange") || strings.Contains(string(reconnectBody), "id: "+lastEventID+"\n") {
+		t.Fatalf("Last-Event-ID reconnect did not wait for a new state: %q", reconnectBody)
 	}
 	t.Logf("OK: EventSource emitted initial state + push on delivery (SSE)")
 }

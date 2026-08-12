@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
@@ -15,6 +18,8 @@ import (
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/smtp"
 )
+
+var aliasLocalpartPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`)
 
 // Compile-time assertions that the Postgres impls satisfy the kernel interfaces.
 var (
@@ -253,7 +258,13 @@ func (d *Directory) AuthenticateAPIKey(ctx context.Context, token string) (direc
 		return nil, directory.Principal{}, 0, err
 	}
 	_, _ = d.s.Pool.Exec(ctx, `UPDATE api_keys SET last_used_at=now() WHERE id=$1`, keyID)
-	return ts, directory.Principal{TenantID: tenantID, Login: login}, accountID, nil
+	var principalID int64
+	if err := d.s.Pool.QueryRow(ctx,
+		`SELECT id FROM principals WHERE tenant_id=$1 AND login=$2`,
+		tenantID, login).Scan(&principalID); err != nil {
+		return nil, directory.Principal{}, 0, err
+	}
+	return ts, directory.Principal{ID: principalID, TenantID: tenantID, Login: login}, accountID, nil
 }
 
 // newAPIKeyToken generates a random (prefix, secret) pair: prefix is a short
@@ -308,7 +319,8 @@ func (d *Directory) ResolveInbound(ctx context.Context, addr smtp.Path) (directo
 		`SELECT a.account_id, a.tenant_id, a.is_alias
 		 FROM addresses a
 		 JOIN domains d ON d.id = a.domain_id
-		 WHERE d.domain=$1 AND a.localpart=$2 AND NOT d.disabled`,
+		 JOIN accounts acc ON acc.id=a.account_id AND acc.tenant_id=a.tenant_id
+		 WHERE d.domain=$1 AND a.localpart=$2 AND NOT d.disabled AND NOT acc.disabled`,
 		addr.IPDomain.Domain.Name(), string(addr.Localpart)).
 		Scan(&accID, &tenantID, &isAlias)
 	if err == pgx.ErrNoRows {
@@ -342,7 +354,7 @@ func (t *tenantScope) Tenant() directory.TenantInfo { return t.info }
 func (t *tenantScope) Account(ctx context.Context, name string) (store.Account, error) {
 	var id int64
 	err := t.s.Pool.QueryRow(ctx,
-		`SELECT id FROM accounts WHERE tenant_id=$1 AND name=$2`, t.info.ID, name).Scan(&id)
+		`SELECT id FROM accounts WHERE tenant_id=$1 AND name=$2 AND NOT disabled`, t.info.ID, name).Scan(&id)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("no such account")
 	}
@@ -360,7 +372,7 @@ func (t *tenantScope) AccountForAddress(ctx context.Context, addr smtp.Path) (st
 		`SELECT a.account_id, acc.name
 		 FROM addresses a
 		 JOIN domains d ON d.id = a.domain_id
-		 JOIN accounts acc ON acc.id = a.account_id
+		 JOIN accounts acc ON acc.id = a.account_id AND NOT acc.disabled
 		 WHERE a.tenant_id=$1 AND d.domain=$2 AND a.localpart=$3`,
 		t.info.ID, addr.IPDomain.Domain.Name(), string(addr.Localpart)).Scan(&accID, &name)
 	if err == pgx.ErrNoRows {
@@ -378,7 +390,7 @@ func (t *tenantScope) AccountForAddress(ctx context.Context, addr smtp.Path) (st
 func (t *tenantScope) AccountForID(ctx context.Context, id int64) (store.Account, error) {
 	var name string
 	err := t.s.Pool.QueryRow(ctx,
-		`SELECT name FROM accounts WHERE id=$1 AND tenant_id=$2`, id, t.info.ID).Scan(&name)
+		`SELECT name FROM accounts WHERE id=$1 AND tenant_id=$2 AND NOT disabled`, id, t.info.ID).Scan(&name)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("no such account")
 	}
@@ -386,6 +398,371 @@ func (t *tenantScope) AccountForID(ctx context.Context, id int64) (store.Account
 		return nil, err
 	}
 	return t.s.openAccount(id, t.info.ID, name), nil
+}
+
+func (t *tenantScope) AccountAddresses(ctx context.Context, accountID int64) ([]directory.MailAddress, error) {
+	rows, err := t.s.Pool.Query(ctx,
+		`SELECT a.id, a.localpart || '@' || d.domain, NOT a.is_alias
+		 FROM addresses a
+		 JOIN domains d ON d.id=a.domain_id AND d.tenant_id=a.tenant_id
+		 WHERE a.tenant_id=$1 AND a.account_id=$2
+		 ORDER BY a.is_alias, a.id`,
+		t.info.ID, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("list account addresses: %w", err)
+	}
+	defer rows.Close()
+	var addresses []directory.MailAddress
+	for rows.Next() {
+		var address directory.MailAddress
+		if err := rows.Scan(&address.ID, &address.Address, &address.Primary); err != nil {
+			return nil, fmt.Errorf("scan account address: %w", err)
+		}
+		addresses = append(addresses, address)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list account addresses: %w", err)
+	}
+	return addresses, nil
+}
+
+func (t *tenantScope) CreateAccountAlias(ctx context.Context, accountID int64, localpart string) (directory.MailAddress, error) {
+	localpart = strings.ToLower(strings.TrimSpace(localpart))
+	if !aliasLocalpartPattern.MatchString(localpart) || strings.Contains(localpart, "..") {
+		return directory.MailAddress{}, directory.ErrInvalidLocalpart
+	}
+	var domainID int64
+	var domainName string
+	err := t.s.Pool.QueryRow(ctx,
+		`SELECT a.domain_id, d.domain
+		 FROM addresses a
+		 JOIN domains d ON d.id=a.domain_id AND d.tenant_id=a.tenant_id
+		 JOIN accounts acc ON acc.id=a.account_id AND acc.tenant_id=a.tenant_id
+		 WHERE a.tenant_id=$1 AND a.account_id=$2 AND NOT a.is_alias
+		 ORDER BY a.id
+		 LIMIT 1`,
+		t.info.ID, accountID).Scan(&domainID, &domainName)
+	if err == pgx.ErrNoRows {
+		return directory.MailAddress{}, directory.ErrAddressNotFound
+	}
+	if err != nil {
+		return directory.MailAddress{}, fmt.Errorf("find primary address: %w", err)
+	}
+	var address directory.MailAddress
+	err = t.s.Pool.QueryRow(ctx,
+		`INSERT INTO addresses (tenant_id, domain_id, account_id, localpart, is_alias)
+		 VALUES ($1,$2,$3,$4,true)
+		 ON CONFLICT (domain_id, localpart) DO NOTHING
+		 RETURNING id`,
+		t.info.ID, domainID, accountID, localpart).Scan(&address.ID)
+	if err == pgx.ErrNoRows {
+		return directory.MailAddress{}, directory.ErrAddressExists
+	}
+	if err != nil {
+		return directory.MailAddress{}, fmt.Errorf("create account alias: %w", err)
+	}
+	address.Address = localpart + "@" + domainName
+	return address, nil
+}
+
+func (t *tenantScope) DeleteAccountAlias(ctx context.Context, accountID, addressID int64) error {
+	var isAlias bool
+	err := t.s.Pool.QueryRow(ctx,
+		`SELECT is_alias FROM addresses
+		 WHERE tenant_id=$1 AND account_id=$2 AND id=$3`,
+		t.info.ID, accountID, addressID).Scan(&isAlias)
+	if err == pgx.ErrNoRows {
+		return directory.ErrAddressNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("find account alias: %w", err)
+	}
+	if !isAlias {
+		return directory.ErrPrimaryAddress
+	}
+	ct, err := t.s.Pool.Exec(ctx,
+		`DELETE FROM addresses WHERE tenant_id=$1 AND account_id=$2 AND id=$3 AND is_alias`,
+		t.info.ID, accountID, addressID)
+	if err != nil {
+		return fmt.Errorf("delete account alias: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return directory.ErrAddressNotFound
+	}
+	return nil
+}
+
+func (t *tenantScope) AgentMailboxes(ctx context.Context, principalID int64, spaceID string) ([]directory.AgentMailbox, error) {
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return nil, directory.ErrAuthorizationSpaceMismatch
+	}
+	rows, err := t.s.Pool.Query(ctx,
+		`SELECT acc.id, addr.localpart || '@' || dom.domain,
+		        COALESCE(binding.bot_id,''),COALESCE(binding.bot_profile,''),
+		        CASE WHEN binding.id IS NULL THEN 'unconnected' ELSE 'connected' END,
+		        COALESCE(binding.outbound_mode,'manual_confirmation'),
+		        NOT EXISTS (
+		          SELECT 1 FROM gateway_identities gateway_default
+		          WHERE gateway_default.default_account_id=acc.id
+		            AND gateway_default.tenant_id=acc.tenant_id
+		            AND gateway_default.owner_principal_id=acc.owner_principal_id
+		            AND NOT gateway_default.disabled
+		        )
+		 FROM accounts acc
+		 JOIN principals p ON p.id=acc.owner_principal_id AND p.tenant_id=acc.tenant_id
+		 JOIN addresses addr ON addr.account_id=acc.id AND addr.tenant_id=acc.tenant_id AND NOT addr.is_alias
+		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
+		 LEFT JOIN LATERAL (
+		   SELECT id,bot_id,bot_profile,outbound_mode FROM agent_bindings
+		   WHERE account_id=acc.id AND status='active'
+		   ORDER BY id DESC LIMIT 1
+		 ) binding ON true
+		 WHERE acc.tenant_id=$1 AND p.id=$2 AND NOT acc.disabled
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM agent_mailbox_registrations registration
+		       WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		         AND registration.owner_principal_id=acc.owner_principal_id
+		         AND registration.space_id=$3
+		     ) OR EXISTS (
+		       SELECT 1 FROM gateway_identities gateway
+		       WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
+		         AND gateway.owner_principal_id=acc.owner_principal_id
+		         AND gateway.space_id=$3 AND NOT gateway.disabled
+		     )
+		   )
+		 ORDER BY acc.created_at, acc.id`,
+		t.info.ID, principalID, spaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list agent mailboxes: %w", err)
+	}
+	defer rows.Close()
+	var mailboxes []directory.AgentMailbox
+	for rows.Next() {
+		var mailbox directory.AgentMailbox
+		if err := rows.Scan(&mailbox.ID, &mailbox.Address, &mailbox.BotID, &mailbox.BotProfile, &mailbox.ConnectState, &mailbox.OutboundMode, &mailbox.Deletable); err != nil {
+			return nil, fmt.Errorf("scan agent mailbox: %w", err)
+		}
+		mailboxes = append(mailboxes, mailbox)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list agent mailboxes: %w", err)
+	}
+	return mailboxes, nil
+}
+
+func (t *tenantScope) DeleteAgentMailbox(ctx context.Context, principalID, accountID int64, spaceID string) error {
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return directory.ErrAuthorizationSpaceMismatch
+	}
+	tx, err := t.s.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delete Agent mailbox: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless Commit succeeds
+
+	var deletable bool
+	err = tx.QueryRow(ctx,
+		`SELECT NOT EXISTS (
+		   SELECT 1 FROM gateway_identities gateway
+		   WHERE gateway.default_account_id=acc.id
+		     AND gateway.tenant_id=acc.tenant_id
+		     AND gateway.owner_principal_id=acc.owner_principal_id
+		     AND NOT gateway.disabled
+		 )
+		 FROM accounts acc
+		 WHERE acc.id=$1 AND acc.tenant_id=$2 AND acc.owner_principal_id=$3
+		   AND NOT acc.disabled
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM agent_mailbox_registrations registration
+		       WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		         AND registration.owner_principal_id=acc.owner_principal_id
+		         AND registration.space_id=$4
+		     ) OR EXISTS (
+		       SELECT 1 FROM gateway_identities gateway_space
+		       WHERE gateway_space.default_account_id=acc.id
+		         AND gateway_space.tenant_id=acc.tenant_id
+		         AND gateway_space.owner_principal_id=acc.owner_principal_id
+		         AND gateway_space.space_id=$4 AND NOT gateway_space.disabled
+		     )
+		   )
+		 FOR UPDATE OF acc`,
+		accountID, t.info.ID, principalID, spaceID).Scan(&deletable)
+	if err == pgx.ErrNoRows {
+		return directory.ErrMailboxNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("resolve Agent mailbox deletion: %w", err)
+	}
+	if !deletable {
+		return directory.ErrAgentMailboxNotDeletable
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE agent_binding_credentials SET revoked_at=now()
+		 WHERE revoked_at IS NULL AND binding_id IN (
+		   SELECT id FROM agent_bindings WHERE account_id=$1 AND status='active'
+		 )`, accountID); err != nil {
+		return fmt.Errorf("revoke Agent mailbox credentials: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE agent_bindings SET status='revoked',revoked_at=now()
+		 WHERE account_id=$1 AND status='active'`, accountID); err != nil {
+		return fmt.Errorf("revoke Agent mailbox binding: %w", err)
+	}
+	command, err := tx.Exec(ctx,
+		`UPDATE accounts SET disabled=true WHERE id=$1 AND tenant_id=$2 AND owner_principal_id=$3 AND NOT disabled`,
+		accountID, t.info.ID, principalID)
+	if err != nil {
+		return fmt.Errorf("disable Agent mailbox: %w", err)
+	}
+	if command.RowsAffected() != 1 {
+		return directory.ErrMailboxNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete Agent mailbox: %w", err)
+	}
+	return nil
+}
+
+func (t *tenantScope) CreateAgentMailbox(ctx context.Context, principalID, sourceAccountID int64, spaceID, localpart, configuredDomain string, maxPerOwnerSpace int) (directory.AgentMailbox, error) {
+	localpart = strings.ToLower(strings.TrimSpace(localpart))
+	if !aliasLocalpartPattern.MatchString(localpart) || strings.Contains(localpart, "..") {
+		return directory.AgentMailbox{}, directory.ErrInvalidLocalpart
+	}
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return directory.AgentMailbox{}, directory.ErrAuthorizationSpaceMismatch
+	}
+	if maxPerOwnerSpace <= 0 {
+		maxPerOwnerSpace = 2
+	}
+
+	tx, err := t.s.Pool.Begin(ctx)
+	if err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("begin create agent mailbox: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless Commit succeeds
+
+	// Registration is rare, so locking the owner row is a deliberately simple
+	// cross-instance serialization point. It prevents two concurrent requests
+	// from both observing one remaining slot and exceeding the configured limit.
+	var lockedOwnerID int64
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM principals WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
+		principalID, t.info.ID).Scan(&lockedOwnerID); err == pgx.ErrNoRows {
+		return directory.AgentMailbox{}, directory.ErrMailboxNotFound
+	} else if err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("lock Agent mailbox owner: %w", err)
+	}
+
+	var domainID int64
+	var domainName string
+	err = tx.QueryRow(ctx,
+		`SELECT addr.domain_id, dom.domain
+		 FROM accounts acc
+		 JOIN principals p ON p.id=acc.owner_principal_id AND p.tenant_id=acc.tenant_id
+		 JOIN addresses addr ON addr.account_id=acc.id AND addr.tenant_id=acc.tenant_id AND NOT addr.is_alias
+		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
+		 WHERE acc.tenant_id=$1 AND acc.id=$2 AND p.id=$3`,
+		t.info.ID, sourceAccountID, principalID).Scan(&domainID, &domainName)
+	if err == pgx.ErrNoRows {
+		return directory.AgentMailbox{}, directory.ErrMailboxNotFound
+	}
+	if err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("resolve agent mailbox owner: %w", err)
+	}
+	if configuredDomain = strings.ToLower(strings.TrimSpace(configuredDomain)); configuredDomain != "" {
+		err = tx.QueryRow(ctx,
+			`SELECT id, domain
+			 FROM domains
+			 WHERE tenant_id=$1 AND domain=$2 AND NOT disabled`,
+			t.info.ID, configuredDomain).Scan(&domainID, &domainName)
+		if err == pgx.ErrNoRows {
+			return directory.AgentMailbox{}, directory.ErrAgentMailboxDomainNotFound
+		}
+		if err != nil {
+			return directory.AgentMailbox{}, fmt.Errorf("resolve configured Agent mailbox domain: %w", err)
+		}
+	}
+
+	var registered int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*)
+		 FROM accounts acc
+		 WHERE acc.tenant_id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM agent_mailbox_registrations registration
+		       WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		         AND registration.owner_principal_id=acc.owner_principal_id
+		         AND registration.space_id=$3
+		     ) OR EXISTS (
+		       SELECT 1 FROM gateway_identities gateway
+		       WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
+		         AND gateway.owner_principal_id=acc.owner_principal_id
+		         AND gateway.space_id=$3 AND NOT gateway.disabled
+		     )
+		   )`,
+		t.info.ID, principalID, spaceID).Scan(&registered); err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("count Agent mailboxes in Space: %w", err)
+	}
+	if registered >= maxPerOwnerSpace {
+		return directory.AgentMailbox{}, directory.ErrAgentMailboxLimit
+	}
+
+	var mailbox directory.AgentMailbox
+	mailbox.Address = localpart + "@" + domainName
+	var mailboxPrincipalID int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO principals (tenant_id, login) VALUES ($1,$2) RETURNING id`,
+		t.info.ID, mailbox.Address).Scan(&mailboxPrincipalID); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return directory.AgentMailbox{}, directory.ErrAddressExists
+		}
+		return directory.AgentMailbox{}, fmt.Errorf("create agent mailbox principal: %w", err)
+	}
+
+	err = tx.QueryRow(ctx,
+		`INSERT INTO accounts (tenant_id, principal_id, owner_principal_id, name)
+		 VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (tenant_id, name) DO NOTHING
+		 RETURNING id`,
+		t.info.ID, mailboxPrincipalID, principalID, "agent-mailbox:"+mailbox.Address).Scan(&mailbox.ID)
+	if err == pgx.ErrNoRows {
+		return directory.AgentMailbox{}, directory.ErrAddressExists
+	}
+	if err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("create agent mailbox account: %w", err)
+	}
+
+	var addressID int64
+	err = tx.QueryRow(ctx,
+		`INSERT INTO addresses (tenant_id, domain_id, account_id, localpart, is_alias)
+		 VALUES ($1,$2,$3,$4,false)
+		 ON CONFLICT (domain_id, localpart) DO NOTHING
+		 RETURNING id`,
+		t.info.ID, domainID, mailbox.ID, localpart).Scan(&addressID)
+	if err == pgx.ErrNoRows {
+		return directory.AgentMailbox{}, directory.ErrAddressExists
+	}
+	if err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("create agent mailbox address: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO agent_mailbox_registrations
+		 (tenant_id,account_id,owner_principal_id,space_id)
+		 VALUES ($1,$2,$3,$4)`,
+		t.info.ID, mailbox.ID, principalID, spaceID); err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("register Agent mailbox in Space: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("commit agent mailbox: %w", err)
+	}
+	return mailbox, nil
 }
 
 func (t *tenantScope) Accounts(ctx context.Context) ([]store.Account, error) {

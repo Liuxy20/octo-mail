@@ -100,6 +100,31 @@ func (a *account) MailboxEnsure(tx store.Tx, name string, subscribe bool, su sto
 	return mb, pt.changes[before:], nil
 }
 
+func (a *account) MailboxSetSpecialUse(tx store.Tx, mb *store.Mailbox, su store.SpecialUse) ([]store.Change, error) {
+	pt := tx.(*pgTx)
+	before := len(pt.changes)
+	seq := pt.nextModSeq()
+	ct, err := pt.tx.Exec(pt.ctx,
+		`UPDATE mailboxes
+		 SET su_archive=$1, su_draft=$2, su_junk=$3, su_sent=$4, su_trash=$5, modseq=$6
+		 WHERE account_id=$7 AND id=$8 AND NOT expunged`,
+		su.Archive, su.Draft, su.Junk, su.Sent, su.Trash, int64(seq), pt.acc.id, mb.ID)
+	if err != nil {
+		return nil, err
+	}
+	if ct.RowsAffected() == 0 {
+		return nil, pgx.ErrNoRows
+	}
+	if err := pt.record(store.ChangeMailboxSpecialUse{
+		MailboxID: mb.ID, MailboxName: mb.Name, SpecialUse: su, ModSeq: seq,
+	}); err != nil {
+		return nil, err
+	}
+	mb.SpecialUse = su
+	mb.ModSeq = seq
+	return pt.changes[before:], nil
+}
+
 func (a *account) MailboxCreate(tx store.Tx, name string, su store.SpecialUse) (store.Mailbox, []store.Change, []string, bool, error) {
 	pt := tx.(*pgTx)
 	if _, ok, err := pt.findMailbox(name); err != nil {

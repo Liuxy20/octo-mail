@@ -12,8 +12,13 @@
 package webapi
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,8 +28,11 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/deliverability"
-	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
+	"github.com/Mininglamp-OSS/octo-mail/security/gatewayassert"
 	"github.com/mjl-/mox/ratelimit"
 	"github.com/mjl-/mox/smtp"
 )
@@ -33,7 +41,7 @@ import (
 // manages the per-account suppression list.
 type Server struct {
 	Dir          directory.Directory
-	Submission   *submit.Submitter
+	Submission   messageSubmitter
 	Suppressions *deliverability.Suppressions
 	// Log, if set, records the full internal error behind a 500; the client only
 	// ever gets a generic message, so raw DB/driver text can't leak. Optional.
@@ -41,6 +49,66 @@ type Server struct {
 	// LoginLimiter, if set, throttles failed authentication attempts per client IP
 	// (brute-force / credential-stuffing + enumeration defense). Optional.
 	LoginLimiter *ratelimit.Limiter
+	// DeviceFlowLimiter, if set, throttles every public device creation and token
+	// polling request with a coarse per-source budget. Behind a trusted reverse
+	// proxy this intentionally becomes a deployment-wide circuit breaker.
+	DeviceFlowLimiter *ratelimit.Limiter
+	// DeviceCreateLimiter bounds device-flow creation per source address without
+	// consuming the budget used by normal token polling.
+	DeviceCreateLimiter *ratelimit.Limiter
+	// DeviceTokenLimiter bounds token polling per opaque device code. This keeps
+	// concurrent authorizations independent even when a reverse proxy is the
+	// RemoteAddr for every request.
+	DeviceTokenLimiter *ratelimit.Limiter
+	// AuthorizationURL is the octo-web page where a human owner approves a
+	// device request. It may be absolute in deployments or a gateway-relative
+	// path when octo-mail and octo-web share an origin.
+	AuthorizationURL string
+	// GatewaySecret verifies short-lived identity assertions minted by the
+	// authenticated OCTO gateway. Empty disables this authentication path.
+	GatewaySecret []byte
+	// OutboundPolicy evaluates Agent-originated outbound content after the
+	// owner/automation authorization gate and before any Sent copy or queue
+	// side effect. Nil preserves the historical allow-all behavior.
+	OutboundPolicy outboundpolicy.Evaluator
+	// AutoReplyChain authenticates and bounds owner-approved Agent automatic
+	// replies. Nil is the explicit rollback/disabled behavior.
+	AutoReplyChain *autoreplychain.Chain
+	// RuleMetadata verifies server-generated forwarding attribution before it is
+	// exposed to clients. Nil fails closed and treats all such headers as external.
+	RuleMetadata *rulemetadata.Authenticator
+	// MaxAgentMailboxesPerOwnerSpace is the total per-owner, per-Space Agent
+	// mailbox limit, including the gateway default Agent mailbox. The directory
+	// enforces it transactionally when another mailbox is registered. Zero keeps
+	// the safe product default of two for embedders/tests that omit the field.
+	MaxAgentMailboxesPerOwnerSpace int
+	// AgentMailboxDomain, when configured, is the tenant-owned address domain
+	// used for newly registered Agent mailboxes and advertised to the owner UI.
+	// Empty preserves the legacy behavior of inheriting the source account domain.
+	AgentMailboxDomain string
+	// MaxMessageSize bounds WebAPI request bodies and MIME message parsing.
+	// Zero preserves the historical 64 MiB limit for direct embedders/tests.
+	MaxMessageSize int64
+}
+
+const (
+	defaultMaxAgentMailboxesPerOwnerSpace = 2
+	defaultMaxMessageSize                 = 64 << 20
+	maxDeviceAuthorizationBodySize        = 4 << 10
+)
+
+func (s *Server) maxAgentMailboxesPerOwnerSpace() int {
+	if s.MaxAgentMailboxesPerOwnerSpace > 0 {
+		return s.MaxAgentMailboxesPerOwnerSpace
+	}
+	return defaultMaxAgentMailboxesPerOwnerSpace
+}
+
+func (s *Server) maxMessageSize() int64 {
+	if s.MaxMessageSize > 0 {
+		return s.MaxMessageSize
+	}
+	return defaultMaxMessageSize
 }
 
 // Handler mounts the REST routes under /webapi/v0 using method+path patterns
@@ -49,36 +117,115 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// Messages.
 	mux.HandleFunc("GET /webapi/v0/messages", s.h(s.listMessages))
-	mux.HandleFunc("POST /webapi/v0/messages", s.h(s.sendMessage))
+	mux.HandleFunc("POST /webapi/v0/messages", s.hAgentConfirmed("mail.message.send", s.sendMessage))
 	mux.HandleFunc("GET /webapi/v0/messages/{id}", s.h(s.getMessage))
 	mux.HandleFunc("PATCH /webapi/v0/messages/{id}", s.h(s.patchMessage))
-	mux.HandleFunc("DELETE /webapi/v0/messages/{id}", s.h(s.deleteMessage))
+	mux.HandleFunc("DELETE /webapi/v0/messages/{id}", s.hAgentConfirmed("mail.message.delete", s.deleteMessage))
 	mux.HandleFunc("GET /webapi/v0/messages/{id}/raw", s.hRaw(s.rawMessage))
-	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply", s.h(s.replyMessage))
-	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply-all", s.h(s.replyAllMessage))
-	mux.HandleFunc("POST /webapi/v0/messages/{id}/forward", s.h(s.forwardMessage))
+	mux.HandleFunc("GET /webapi/v0/messages/{id}/attachments/{partId}", s.downloadAttachment)
+	mux.HandleFunc("GET /webapi/v0/messages/{id}/delivery", s.h(s.getMessageDelivery))
+	mux.HandleFunc("GET /webapi/v0/messages/{id}/auto-reply-context", s.h(s.getAutoReplyContext))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply-draft", s.h(s.createAgentReplyDraft))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply", s.hAgentConfirmed("mail.message.reply", s.replyMessage))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply-all", s.hAgentConfirmed("mail.message.reply_all", s.replyAllMessage))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/forward", s.hAgentConfirmed("mail.message.forward", s.forwardMessage))
 	// Threads.
 	mux.HandleFunc("GET /webapi/v0/threads/{id}", s.h(s.getThread))
 	// Drafts.
 	mux.HandleFunc("GET /webapi/v0/drafts", s.h(s.listDrafts))
+	mux.HandleFunc("POST /webapi/v0/agent-send-intents", s.h(s.createAgentSendIntent))
+	mux.HandleFunc("POST /webapi/v0/agent-drafts", s.h(s.createAgentDraft))
 	mux.HandleFunc("POST /webapi/v0/drafts", s.h(s.createDraft))
-	mux.HandleFunc("POST /webapi/v0/drafts/{id}/send", s.h(s.sendDraft))
-	mux.HandleFunc("DELETE /webapi/v0/drafts/{id}", s.h(s.deleteDraft))
+	mux.HandleFunc("PATCH /webapi/v0/drafts/{id}", s.h(s.updateDraft))
+	mux.HandleFunc("POST /webapi/v0/drafts/{id}/send", s.hAgentConfirmed("mail.draft.send", s.sendDraft))
+	mux.HandleFunc("DELETE /webapi/v0/drafts/{id}", s.hAgentConfirmed("mail.draft.delete", s.deleteDraft))
 	// Mailboxes.
 	mux.HandleFunc("GET /webapi/v0/mailboxes", s.h(s.listMailboxes))
+	mux.HandleFunc("GET /webapi/v0/identity", s.h(s.getIdentity))
+	// Account addresses.
+	mux.HandleFunc("GET /webapi/v0/addresses", s.h(s.listAddresses))
+	mux.HandleFunc("POST /webapi/v0/addresses", s.h(s.createAddress))
+	mux.HandleFunc("DELETE /webapi/v0/addresses/{id}", s.h(s.deleteAddress))
+	// Independent Agent mailboxes owned by the authenticated principal.
+	mux.HandleFunc("GET /webapi/v0/agent-mailboxes", s.h(s.listAgentMailboxes))
+	mux.HandleFunc("POST /webapi/v0/agent-mailboxes", s.h(s.createAgentMailbox))
+	mux.HandleFunc("DELETE /webapi/v0/agent-mailboxes/{id}", s.h(s.deleteAgentMailbox))
+	mux.HandleFunc("DELETE /webapi/v0/agent-mailboxes/{id}/binding", s.h(s.revokeAgentMailboxBinding))
+	mux.HandleFunc("PATCH /webapi/v0/agent-mailboxes/{id}/automation", s.h(s.updateAgentMailboxAutomation))
+	mux.HandleFunc("GET /webapi/v0/agent-mailboxes/{mailboxId}/rules", s.h(s.listAgentMailRules))
+	mux.HandleFunc("POST /webapi/v0/agent-mailboxes/{mailboxId}/rules", s.h(s.createAgentMailRule))
+	mux.HandleFunc("PATCH /webapi/v0/agent-mailboxes/{mailboxId}/rules/{ruleId}", s.h(s.updateAgentMailRule))
+	mux.HandleFunc("DELETE /webapi/v0/agent-mailboxes/{mailboxId}/rules/{ruleId}", s.h(s.deleteAgentMailRule))
+	mux.HandleFunc("GET /webapi/v0/agent-mailboxes/{mailboxId}/rule-executions", s.h(s.listAgentMailRuleExecutions))
+	// Agent device authorization. Device creation and token exchange are public
+	// OAuth-style endpoints; request inspection/approval requires the owner.
+	mux.HandleFunc("POST /webapi/v0/agent-auth/device", s.deviceFlowLimited(s.deviceCreateLimited(s.deviceBodyLimited(s.createAgentDeviceAuthorization))))
+	mux.HandleFunc("POST /webapi/v0/agent-auth/token", s.deviceFlowLimited(s.deviceBodyLimited(s.exchangeAgentAuthorization)))
+	mux.HandleFunc("GET /webapi/v0/agent-auth/requests/{code}", s.h(s.getAgentAuthorization))
+	mux.HandleFunc("POST /webapi/v0/agent-auth/requests/{code}/approve", s.h(s.approveAgentAuthorization))
 	// Suppressions.
 	mux.HandleFunc("GET /webapi/v0/suppressions", s.h(s.listSuppressions))
 	mux.HandleFunc("GET /webapi/v0/suppressions/{address}", s.h(s.getSuppression))
 	mux.HandleFunc("PUT /webapi/v0/suppressions/{address}", s.h(s.putSuppression))
 	mux.HandleFunc("DELETE /webapi/v0/suppressions/{address}", s.h(s.deleteSuppression))
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, s.maxMessageSize())
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) deviceFlowLimited(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if s.DeviceFlowLimiter != nil && ip != nil {
+			if !s.DeviceFlowLimiter.Add(ip, time.Now(), 1) {
+				s.writeErr(w, r, errStatus(http.StatusTooManyRequests, "slow_down", "device authorization requests are too frequent"))
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) deviceCreateLimited(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if s.DeviceCreateLimiter != nil && ip != nil && !s.DeviceCreateLimiter.Add(ip, time.Now(), 1) {
+			s.writeErr(w, r, errStatus(http.StatusTooManyRequests, "slow_down", "device authorization requests are too frequent"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) deviceBodyLimited(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxDeviceAuthorizationBodySize)
+		next(w, r)
+	}
+}
+
+func deviceCodeLimitKey(deviceCode string) net.IP {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(deviceCode)))
+	return net.IPv4(digest[0], digest[1], digest[2], digest[3])
+}
+
+func (s *Server) allowDeviceTokenPoll(deviceCode string) bool {
+	return s.DeviceTokenLimiter == nil || s.DeviceTokenLimiter.Add(deviceCodeLimitKey(deviceCode), time.Now(), 1)
 }
 
 // authCtx carries the authenticated account for a request.
 type authCtx struct {
-	acc   store.Account
-	scope directory.TenantScope
-	login string
+	acc                 store.Account
+	scope               directory.TenantScope
+	principal           directory.Principal
+	login               string
+	spaceID             string
+	agentCredentialID   int64
+	humanAuthenticated  bool
+	ownerConfirmedDraft bool
 }
 
 // auth authenticates the request, throttling by client IP: it refuses once the
@@ -109,6 +256,49 @@ func clientIP(r *http.Request) net.IP {
 }
 
 func (s *Server) authenticate(r *http.Request) (authCtx, error) {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omg_") {
+		if len(s.GatewaySecret) < 32 {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		body, err := readAndRestoreAuthBody(r, s.maxMessageSize())
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		selectedMailbox := strings.TrimSpace(r.Header.Get("X-Octo-Mailbox-ID"))
+		verificationTime := time.Now().UTC()
+		claims, err := gatewayassert.VerifyForMailbox(s.GatewaySecret, strings.TrimPrefix(h, "Bearer "), selectedMailbox, r.Method, r.URL.RequestURI(), body, verificationTime)
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		replayDir, ok := s.Dir.(directory.GatewayAssertionReplayDirectory)
+		if !ok || replayDir.ConsumeGatewayAssertionNonce(r.Context(), claims.Issuer, claims.Nonce, time.Unix(claims.ExpiresAt, 0), verificationTime) != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		gatewayDir, ok := s.Dir.(directory.GatewayIdentityDirectory)
+		if !ok {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		selectedAccountID := int64(0)
+		if raw := selectedMailbox; raw != "" {
+			selectedAccountID, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil || selectedAccountID <= 0 {
+				return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+			}
+		}
+		scope, principal, accountID, err := gatewayDir.AuthenticateGatewayIdentity(r.Context(), claims.Issuer, claims.Subject, claims.SpaceID, selectedAccountID)
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		acc, err := scope.AccountForID(r.Context(), accountID)
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		login, err := primaryAccountAddress(r.Context(), scope, accountID)
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		return authCtx{acc: acc, scope: scope, principal: principal, login: login, spaceID: claims.SpaceID, humanAuthenticated: true}, nil
+	}
 	// API key first: Authorization: Bearer omk_<prefix>_<secret>.
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omk_") {
 		token := strings.TrimPrefix(h, "Bearer ")
@@ -123,7 +313,26 @@ func (s *Server) authenticate(r *http.Request) (authCtx, error) {
 		if err != nil {
 			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for key")
 		}
-		return authCtx{acc: acc, scope: scope, login: princ.Login}, nil
+		return authCtx{acc: acc, scope: scope, principal: princ, login: princ.Login}, nil
+	}
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omb_") {
+		token := strings.TrimPrefix(h, "Bearer ")
+		agentDir, ok := s.Dir.(directory.AgentAuthorizationDirectory)
+		if !ok {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		scope, princ, accountID, credentialID, err := agentDir.AuthenticateAgentCredential(r.Context(), token)
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
+		}
+		acc, err := scope.AccountForID(r.Context(), accountID)
+		if err != nil {
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for credential")
+		}
+		return authCtx{
+			acc: acc, scope: scope, principal: princ, login: princ.Login,
+			agentCredentialID: credentialID,
+		}, nil
 	}
 
 	login, password, ok := r.BasicAuth()
@@ -134,7 +343,7 @@ func (s *Server) authenticate(r *http.Request) (authCtx, error) {
 	if err != nil {
 		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "bad login address")
 	}
-	scope, _, err := s.Dir.AuthenticatePrincipal(r.Context(), login, directory.PasswordCredential(password))
+	scope, principal, err := s.Dir.AuthenticatePrincipal(r.Context(), login, directory.PasswordCredential(password))
 	if err != nil {
 		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
 	}
@@ -142,7 +351,32 @@ func (s *Server) authenticate(r *http.Request) (authCtx, error) {
 	if err != nil {
 		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for login")
 	}
-	return authCtx{acc: acc, scope: scope, login: login}, nil
+	return authCtx{acc: acc, scope: scope, principal: principal, login: login, humanAuthenticated: true}, nil
+}
+
+func primaryAccountAddress(ctx context.Context, scope directory.TenantScope, accountID int64) (string, error) {
+	addresses, err := scope.AccountAddresses(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	for _, address := range addresses {
+		if address.Primary && strings.TrimSpace(address.Address) != "" {
+			return address.Address, nil
+		}
+	}
+	return "", fmt.Errorf("account %d has no primary address", accountID)
+}
+
+func readAndRestoreAuthBody(r *http.Request, limit int64) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil || int64(len(body)) > limit {
+		return nil, fmt.Errorf("request body unavailable")
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
 }
 
 // handler is a REST handler that returns (status, body) or an error. A nil body
@@ -205,9 +439,32 @@ func (s *Server) hRaw(fn func(ctx context.Context, a authCtx, r *http.Request) (
 
 // decode reads and JSON-decodes the request body (capped) into v.
 func decode(r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 64<<20))
+	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return errStatus(http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
+		}
 		return errStatus(http.StatusBadRequest, "invalid_body", "invalid JSON body: "+err.Error())
+	}
+	return nil
+}
+
+// decodeStrict is used by security-sensitive intent endpoints whose accepted
+// field set is part of the authorization scope. Unknown fields must not be
+// silently ignored and later interpreted differently by another component.
+func decodeStrict(r *http.Request, v any) error {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return errStatus(http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
+		}
+		return errStatus(http.StatusBadRequest, "invalid_body", "invalid JSON body: "+err.Error())
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errStatus(http.StatusBadRequest, "invalid_body", "request body must contain exactly one JSON value")
 	}
 	return nil
 }
@@ -257,6 +514,7 @@ type statusError struct {
 	code   string
 	msg    string
 	cause  error
+	policy any
 }
 
 func (e *statusError) Error() string { return e.msg }
@@ -286,9 +544,13 @@ func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	if se.cause != nil && s.Log != nil {
 		s.Log.WarnContext(r.Context(), "webapi internal error", "method", r.Method, "path", r.URL.Path, "code", se.code, "err", se.cause)
 	}
-	writeJSON(w, se.status, map[string]any{
+	body := map[string]any{
 		"error": map[string]string{"code": se.code, "message": se.msg},
-	})
+	}
+	if se.policy != nil {
+		body["policy"] = se.policy
+	}
+	writeJSON(w, se.status, body)
 }
 
 // senderDomain returns the account login's domain, for Message-ID generation.

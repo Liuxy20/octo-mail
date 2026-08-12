@@ -107,6 +107,15 @@ type SMTPDeliverer struct {
 // ErrSuppressed indicates the recipient is on the account suppression list.
 var ErrSuppressed = errors.New("recipient suppressed")
 
+type suppressedError struct {
+	err error
+}
+
+func (e *suppressedError) Error() string              { return e.err.Error() }
+func (e *suppressedError) Unwrap() error              { return e.err }
+func (e *suppressedError) Permanent() bool            { return true }
+func (e *suppressedError) DeliveryReasonCode() string { return "recipient_suppressed" }
+
 // Deliver implements queue.Deliverer.
 func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 	domain := addr.Domain(m.RcptTo)
@@ -123,7 +132,7 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 			return fmt.Errorf("suppression check for %s: %w", m.RcptTo, err)
 		}
 		if sup {
-			return fmt.Errorf("%w: %s", ErrSuppressed, m.RcptTo)
+			return &suppressedError{err: fmt.Errorf("%w: %s", ErrSuppressed, m.RcptTo)}
 		}
 	}
 
@@ -281,9 +290,19 @@ func (e *resultErr) Permanent() bool           { return e.permanent }
 // extracting the code/secode and permanence; otherwise it records code 0 and
 // treats the error as transient (retryable).
 func smtpResultErr(wrapped, cause error) error {
-	var se *smtpclient.Error
+	// smtpclient.Error implements error on a value receiver and is commonly
+	// returned as a value. Match that concrete shape so 5xx replies retain their
+	// code and permanence instead of being misclassified as transient failures.
+	var se smtpclient.Error
 	if errors.As(cause, &se) {
-		return &resultErr{err: wrapped, code: se.Code, secode: se.Secode, permanent: se.Permanent}
+		permanent := se.Permanent || se.Code/100 == 5
+		return &resultErr{err: wrapped, code: se.Code, secode: se.Secode, permanent: permanent}
+	}
+	// Keep compatibility with callers that wrap a pointer to the same error.
+	var sep *smtpclient.Error
+	if errors.As(cause, &sep) && sep != nil {
+		permanent := sep.Permanent || sep.Code/100 == 5
+		return &resultErr{err: wrapped, code: sep.Code, secode: sep.Secode, permanent: permanent}
 	}
 	return wrapped
 }

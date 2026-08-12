@@ -27,9 +27,13 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-mail/junkfilter"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreply"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/deliverability"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/inbound"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/mailrules"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/queue"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	"github.com/Mininglamp-OSS/octo-mail/ops/ha"
 	"github.com/Mininglamp-OSS/octo-mail/ops/obs"
@@ -151,6 +155,21 @@ func run() error {
 
 	dir := s.NewDirectory()
 	submitter := &submit.Submitter{Pool: s.Pool, Blob: bs}
+	var autoReplyChain *autoreplychain.Chain
+	if cfg.autoReplyMaxCount > 0 {
+		autoReplyChain, err = autoreplychain.New(cfg.autoReplyChainKey, cfg.autoReplyMaxCount)
+		if err != nil {
+			return fmt.Errorf("automatic reply chain: %w", err)
+		}
+		log.Info("Agent automatic-reply chain limit enabled", "max_count", cfg.autoReplyMaxCount)
+	}
+	var ruleMetadata *rulemetadata.Authenticator
+	if len(cfg.autoReplyChainKey) >= 32 {
+		ruleMetadata, err = rulemetadata.New(cfg.autoReplyChainKey)
+		if err != nil {
+			return fmt.Errorf("rule metadata authentication: %w", err)
+		}
+	}
 	repo := &deliverability.Service{Pool: s.Pool, MaxPerWindow: cfg.sendRateMax, RateWindow: cfg.sendRateWindow}
 	signer := &deliverability.DKIMSigner{Pool: s.Pool}
 	// Optional DKIM key encryption at rest.
@@ -260,6 +279,7 @@ func run() error {
 	// SMTP receive (MX, :25).
 	if cfg.smtpAddr != "" {
 		vacation := &autoreply.Responder{Lookup: s.LookupAccountByID, Submitter: submitter}
+		ruleProcessor := &mailrules.Processor{Pool: s.Pool, Submitter: submitter, RuleMetadata: ruleMetadata, MaxMessageSize: cfg.maxSize}
 		mx := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, TLSConfig: nil, Auth: authenticator, RejectDMARCFail: cfg.rejectDMARC, MaxHops: cfg.maxHops, Junk: junkMgr, Decider: decider,
 			DMARCRecorder: func(ctx context.Context, fromDomain, rua, sourceIP, spf, dkim, disposition string) {
 				_ = reports.RecordDMARCAgg(ctx, fromDomain, rua, sourceIP, spf, dkim, disposition)
@@ -267,6 +287,11 @@ func run() error {
 			VacationResponder: func(ctx context.Context, accountID int64, sender, recipient string, raw []byte) {
 				if err := vacation.Respond(ctx, accountID, sender, recipient, raw); err != nil {
 					log.WarnContext(ctx, "vacation auto-reply failed", "err", err)
+				}
+			},
+			MailRuleProcessor: func(ctx context.Context, accountID, sourceEmailID int64, raw []byte) {
+				if err := ruleProcessor.Process(ctx, accountID, sourceEmailID, raw); err != nil {
+					log.WarnContext(ctx, "Agent Mail rule processing failed", "account_id", accountID, "email_id", sourceEmailID, "err", err)
 				}
 			},
 		}
@@ -332,6 +357,21 @@ func run() error {
 		Window: time.Minute,
 		Limits: [3]int64{10, 100, 1000}, // per /32, /64-ish, /48-ish IP class
 	}}}
+	// Device endpoints are normally reached through one trusted reverse proxy.
+	// Keep a high per-source circuit breaker, then isolate creation by source and
+	// normal three-second token polling by opaque device code in webapi.Server.
+	deviceFlowLimiter := &ratelimit.Limiter{WindowLimits: []ratelimit.WindowLimit{{
+		Window: time.Minute,
+		Limits: [3]int64{3000, 30000, 300000},
+	}}}
+	deviceCreateLimiter := &ratelimit.Limiter{WindowLimits: []ratelimit.WindowLimit{{
+		Window: time.Minute,
+		Limits: [3]int64{30, 300, 3000},
+	}}}
+	deviceTokenLimiter := &ratelimit.Limiter{WindowLimits: []ratelimit.WindowLimit{{
+		Window: time.Minute,
+		Limits: [3]int64{30, 3000, 30000}, // 20/min at the advertised 3s interval
+	}}}
 
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
@@ -340,9 +380,14 @@ func run() error {
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).
 	if cfg.jmapAddr != "" {
-		js := &jmapd.Server{Dir: dir, BaseURL: cfg.jmapBaseURL, Submission: submitter, Blob: bs, Log: log, LoginLimiter: loginLimiter}
-		wa := &webapi.Server{Dir: dir, Submission: submitter, Suppressions: &deliverability.Suppressions{Pool: s.Pool}, Log: log, LoginLimiter: loginLimiter}
+		js := &jmapd.Server{Dir: dir, BaseURL: cfg.jmapBaseURL, MaxSizeUpload: cfg.maxSize, Submission: submitter, Blob: bs, Log: log, LoginLimiter: loginLimiter}
+		policyEvaluator := outboundpolicy.NewKeywordEvaluator(cfg.outboundReviewTerms)
+		if len(cfg.outboundReviewTerms) > 0 {
+			log.Info("local Agent outbound review workflow enabled", "term_count", len(cfg.outboundReviewTerms))
+		}
+		wa := &webapi.Server{Dir: dir, Submission: submitter, Suppressions: &deliverability.Suppressions{Pool: s.Pool}, Log: log, LoginLimiter: loginLimiter, DeviceFlowLimiter: deviceFlowLimiter, DeviceCreateLimiter: deviceCreateLimiter, DeviceTokenLimiter: deviceTokenLimiter, AuthorizationURL: cfg.authorizationURL, GatewaySecret: cfg.gatewaySecret, OutboundPolicy: policyEvaluator, AutoReplyChain: autoReplyChain, RuleMetadata: ruleMetadata, MaxAgentMailboxesPerOwnerSpace: cfg.maxAgentMailboxesPerOwnerSpace, AgentMailboxDomain: cfg.agentMailboxDomain, MaxMessageSize: cfg.maxSize}
 		mux := http.NewServeMux()
+		mux.Handle("/.well-known/jmap", js.Handler())
 		mux.Handle("/jmap/", js.Handler())
 		mux.Handle("/webapi/", wa.Handler())
 		mux.Handle("/webmail", webui.Handler())
@@ -500,7 +545,7 @@ func run() error {
 		if n, err := worker.RunOnce(ctx); err != nil {
 			log.Warn("queue worker", "err", err)
 		} else if n > 0 {
-			log.Info("queue worker delivered", "count", n)
+			log.Info("queue worker processed", "count", n)
 		}
 	})
 
@@ -547,7 +592,7 @@ func run() error {
 	// (a standby is elected and resumes the drains). The queue/webhook workers
 	// above are safe on every node (FOR UPDATE SKIP LOCKED leases), so they are
 	// not gated.
-	fts := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	fts := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 100, MaxMessageSize: cfg.maxSize}
 	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100, Log: log}
 	// Leader-election objids. Each cluster-singleton subsystem campaigns on a
 	// distinct objid within the ha leader lock CLASS (see ops/ha.lockClassLeader);
@@ -963,7 +1008,7 @@ func (d *projectionDrainer) tick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := d.fts.DrainAccount(ctx, a.tenant, a.id); err != nil {
+		if _, err := d.fts.RunOnceAccount(ctx, a.tenant, a.id); err != nil {
 			d.log.Warn("fts drain", "account", a.id, "err", err)
 		}
 		if err := d.threads.DrainAccount(ctx, a.tenant, a.id); err != nil {

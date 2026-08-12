@@ -33,6 +33,7 @@ type Msg struct {
 	ID          int64
 	TenantID    int64
 	AccountID   int64
+	MessageID   int64 // linked Sent message effective id; zero for unlinked submissions
 	MailFrom    string
 	RcptTo      string
 	BlobRef     string
@@ -85,6 +86,13 @@ type ResultError interface {
 type PermanentError interface {
 	error
 	Permanent() bool
+}
+
+// DeliveryReasonError optionally supplies a stable customer-facing reason code
+// without exposing an implementation-specific error string.
+type DeliveryReasonError interface {
+	error
+	DeliveryReasonCode() string
 }
 
 // backoffFor returns the delay before the next attempt after `attempts` failed
@@ -156,9 +164,9 @@ func appendLog(ctx context.Context, db execer, m Msg, kind string, payload any, 
 		raw = b
 	}
 	_, err := db.Exec(ctx,
-		`INSERT INTO queue_log (queue_id, tenant_id, account_id, rcpt_to, kind, payload, keep_until)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		m.ID, m.TenantID, m.AccountID, m.RcptTo, kind, raw, keep)
+		`INSERT INTO queue_log (queue_id, tenant_id, account_id, message_id, rcpt_to, kind, payload, keep_until)
+		 VALUES ($1,$2,$3,NULLIF($4,0),$5,$6,$7,$8)`,
+		m.ID, m.TenantID, m.AccountID, m.MessageID, m.RcptTo, kind, raw, keep)
 	return err
 }
 
@@ -192,15 +200,23 @@ func EnqueueTx(ctx context.Context, tx pgx.Tx, m Msg) (int64, error) {
 	}
 	var id int64
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO queue (tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, next_attempt, hold, require_tls, dsn_notify, dsn_ret, dsn_envid, dsn_orcpt, body_8bitmime, smtputf8)
-		 VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,now()),$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-		m.TenantID, m.AccountID, m.MailFrom, m.RcptTo, m.BlobRef, m.Size, notBefore, hold, m.RequireTLS,
+		`INSERT INTO queue (tenant_id, account_id, message_id, mail_from, rcpt_to, blob_ref, size, next_attempt, hold, require_tls, dsn_notify, dsn_ret, dsn_envid, dsn_orcpt, body_8bitmime, smtputf8)
+		 VALUES ($1,$2,NULLIF($3,0),$4,$5,$6,$7,COALESCE($8,now()),$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+		m.TenantID, m.AccountID, m.MessageID, m.MailFrom, m.RcptTo, m.BlobRef, m.Size, notBefore, hold, m.RequireTLS,
 		m.Notify, m.Ret, m.EnvID, m.ORcpt, m.Body8BitMIME, m.SMTPUTF8).Scan(&id); err != nil {
 		return 0, err
 	}
 	// Append the enqueued fact to the source-of-truth log (same tx as the
 	// projection insert). m.ID is now known.
 	m.ID = id
+	if m.MessageID != 0 {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO outbound_deliveries (account_id, queue_id, message_id, recipient, status)
+			 VALUES ($1,$2,$3,$4,'queued')`,
+			m.AccountID, m.ID, m.MessageID, m.RcptTo); err != nil {
+			return 0, err
+		}
+	}
 	if err := appendLog(ctx, tx, m, kindEnqueued, map[string]any{"hold": hold, "size": m.Size}, nil); err != nil {
 		return 0, err
 	}
@@ -286,16 +302,33 @@ func (w *Worker) deliveryTimeout() time.Duration {
 // whose lease was lost burns nothing (held=false → no increment). Returns the
 // new attempt number so the caller uses the authoritative persisted value.
 func (w *Worker) renewLease(ctx context.Context, m Msg) (held bool, attempts int, err error) {
-	err = w.Pool.QueryRow(ctx,
-		`UPDATE queue SET lease_until=now()+make_interval(secs => $3), attempts=attempts+1, last_attempt=now()
-		 WHERE id=$1 AND leased_by=$2 AND lease_until > now()
-		 RETURNING attempts`,
-		m.ID, w.NodeID, w.lease().Seconds()).Scan(&attempts)
-	if err == pgx.ErrNoRows {
-		return false, 0, nil // lease lost; another node owns this message now
-	}
+	err = pgx.BeginFunc(ctx, w.Pool, func(tx pgx.Tx) error {
+		e := tx.QueryRow(ctx,
+			`UPDATE queue SET lease_until=now()+make_interval(secs => $3), attempts=attempts+1, last_attempt=now()
+			 WHERE id=$1 AND leased_by=$2 AND lease_until > now()
+			 RETURNING attempts`,
+			m.ID, w.NodeID, w.lease().Seconds()).Scan(&attempts)
+		if e == pgx.ErrNoRows {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		held = true
+		if m.MessageID != 0 {
+			_, e = tx.Exec(ctx,
+				`UPDATE outbound_deliveries
+				 SET status='delivering', attempt_count=$3, last_attempt_at=now(), updated_at=now()
+				 WHERE account_id=$1 AND queue_id=$2`,
+				m.AccountID, m.ID, attempts)
+		}
+		return e
+	})
 	if err != nil {
 		return false, 0, err
+	}
+	if !held {
+		return false, 0, nil // lease lost; another node owns this message now
 	}
 	return true, attempts, nil
 }
@@ -396,7 +429,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		}
 		var perr error
 		if derr == nil {
-			_, perr = w.retire(ctx, m, true)
+			_, perr = w.retire(ctx, m, true, "")
 		} else {
 			perr = w.reschedule(ctx, m, derr)
 		}
@@ -420,10 +453,41 @@ func (w *Worker) recordResult(ctx context.Context, m Msg, start time.Time, dur t
 			code, secode = re.SMTPResult()
 		}
 	}
-	return appendLog(ctx, w.Pool, m, kindAttempt, map[string]any{
-		"n": m.Attempts, "start": start, "duration_ms": dur.Milliseconds(),
-		"success": success, "code": code, "secode": secode, "error": errStr,
-	}, nil)
+	return pgx.BeginFunc(ctx, w.Pool, func(tx pgx.Tx) error {
+		if err := appendLog(ctx, tx, m, kindAttempt, map[string]any{
+			"n": m.Attempts, "start": start, "duration_ms": dur.Milliseconds(),
+			"success": success, "code": code, "secode": secode, "error": errStr,
+		}, nil); err != nil {
+			return err
+		}
+		if m.MessageID == 0 {
+			return nil
+		}
+		_, err := tx.Exec(ctx,
+			`UPDATE outbound_deliveries
+			 SET attempt_count=$3, smtp_code=$4, smtp_secode=$5,
+			     reason_code=$6, technical_detail=$7, last_attempt_at=$8, updated_at=now()
+			 WHERE account_id=$1 AND queue_id=$2`,
+			m.AccountID, m.ID, m.Attempts, code, secode,
+			deliveryReasonCode(derr, code), errStr, start)
+		return err
+	})
+}
+
+func deliveryReasonCode(err error, smtpCode int) string {
+	if err == nil {
+		return ""
+	}
+	var reason DeliveryReasonError
+	if errors.As(err, &reason) {
+		if code := reason.DeliveryReasonCode(); code != "" {
+			return code
+		}
+	}
+	if smtpCode >= 500 && smtpCode < 600 {
+		return "recipient_server_rejected"
+	}
+	return "delivery_failed"
 }
 
 // claim atomically leases up to Batch due messages to this node. A message is
@@ -441,7 +505,7 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 		     FOR UPDATE SKIP LOCKED
 		     LIMIT $3
 		 )
-		 RETURNING id, tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, attempts, max_attempts, require_tls,
+		 RETURNING id, tenant_id, account_id, COALESCE(message_id,0), mail_from, rcpt_to, blob_ref, size, attempts, max_attempts, require_tls,
 		           COALESCE(dsn_notify,''), COALESCE(dsn_ret,''), COALESCE(dsn_envid,''), COALESCE(dsn_orcpt,''),
 		           COALESCE(body_8bitmime,false), COALESCE(smtputf8,false), created_at`,
 		w.NodeID, w.lease().Seconds(), w.batch())
@@ -452,7 +516,7 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 	var out []Msg
 	for rows.Next() {
 		var m Msg
-		if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MailFrom, &m.RcptTo, &m.BlobRef, &m.Size, &m.Attempts, &m.MaxAttempts, &m.RequireTLS,
+		if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MessageID, &m.MailFrom, &m.RcptTo, &m.BlobRef, &m.Size, &m.Attempts, &m.MaxAttempts, &m.RequireTLS,
 			&m.Notify, &m.Ret, &m.EnvID, &m.ORcpt, &m.Body8BitMIME, &m.SMTPUTF8, &m.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -465,7 +529,7 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 // (delivered on success, failed otherwise) carrying the retention horizon. Fenced
 // by leased_by: a stale node whose lease was reclaimed retires nothing. Returns
 // whether this call actually retired the row (true) or it was already gone.
-func (w *Worker) retire(ctx context.Context, m Msg, success bool) (bool, error) {
+func (w *Worker) retire(ctx context.Context, m Msg, success bool, failureReason string) (bool, error) {
 	acted := false
 	keep := time.Now().Add(w.retiredKeep())
 	err := pgx.BeginFunc(ctx, w.Pool, func(tx pgx.Tx) error {
@@ -481,7 +545,32 @@ func (w *Worker) retire(ctx context.Context, m Msg, success bool) (bool, error) 
 		if !success {
 			kind = kindFailed
 		}
-		return appendLog(ctx, tx, m, kind, map[string]any{"attempts": m.Attempts}, &keep)
+		if err := appendLog(ctx, tx, m, kind, map[string]any{"attempts": m.Attempts}, &keep); err != nil {
+			return err
+		}
+		if m.MessageID == 0 {
+			return nil
+		}
+		if success {
+			_, err = tx.Exec(ctx,
+				`UPDATE outbound_deliveries
+				 SET status='delivered', delivered_at=now(), updated_at=now()
+				 WHERE account_id=$1 AND queue_id=$2`,
+				m.AccountID, m.ID)
+		} else {
+			_, err = tx.Exec(ctx,
+				`UPDATE outbound_deliveries
+				 SET status='failed', failed_at=now(),
+				     reason_code=CASE
+				       WHEN $3 <> '' THEN $3
+				       WHEN reason_code='' THEN 'delivery_failed'
+				       ELSE reason_code
+				     END,
+				     updated_at=now()
+				 WHERE account_id=$1 AND queue_id=$2`,
+				m.AccountID, m.ID, failureReason)
+		}
+		return err
 	})
 	return acted, err
 }
@@ -523,7 +612,11 @@ func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
 	permanent := errors.As(lastErr, &perm) && perm.Permanent()
 	aged := !m.CreatedAt.IsZero() && time.Since(m.CreatedAt) >= w.maxLifetime()
 	if permanent || aged || m.Attempts >= m.MaxAttempts {
-		acted, rerr := w.retire(ctx, m, false)
+		failureReason := ""
+		if !permanent {
+			failureReason = "delivery_timed_out"
+		}
+		acted, rerr := w.retire(ctx, m, false, failureReason)
 		if rerr != nil {
 			return rerr
 		}
@@ -563,6 +656,15 @@ func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
 			return err
 		}
 		acted = true
+		if m.MessageID != 0 {
+			if _, err := tx.Exec(ctx,
+				`UPDATE outbound_deliveries
+				 SET status='retrying', attempt_count=$3, updated_at=now()
+				 WHERE account_id=$1 AND queue_id=$2`,
+				m.AccountID, m.ID, m.Attempts); err != nil {
+				return err
+			}
+		}
 		// The delayed warning transitions on THIS call iff we asked for it and it
 		// was not already set — dedup across lease re-claims.
 		firedDelay = wantDelay && !wasDelayed

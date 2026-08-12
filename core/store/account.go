@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 )
 
 // ErrOverQuota is returned by delivery/append paths when accepting a message
 // would exceed the per-account or per-tenant byte quota. It is a permanent
 // condition (the message is rejected, not deferred).
 var ErrOverQuota = errors.New("over quota")
+
+// ErrCannotCalculateEmailChanges means retained account history is insufficient
+// to produce an exact standards-based Email change set for the requested state.
+var ErrCannotCalculateEmailChanges = errors.New("cannot calculate email changes")
 
 // AddOpts controls MessageAdd behavior.
 type AddOpts struct {
@@ -110,6 +115,7 @@ type Account interface {
 
 	MailboxFind(tx Tx, name string) (*Mailbox, error)
 	MailboxEnsure(tx Tx, name string, subscribe bool, su SpecialUse, modseq *ModSeq) (Mailbox, []Change, error)
+	MailboxSetSpecialUse(tx Tx, mb *Mailbox, su SpecialUse) ([]Change, error)
 	MailboxCreate(tx Tx, name string, su SpecialUse) (mb Mailbox, changes []Change, created []string, exists bool, err error)
 	MailboxRename(tx Tx, src *Mailbox, dst string, modseq *ModSeq) (changes []Change, alreadyExists, notExists bool, err error)
 	MailboxDelete(ctx context.Context, tx Tx, mb *Mailbox) (changes []Change, hasChildren bool, err error)
@@ -153,6 +159,157 @@ type Account interface {
 	RegisterComm() *Comm
 
 	Close() error
+}
+
+// OutboundDeliveryStore is the optional delivery-result capability implemented
+// by persistent accounts that support linked Sent messages. Keeping it separate
+// from Account preserves compatibility with protocol test doubles and storage
+// implementations that do not provide outbound tracking.
+type OutboundDeliveryStore interface {
+	OutboundDeliveries(ctx context.Context, messageID int64) ([]OutboundDelivery, error)
+	OutboundDeliveriesForMessages(ctx context.Context, messageIDs []int64) (map[int64][]OutboundDelivery, error)
+}
+
+// OutboundPolicyReason is one stable, client-visible business reason attached
+// to a policy Draft. It is data, not an authorization decision: system hard
+// gates continue to be enforced by the authenticated protocol path.
+type OutboundPolicyReason struct {
+	Code        string `json:"code"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+// OutboundPolicyDraft is the durable projection for an Agent outbound intent
+// that was not sent because the human owner must review it.
+type OutboundPolicyDraft struct {
+	EmailID        int64
+	Status         string
+	DraftVersion   int
+	PolicyVersion  string
+	Reasons        []OutboundPolicyReason
+	Source         string
+	SourceEmailID  int64
+	ContentDigest  []byte
+	IdempotencyKey string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// OutboundPolicyDraftTx is an optional transaction capability. Implementations
+// must scope every operation to the transaction's authenticated account.
+type OutboundPolicyDraftTx interface {
+	FindOutboundPolicyDraftByIdempotencyKey(key string) (OutboundPolicyDraft, bool, error)
+	FindOutboundPolicyDraftByEmailID(emailID int64) (OutboundPolicyDraft, bool, error)
+	PutOutboundPolicyDraft(draft OutboundPolicyDraft) error
+	ReplaceOutboundPolicyDraft(oldEmailID int64, expectedVersion int, newEmailID int64, contentDigest []byte) (OutboundPolicyDraft, bool, error)
+	DeleteOutboundPolicyDraft(emailID int64) error
+}
+
+// OutboundPolicyDraftStore exposes account-scoped policy metadata to protocol
+// read projections without making the protocol layer aware of PostgreSQL.
+type OutboundPolicyDraftStore interface {
+	OutboundPolicyDraftsForMessages(ctx context.Context, messageIDs []int64) (map[int64]OutboundPolicyDraft, error)
+}
+
+// AgentOutboundDraft is the durable workflow projection for mail prepared by an
+// Agent but not yet sent. Message bytes remain in the normal Drafts mailbox;
+// this record carries only versioning, source and idempotency metadata.
+type AgentOutboundDraft struct {
+	EmailID        int64
+	DraftType      string
+	Status         string
+	DraftVersion   int
+	SourceEmailID  int64
+	ContentDigest  []byte
+	IdempotencyKey string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// AgentOutboundDraftTx is account-scoped by the surrounding authenticated
+// transaction. Implementations must never accept a caller-supplied account id.
+type AgentOutboundDraftTx interface {
+	FindAgentOutboundDraftByIdempotencyKey(key string) (AgentOutboundDraft, bool, error)
+	FindAgentOutboundDraftByEmailID(emailID int64) (AgentOutboundDraft, bool, error)
+	PutAgentOutboundDraft(draft AgentOutboundDraft) error
+	ReplaceAgentOutboundDraft(oldEmailID int64, expectedVersion int, newEmailID int64, contentDigest []byte) (AgentOutboundDraft, bool, error)
+	DeleteAgentOutboundDraft(emailID int64) error
+}
+
+// AgentOutboundDraftStore exposes account-scoped workflow metadata to protocol
+// projections without leaking the concrete storage implementation.
+type AgentOutboundDraftStore interface {
+	AgentOutboundDraftsForMessages(ctx context.Context, messageIDs []int64) (map[int64]AgentOutboundDraft, error)
+}
+
+// AgentSendIntent is the durable idempotency record for one automatically
+// submitted Agent message. A processing record is deliberately
+// fail-closed: after an ambiguous crash, the same key is never submitted again
+// until an operator reconciles it.
+type AgentSendIntent struct {
+	IdempotencyKey string
+	ContentDigest  []byte
+	Status         string
+	MessageID      int64
+	SubmissionIDs  []int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// AgentSendIntentStore scopes every operation to the authenticated account.
+// Claim returns claimed=false when the key already exists.
+type AgentSendIntentStore interface {
+	ClaimAgentSendIntent(ctx context.Context, key string, contentDigest []byte) (intent AgentSendIntent, claimed bool, err error)
+	CompleteAgentSendIntent(ctx context.Context, key string, messageID int64, submissionIDs []int64) error
+	AbandonAgentSendIntent(ctx context.Context, key string) error
+}
+
+// DraftSendClaim is the durable multi-node guard for one immutable Draft send.
+// A processing claim is deliberately fail-closed when the submission result is
+// unknown; callers must not turn an ambiguous outcome into a duplicate email.
+type DraftSendClaim struct {
+	EmailID       int64
+	DraftVersion  int
+	ContentDigest []byte
+	Status        string
+	MessageID     int64
+	SubmissionIDs []int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// DraftSendClaimTx claims a Draft while holding the account write transaction,
+// so version validation and the no-side-effect decision are serialized across
+// all nodes.
+type DraftSendClaimTx interface {
+	ClaimDraftSend(emailID int64, draftVersion int, contentDigest []byte) (claim DraftSendClaim, claimed bool, err error)
+}
+
+// DraftSendClaimStore completes or releases an existing claim after the
+// external submission attempt. Delete is used only after accepted submission
+// and successful Draft cleanup.
+type DraftSendClaimStore interface {
+	CompleteDraftSendClaim(ctx context.Context, emailID int64, messageID int64, submissionIDs []int64) error
+	AbandonDraftSendClaim(ctx context.Context, emailID int64) error
+	DeleteDraftSendClaim(ctx context.Context, emailID int64) error
+}
+
+// EmailChangeSet is the storage-neutral fold needed by JMAP Email/changes.
+// NewState is an account change-log position. The id slices contain stable
+// effective Email ids; protocol layers render them in their own wire format.
+type EmailChangeSet struct {
+	NewState  ModSeq
+	HasMore   bool
+	Created   []int64
+	Updated   []int64
+	Destroyed []int64
+}
+
+// EmailChangeStore exposes the account's durable ordered Email history to the
+// standards protocol layer. Implementations must calculate the set and state
+// from one consistent snapshot and never silently skip unavailable history.
+type EmailChangeStore interface {
+	EmailChanges(ctx context.Context, since ModSeq, maxChanges int) (EmailChangeSet, error)
 }
 
 // Tx is a storage transaction. Get/Insert/Update/Delete operate on the shape

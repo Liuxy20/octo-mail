@@ -9,41 +9,66 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	moxmessage "github.com/mjl-/mox/message"
+	moxsmtp "github.com/mjl-/mox/smtp"
 )
 
 // maxListLimit caps the page size of a single list request, so an absent/zero/
 // oversized ?limit can't return the whole account in one response.
 const maxListLimit = 1000
 
+type messageSubmitter interface {
+	SubmitForMessage(ctx context.Context, tenantID, accountID, messageID int64, mailFrom string, rcptTo []string, raw []byte) ([]int64, error)
+}
+
 // messageSummary is the list-view shape of a message.
 type messageSummary struct {
-	ID         string   `json:"id"`
-	ThreadID   string   `json:"threadId,omitempty"`
-	Mailbox    string   `json:"mailbox"`
-	Subject    string   `json:"subject"`
-	From       string   `json:"from"`
-	To         []string `json:"to"`
-	Preview    string   `json:"preview"`
-	ReceivedAt string   `json:"receivedAt"`
-	Size       int64    `json:"size"`
-	Keywords   []string `json:"keywords"`
-	Unread     bool     `json:"unread"`
+	ID         string              `json:"id"`
+	ThreadID   string              `json:"threadId,omitempty"`
+	Mailbox    string              `json:"mailbox"`
+	Subject    string              `json:"subject"`
+	From       string              `json:"from"`
+	To         []string            `json:"to"`
+	Preview    string              `json:"preview"`
+	ReceivedAt string              `json:"receivedAt"`
+	Size       int64               `json:"size"`
+	Keywords   []string            `json:"keywords"`
+	Unread     bool                `json:"unread"`
+	Delivery   *deliverySummary    `json:"delivery,omitempty"`
+	Policy     *outboundPolicyInfo `json:"policy,omitempty"`
+	AgentDraft *agentDraftInfo     `json:"agentDraft,omitempty"`
 }
 
 // messageDetail adds parsed bodies to the summary.
 type messageDetail struct {
 	messageSummary
-	Cc       []string `json:"cc,omitempty"`
-	BodyText string   `json:"bodyText,omitempty"`
-	BodyHTML string   `json:"bodyHtml,omitempty"`
+	Cc                   []string             `json:"cc,omitempty"`
+	Bcc                  []string             `json:"bcc,omitempty"`
+	BodyText             string               `json:"bodyText,omitempty"`
+	BodyHTML             string               `json:"bodyHtml,omitempty"`
+	OriginalFrom         string               `json:"originalFrom,omitempty"`
+	SentBy               string               `json:"sentBy,omitempty"`
+	Attachments          []receivedAttachment `json:"attachments"`
+	AttachmentsTruncated bool                 `json:"attachmentsTruncated,omitempty"`
 }
 
-// GET /webapi/v0/messages?mailbox=&search=&limit=&offset=
+// GET /webapi/v0/messages?mailbox=&search=&unread=&limit=&offset=
 func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
 	q := r.URL.Query()
 	mailbox := q.Get("mailbox")
 	search := q.Get("search")
+	var unread *bool
+	if values, ok := q["unread"]; ok {
+		if len(values) != 1 || (values[0] != "true" && values[0] != "false") {
+			return 0, nil, errStatus(http.StatusBadRequest, "invalid_query", "unread must be true or false")
+		}
+		value, _ := strconv.ParseBool(values[0])
+		unread = &value
+	}
 	limit := atoiDefault(q.Get("limit"), 50)
 	offset := atoiDefault(q.Get("offset"), 0)
 	// Clamp the page size: a 0/negative/oversized limit (e.g. ?limit=0 or a huge
@@ -64,22 +89,35 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 		// per-row body parse (summarize reads the projection columns).
 		filter := func() store.MessageQuery {
 			mq := tx.QueryMessage().DistinctEmail()
+			if unread != nil {
+				mq = mq.FilterFlags(store.Flags{Seen: true}, store.Flags{Seen: !*unread})
+			}
 			if search != "" {
 				mq = mq.FilterFTS(search)
 			}
 			return mq
 		}
 		if mailbox != "" {
-			mb, e := a.acc.MailboxFind(tx, mailbox)
-			if e != nil {
-				return e
+			if strings.EqualFold(mailbox, "Starred") {
+				base := filter
+				filter = func() store.MessageQuery {
+					return base().FilterKeyword("$flagged", true)
+				}
+			} else {
+				mb, e := a.acc.MailboxFind(tx, mailbox)
+				if e != nil {
+					return e
+				}
+				if isEmptyRequiredMailbox(mailbox, mb) {
+					return nil
+				}
+				if mb == nil {
+					return errStatus(http.StatusNotFound, "not_found", "no such mailbox")
+				}
+				// Re-apply the mailbox filter on each builder instance below.
+				base := filter
+				filter = func() store.MessageQuery { return base().FilterMailbox(mb.ID) }
 			}
-			if mb == nil {
-				return errStatus(http.StatusNotFound, "not_found", "no such mailbox")
-			}
-			// Re-apply the mailbox filter on each builder instance below.
-			base := filter
-			filter = func() store.MessageQuery { return base().FilterMailbox(mb.ID) }
 		}
 		n, e := filter().Count()
 		if e != nil {
@@ -102,6 +140,52 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 	if out == nil {
 		out = []messageSummary{}
 	}
+	messageIDs := make([]int64, 0, len(out))
+	for _, message := range out {
+		if id, ok := parseEmailID(message.ID); ok {
+			messageIDs = append(messageIDs, id)
+		}
+	}
+	deliveries := map[int64][]store.OutboundDelivery{}
+	if tracked, ok := a.acc.(store.OutboundDeliveryStore); ok {
+		deliveries, err = tracked.OutboundDeliveriesForMessages(ctx, messageIDs)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+	for i := range out {
+		if id, ok := parseEmailID(out[i].ID); ok {
+			out[i].Delivery = summarizeDelivery(deliveries[id])
+		}
+	}
+	if policies, ok := a.acc.(store.OutboundPolicyDraftStore); ok {
+		items, err := policies.OutboundPolicyDraftsForMessages(ctx, messageIDs)
+		if err != nil {
+			return 0, nil, err
+		}
+		for i := range out {
+			if id, ok := parseEmailID(out[i].ID); ok {
+				if draft, exists := items[id]; exists {
+					policy := outboundPolicyProjection(draft, out[i].Subject)
+					out[i].Policy = &policy
+				}
+			}
+		}
+	}
+	if drafts, ok := a.acc.(store.AgentOutboundDraftStore); ok {
+		items, err := drafts.AgentOutboundDraftsForMessages(ctx, messageIDs)
+		if err != nil {
+			return 0, nil, err
+		}
+		for i := range out {
+			if id, ok := parseEmailID(out[i].ID); ok {
+				if draft, exists := items[id]; exists {
+					projection := agentDraftProjection(draft, out[i].Subject, out[i].From, numericThreadID(out[i].ThreadID))
+					out[i].AgentDraft = &projection
+				}
+			}
+		}
+	}
 	return http.StatusOK, map[string]any{"messages": out, "total": total, "offset": offset, "limit": limit}, nil
 }
 
@@ -122,11 +206,44 @@ func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (in
 		data, _ := io.ReadAll(br)
 		br.Close()
 		text, html, cc := parseBodies(data)
+		envelope := parseEnvelope(data, s.RuleMetadata)
 		detail.BodyText, detail.BodyHTML, detail.Cc = text, html, cc
+		detail.Bcc = envelope.bcc
+		detail.OriginalFrom, detail.SentBy = envelope.originalFrom, envelope.sentBy
+		detail.Attachments, detail.AttachmentsTruncated = parseAttachments(data)
 		return nil
 	})
 	if err != nil {
 		return 0, nil, err
+	}
+	if messageID, ok := parseEmailID(id); ok {
+		if tracked, ok := a.acc.(store.OutboundDeliveryStore); ok {
+			deliveries, err := tracked.OutboundDeliveries(ctx, messageID)
+			if err != nil {
+				return 0, nil, err
+			}
+			detail.Delivery = summarizeDelivery(deliveries)
+		}
+		if policies, ok := a.acc.(store.OutboundPolicyDraftStore); ok {
+			items, err := policies.OutboundPolicyDraftsForMessages(ctx, []int64{messageID})
+			if err != nil {
+				return 0, nil, err
+			}
+			if draft, exists := items[messageID]; exists {
+				policy := outboundPolicyProjection(draft, detail.Subject)
+				detail.Policy = &policy
+			}
+		}
+		if drafts, ok := a.acc.(store.AgentOutboundDraftStore); ok {
+			items, err := drafts.AgentOutboundDraftsForMessages(ctx, []int64{messageID})
+			if err != nil {
+				return 0, nil, err
+			}
+			if draft, exists := items[messageID]; exists {
+				projection := agentDraftProjection(draft, detail.Subject, detail.From, numericThreadID(detail.ThreadID))
+				detail.AgentDraft = &projection
+			}
+		}
 	}
 	return http.StatusOK, detail, nil
 }
@@ -179,12 +296,55 @@ func (s *Server) sendMessage(ctx context.Context, a authCtx, r *http.Request) (i
 	if err != nil {
 		return 0, nil, err
 	}
-	rcpts := allRecipients(req.To, req.Cc, req.Bcc)
-	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), a.login, rcpts, raw)
-	if err != nil {
-		return 0, nil, internalErr("submit_failed", err)
+	policyRaw := raw
+	if len(req.Bcc) > 0 && a.agentCredentialID > 0 && s.OutboundPolicy != nil {
+		policyRaw, _, err = compose(composeInput{
+			From: a.login, To: req.To, Cc: req.Cc, DraftBcc: req.Bcc, Subject: req.Subject,
+			Text: req.Text, HTML: req.HTML, Attachments: req.Attachments,
+		}, a.senderDomain())
+		if err != nil {
+			return 0, nil, err
+		}
 	}
-	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
+	if err := s.enforceAgentOutboundPolicy(ctx, a, r, outboundpolicy.Intent{
+		Source: outboundPolicySource(r), Operation: "mail.message.send",
+		To: req.To, Cc: req.Cc, Bcc: req.Bcc, Subject: req.Subject,
+		Text: req.Text, HTML: req.HTML, AttachmentCount: len(req.Attachments),
+	}, policyRaw); err != nil {
+		return 0, nil, err
+	}
+	return s.submitComposedMessage(ctx, a, req.To, req.Cc, req.Bcc, raw)
+}
+
+func (s *Server) submitComposedMessage(ctx context.Context, a authCtx, to, cc, bcc []string, raw []byte) (int, any, error) {
+	sent, ids, err := s.enqueueComposedMessage(ctx, a, to, cc, bcc, raw)
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusAccepted, map[string]any{
+		"outcome": "accepted", "submissionIds": ids, "messageId": emailID(sent),
+		"senderAddress": a.login,
+	}, nil
+}
+
+func (s *Server) enqueueComposedMessage(ctx context.Context, a authCtx, to, cc, bcc []string, raw []byte) (store.Message, []int64, error) {
+	if s.Submission == nil {
+		return store.Message{}, nil, errStatus(http.StatusServiceUnavailable, "unavailable", "submission not enabled")
+	}
+	rcpts := allRecipients(to, cc, bcc)
+	sent, err := saveSentCopy(ctx, a.acc, raw)
+	if err != nil {
+		return store.Message{}, nil, internalErr("sent_copy_failed", err)
+	}
+	ids, err := s.Submission.SubmitForMessage(ctx, a.scope.Tenant().ID, a.acc.ID(), sent.EffectiveEmailID(), a.login, rcpts, raw)
+	if err != nil {
+		if submit.IsResultUnknown(err) {
+			return sent, nil, submissionResultUnknownError(err)
+		}
+		s.cleanupFailedSubmissionSentCopy(ctx, a.acc, sent.EffectiveEmailID())
+		return store.Message{}, nil, internalErr("submit_failed", err)
+	}
+	return sent, ids, nil
 }
 
 // replyRequest is the POST /messages/{id}/reply[-all] body.
@@ -210,46 +370,116 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	if err := decode(r, &req); err != nil {
 		return 0, nil, err
 	}
+	automatic := isAgentAutomaticReply(a, r)
+	var automaticIntentDigest []byte
+	if automatic {
+		// Idempotency binds the caller's request, not server-generated transport
+		// metadata or the final-chain notice appended below. A configuration
+		// change must not turn a retry of an accepted request into a conflict.
+		automaticIntentDigest = agentDraftIntentDigest("agent_automatic_reply", r.PathValue("id"), req)
+	}
 	var (
 		to, cc     []string
 		subject    string
 		inReplyTo  string
 		references []string
+		sourceRaw  []byte
 	)
-	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
-		msgs, e := loadGroup(tx, a.acc, id)
-		if e != nil {
-			return e
-		}
-		br := a.acc.MessageReader(ctx, msgs[0])
-		data, _ := io.ReadAll(br)
-		br.Close()
-		env := parseEnvelope(data)
-		to, cc = replyRecipients(env, a.login, all)
-		subject = ensurePrefix(env.subject, "Re: ")
-		inReplyTo = env.messageID
-		references = append(env.references, env.messageID)
-		return nil
-	})
+	sourceRaw, err := readMessageBytes(ctx, a.acc, id)
 	if err != nil {
 		return 0, nil, err
 	}
+	env := parseEnvelope(sourceRaw, nil)
+	to, cc = replyRecipients(env, a.login, all)
+	subject = ensurePrefix(env.subject, "Re: ")
+	inReplyTo = env.messageID
+	references = append(env.references, env.messageID)
 	if len(to) == 0 {
 		return 0, nil, errStatus(http.StatusUnprocessableEntity, "no_recipients", "original has no reply recipient")
+	}
+	messageID := ""
+	trustedHeaders := map[string]string(nil)
+	if isAgentAutomaticReply(a, r) && s.AutoReplyChain != nil {
+		messageID, err = genMessageID(a.senderDomain())
+		if err != nil {
+			return 0, nil, internalErr("message_id_failed", err)
+		}
+		metadata, err := s.nextAutoReplyMetadata(ctx, a, id, sourceRaw, messageID)
+		if err != nil {
+			return 0, nil, err
+		}
+		if s.AutoReplyChain.IsFinalCount(metadata.Count) {
+			req.Text = autoreplychain.AppendFinalNotice(req.Text)
+			if len(req.Text) > 100000 {
+				return 0, nil, errStatus(http.StatusRequestEntityTooLarge, "automatic_reply_too_large", "final automatic reply exceeds the plain-text size limit")
+			}
+		}
+		trustedHeaders = autoreplychain.Headers(metadata)
 	}
 	raw, _, err := compose(composeInput{
 		From: a.login, To: to, Cc: cc, Subject: subject,
 		Text: req.Text, HTML: req.HTML, Attachments: req.Attachments,
-		InReplyTo: inReplyTo, References: references,
+		MessageID: messageID, InReplyTo: inReplyTo, References: references,
+		TrustedHeaders: trustedHeaders,
 	}, a.senderDomain())
 	if err != nil {
 		return 0, nil, err
 	}
-	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), a.login, allRecipients(to, cc, nil), raw)
+	operation := "mail.message.reply"
+	if all {
+		operation = "mail.message.reply_all"
+	}
+	if err := s.enforceAgentOutboundPolicy(ctx, a, r, outboundpolicy.Intent{
+		Source: outboundPolicySource(r), Operation: operation, SourceEmailID: id,
+		To: to, Cc: cc, Subject: subject, Text: req.Text, HTML: req.HTML,
+		AttachmentCount: len(req.Attachments),
+	}, raw); err != nil {
+		return 0, nil, err
+	}
+	requestKey := strings.TrimSpace(r.Header.Get(outboundIdempotencyHeader))
+	var automaticIntentClaimed bool
+	if automatic {
+		intent, claimed, err := s.claimAgentSendIntent(ctx, a, requestKey, automaticIntentDigest)
+		if err != nil {
+			return 0, nil, err
+		}
+		if !claimed {
+			return existingAgentSendIntentResult(a, intent)
+		}
+		automaticIntentClaimed = true
+	}
+	sent, err := saveSentCopy(ctx, a.acc, raw)
 	if err != nil {
+		if automaticIntentClaimed {
+			s.abandonAgentSendIntent(ctx, a, requestKey)
+		}
+		return 0, nil, internalErr("sent_copy_failed", err)
+	}
+	ids, err := s.Submission.SubmitForMessage(ctx, a.scope.Tenant().ID, a.acc.ID(), sent.EffectiveEmailID(), a.login, allRecipients(to, cc, nil), raw)
+	if err != nil {
+		if submit.IsResultUnknown(err) {
+			if automaticIntentClaimed {
+				return 0, nil, resultUnknownStatusError(
+					"send_intent_result_unknown",
+					"this automatic reply may have been accepted; inspect Sent and do not retry automatically",
+					err,
+				)
+			}
+			return 0, nil, submissionResultUnknownError(err)
+		}
+		s.cleanupFailedSubmissionSentCopy(ctx, a.acc, sent.EffectiveEmailID())
+		if automaticIntentClaimed {
+			s.abandonAgentSendIntent(ctx, a, requestKey)
+		}
 		return 0, nil, internalErr("submit_failed", err)
 	}
-	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
+	if automaticIntentClaimed {
+		s.completeAgentSendIntent(ctx, a, requestKey, sent.EffectiveEmailID(), ids)
+	}
+	return http.StatusAccepted, map[string]any{
+		"outcome": "accepted", "submissionIds": ids, "messageId": emailID(sent),
+		"senderAddress": a.login,
+	}, nil
 }
 
 // forwardRequest is the POST /messages/{id}/forward body.
@@ -271,7 +501,7 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 	if len(req.To) == 0 {
 		return 0, nil, errStatus(http.StatusBadRequest, "invalid_body", "at least one recipient in 'to' is required")
 	}
-	var subject, quoted string
+	var subject, quoted, originalFrom string
 	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
@@ -280,9 +510,10 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 		br := a.acc.MessageReader(ctx, msgs[0])
 		data, _ := io.ReadAll(br)
 		br.Close()
-		env := parseEnvelope(data)
+		env := parseEnvelope(data, nil)
 		text, _, _ := parseBodies(data)
 		subject = ensurePrefix(env.subject, "Fwd: ")
+		originalFrom = env.from
 		quoted = "---------- Forwarded message ----------\r\nFrom: " + env.from + "\r\nSubject: " + env.subject + "\r\n\r\n" + text
 		return nil
 	})
@@ -296,15 +527,33 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 	body += quoted
 	raw, _, err := compose(composeInput{
 		From: a.login, To: req.To, Subject: subject, Text: body, Attachments: req.Attachments,
+		OriginalFrom: originalFrom, SentBy: a.login,
 	}, a.senderDomain())
 	if err != nil {
 		return 0, nil, err
 	}
-	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), a.login, req.To, raw)
+	if err := s.enforceAgentOutboundPolicy(ctx, a, r, outboundpolicy.Intent{
+		Source: outboundPolicySource(r), Operation: "mail.message.forward", SourceEmailID: id,
+		To: req.To, Subject: subject, Text: body, AttachmentCount: len(req.Attachments),
+	}, raw); err != nil {
+		return 0, nil, err
+	}
+	sent, err := saveSentCopy(ctx, a.acc, raw)
 	if err != nil {
+		return 0, nil, internalErr("sent_copy_failed", err)
+	}
+	ids, err := s.Submission.SubmitForMessage(ctx, a.scope.Tenant().ID, a.acc.ID(), sent.EffectiveEmailID(), a.login, req.To, raw)
+	if err != nil {
+		if submit.IsResultUnknown(err) {
+			return 0, nil, submissionResultUnknownError(err)
+		}
+		s.cleanupFailedSubmissionSentCopy(ctx, a.acc, sent.EffectiveEmailID())
 		return 0, nil, internalErr("submit_failed", err)
 	}
-	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
+	return http.StatusAccepted, map[string]any{
+		"outcome": "accepted", "submissionIds": ids, "messageId": emailID(sent),
+		"senderAddress": a.login,
+	}, nil
 }
 
 // patchRequest updates flags and/or moves the message.
@@ -322,6 +571,15 @@ func (s *Server) patchMessage(ctx context.Context, a authCtx, r *http.Request) (
 	}
 	if len(req.AddKeywords) == 0 && len(req.RemoveKeywords) == 0 {
 		return 0, nil, errStatus(http.StatusBadRequest, "invalid_body", "provide addKeywords and/or removeKeywords")
+	}
+	if a.agentCredentialID > 0 {
+		for _, keywords := range [][]string{req.AddKeywords, req.RemoveKeywords} {
+			for _, keyword := range keywords {
+				if agentKeywordRequiresOwner(keyword) {
+					return 0, nil, errStatus(http.StatusForbidden, "owner_required", "this Agent Mail keyword change must be completed by the human owner gateway")
+				}
+			}
+		}
 	}
 	err := a.acc.Tx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
@@ -347,6 +605,18 @@ func (s *Server) patchMessage(ctx context.Context, a authCtx, r *http.Request) (
 		return 0, nil, err
 	}
 	return http.StatusOK, map[string]any{"updated": id}, nil
+}
+
+// agentKeywordRequiresOwner permits non-destructive progress markers and
+// free-form keywords while keeping owner-controlled system state out of reach
+// of an Agent credential. SetByName is the canonical parser for IMAP/JMAP flag
+// aliases, so spellings such as \Deleted, $deleted, and DELETED stay equivalent.
+func agentKeywordRequiresOwner(name string) bool {
+	var flags store.Flags
+	if !flags.SetByName(name, true) {
+		return false
+	}
+	return !(flags.Seen || flags.Answered || flags.Flagged || flags.Forwarded)
 }
 
 // DELETE /webapi/v0/messages/{id}
@@ -387,7 +657,7 @@ func summarize(ctx context.Context, acc store.Account, m store.Message, mbNames 
 		br := acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
-		env := parseEnvelope(data)
+		env := parseEnvelope(data, nil)
 		subject, from, to, preview = env.subject, env.from, env.to, previewText(data)
 	}
 	sum := messageSummary{
@@ -450,15 +720,19 @@ func mailboxByID(tx store.Tx, acc store.Account, id int64) (*store.Mailbox, erro
 
 // envelope holds parsed header fields we surface.
 type envelope struct {
-	subject    string
-	from       string
-	to         []string
-	cc         []string
-	messageID  string
-	references []string
+	subject      string
+	from         string
+	replyTo      string
+	to           []string
+	cc           []string
+	bcc          []string
+	messageID    string
+	references   []string
+	originalFrom string
+	sentBy       string
 }
 
-func parseEnvelope(data []byte) envelope {
+func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator) envelope {
 	var e envelope
 	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
 	if err != nil && part.Envelope == nil {
@@ -475,6 +749,12 @@ func parseEnvelope(data []byte) envelope {
 		for _, a := range env.CC {
 			e.cc = append(e.cc, a.User+"@"+a.Host)
 		}
+		for _, a := range env.BCC {
+			e.bcc = append(e.bcc, a.User+"@"+a.Host)
+		}
+		if len(env.ReplyTo) > 0 {
+			e.replyTo = env.ReplyTo[0].User + "@" + env.ReplyTo[0].Host
+		}
 		e.messageID = env.MessageID
 	}
 	// References chain: read the raw References header (mox's Envelope has no
@@ -484,11 +764,26 @@ func parseEnvelope(data []byte) envelope {
 		if refs := strings.Fields(h.Get("References")); len(refs) > 0 {
 			e.references = refs
 		}
+		if ruleAuthenticator != nil {
+			if metadata, ok := ruleAuthenticator.VerifyHeader(h); ok {
+				e.originalFrom = validAttributionAddress(metadata.OriginalFrom)
+				e.sentBy = validAttributionAddress(metadata.SentBy)
+			}
+		}
 	}
 	if len(e.references) == 0 && part.Envelope != nil && part.Envelope.InReplyTo != "" {
 		e.references = append(e.references, part.Envelope.InReplyTo)
 	}
 	return e
+}
+
+func validAttributionAddress(value string) string {
+	value = strings.TrimSpace(value)
+	address, err := moxsmtp.ParseAddress(value)
+	if err != nil {
+		return ""
+	}
+	return address.String()
 }
 
 // parseBodies returns (text, html, cc) parsed from the raw message.
@@ -564,8 +859,12 @@ func stripTags(s string) string {
 }
 
 func replyRecipients(env envelope, self string, all bool) (to, cc []string) {
-	if env.from != "" {
-		to = append(to, env.from)
+	primary := env.replyTo
+	if primary == "" {
+		primary = env.from
+	}
+	if primary != "" {
+		to = append(to, primary)
 	}
 	if all {
 		for _, a := range append(append([]string{}, env.to...), env.cc...) {

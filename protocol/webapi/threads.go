@@ -46,3 +46,11 @@ func parseThreadID(id string) (int64, bool) {
 	n, err := strconv.ParseInt(id[1:], 10, 64)
 	return n, err == nil
 }
+
+func numericThreadID(id string) int64 {
+	value, ok := parseThreadID(id)
+	if !ok {
+		return 0
+	}
+	return value
+}

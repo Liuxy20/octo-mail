@@ -2,6 +2,8 @@ package imapd_test
 
 import (
 	"context"
+	"encoding/base64"
+	"mime"
 	"net"
 	"strconv"
 	"testing"
@@ -44,7 +46,7 @@ func TestFTSProjectionAndRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deliver two messages: only the first mentions "pineapple".
+	// Deliver messages that exercise both ASCII and Chinese substring matching.
 	target, err := dir.ResolveInbound(ctx, mustAddr(t, "u1@example.com"))
 	if err != nil {
 		t.Fatal(err)
@@ -53,6 +55,18 @@ func TestFTSProjectionAndRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := target.Deliver(ctx, &store.Message{}, memReader("Subject: veg\r\n\r\njust broccoli here\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	encodedChinese := "Subject: " + mime.BEncoding.Encode("UTF-8", "班级通知") +
+		"\r\nContent-Type: text/plain; charset=utf-8" +
+		"\r\nContent-Transfer-Encoding: base64\r\n\r\n" +
+		base64.StdEncoding.EncodeToString([]byte("各位同学们，下午好")) + "\r\n"
+	if _, err := target.Deliver(ctx, &store.Message{}, memReader(encodedChinese)); err != nil {
+		t.Fatal(err)
+	}
+	// An empty message is a valid indexed value. It must not be mistaken for the
+	// NULL backfill marker, otherwise DrainAccount would select it forever.
+	if _, err := target.Deliver(ctx, &store.Message{}, memReader("")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,8 +111,11 @@ func TestFTSProjectionAndRebuild(t *testing.T) {
 
 	// 2. Drain the FTS worker, then SEARCH finds exactly uid 1.
 	w := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 10}
-	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
-		t.Fatalf("fts drain: %v", err)
+	if n, err := w.RunOnceAccount(ctx, tenantID, accID); err != nil || n != 4 {
+		t.Fatalf("first fts batch = (%d, %v), want (4, nil)", n, err)
+	}
+	if n, err := w.RunOnceAccount(ctx, tenantID, accID); err != nil || n != 0 {
+		t.Fatalf("second fts batch = (%d, %v), want empty message already indexed", n, err)
 	}
 	got := search("pineapple")
 	if len(got) != 1 || got[0] != "1" {
@@ -106,6 +123,34 @@ func TestFTSProjectionAndRebuild(t *testing.T) {
 	}
 	if other := search("broccoli"); len(other) != 1 || other[0] != "2" {
 		t.Fatalf("SEARCH TEXT broccoli = %v, want [2]", other)
+	}
+	if substring := search("apple"); len(substring) != 1 || substring[0] != "1" {
+		t.Fatalf("SEARCH TEXT apple = %v, want substring hit [1]", substring)
+	}
+	if chinese := search("同学们"); len(chinese) != 1 || chinese[0] != "3" {
+		t.Fatalf("SEARCH TEXT 同学们 = %v, want substring hit [3]", chinese)
+	}
+
+	// Legacy rows with a NULL search_text are backfilled in a separate bounded
+	// batch even while new mail is pending, so a busy account cannot starve the
+	// historical sweep.
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE fts SET search_text=NULL
+		 WHERE account_id=$1
+		   AND message_id=(SELECT id FROM messages WHERE account_id=$1 AND uid=3)`, accID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Deliver(ctx, &store.Message{}, memReader("Subject: fresh\r\n\r\nnew mail\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := w.RunOnceAccount(ctx, tenantID, accID); err != nil || n != 2 {
+		t.Fatalf("forward + legacy search_text batches = (%d, %v), want (2, nil)", n, err)
+	}
+	if n, err := w.RunOnceAccount(ctx, tenantID, accID); err != nil || n != 0 {
+		t.Fatalf("post-backfill idle batch = (%d, %v), want (0, nil)", n, err)
+	}
+	if chinese := search("同学们"); len(chinese) != 1 || chinese[0] != "3" {
+		t.Fatalf("SEARCH TEXT 同学们 after backfill = %v, want [3]", chinese)
 	}
 
 	// 3. Rebuild from zero reproduces the same result (pure fold of the log).
