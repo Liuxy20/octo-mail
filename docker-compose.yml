@@ -57,9 +57,32 @@ services:
       OCTO_MAIL_SUBMISSION_ADDR: ":587"
       OCTO_MAIL_IMAP_ADDR: ":143"
       OCTO_MAIL_JMAP_ADDR: ":8080"
-      OCTO_MAIL_JMAP_BASEURL: "http://localhost:8090"
+      # Advertise the externally reachable JMAP resources. Standalone use keeps
+      # localhost; an OCTO gateway deployment sets this to
+      # https://<octo-origin>/agent-mail-api.
+      OCTO_MAIL_JMAP_BASEURL: "${OCTO_MAIL_JMAP_BASEURL:-http://localhost:8090}"
+      # Browser authorization must use the same public OCTO origin as the
+      # signed-in web app. Override this for HTTPS/custom-domain deployments;
+      # never point users at a container or alternate browser origin.
+      OCTO_MAIL_AUTHORIZATION_URL: "${OCTO_MAIL_AUTHORIZATION_URL:-http://localhost:28080/mail/authorize}"
       OCTO_MAIL_ADMIN_ADDR: ":8081"
       OCTO_MAIL_ADMIN_TOKEN: "e2e-admin-token"
+      # Optional OCTO identity gateway. Keep the secret in an uncommitted .env
+      # and configure the same value on octo-server.
+      OCTO_MAIL_GATEWAY_SECRET: "${OCTO_MAIL_GATEWAY_SECRET:-}"
+      # Bot-to-Bot automatic-reply chains are enabled by default with a maximum
+      # of four replies. Keep the HMAC key in the uncommitted .env and share the
+      # same value across octo-mail instances.
+      OCTO_MAIL_AUTO_REPLY_MAX_COUNT: "${OCTO_MAIL_AUTO_REPLY_MAX_COUNT:-4}"
+      # One human owner may register at most two Agent mailboxes per Space.
+      OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE: "${OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE:-2}"
+      # Product address domain for newly registered Agent mailboxes. The domain
+      # must be provisioned for the authenticated tenant in octo-mail.
+      OCTO_MAIL_AGENT_MAILBOX_DOMAIN: "${OCTO_MAIL_AGENT_MAILBOX_DOMAIN:-mail.imocto.cn}"
+      OCTO_MAIL_AUTO_REPLY_CHAIN_KEY: "${OCTO_MAIL_AUTO_REPLY_CHAIN_KEY:-}"
+      # Optional local workflow test adapter. Example: "付款,合同". Empty keeps
+      # existing Agent sends unchanged; final product rules are not hard-coded here.
+      OCTO_MAIL_OUTBOUND_REVIEW_TERMS: "${OCTO_MAIL_OUTBOUND_REVIEW_TERMS:-}"
       # Enforce DMARC so the security-posture default is exercised in acceptance.
       OCTO_MAIL_REJECT_DMARC: "1"
       OCTO_MAIL_NODE_ID: "e2e-node-1"
@@ -69,6 +92,8 @@ services:
     extra_hosts:
       - "acme.test:127.0.0.1"
       - "other.test:127.0.0.1"
+      - "demo.octo.test:127.0.0.1"
+      - "mail.imocto.cn:127.0.0.1"
       - "mail.octo-mail.test:127.0.0.1"
     ports:
       - "2525:25"     # SMTP MX

@@ -71,8 +71,14 @@ The fastest way to see a full stack — octo-mail + PostgreSQL + MinIO (S3) — 
 Compose:
 
 ```sh
+printf 'OCTO_MAIL_AUTO_REPLY_CHAIN_KEY=%s\n' "$(openssl rand -hex 32)" > .env
 docker compose up -d --build
 ```
+
+The generated key authenticates Agent-to-Agent automatic-reply chain metadata and
+must remain stable across restarts and replicas. If an existing `.env` contains other
+settings, add the variable instead of overwriting the file. Set
+`OCTO_MAIL_AUTO_REPLY_MAX_COUNT=0` only when explicitly disabling this protection.
 
 This publishes SMTP `2525`, submission `5587`, IMAP `1143`, JMAP + webmail `8090`, and
 admin + `/metrics` + `/healthz` `8091` on localhost.
@@ -137,10 +143,53 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_SMTP_ADDR` / `_SUBMISSION_ADDR` / `_IMAP_ADDR` / `_JMAP_ADDR` / `_ADMIN_ADDR` | Listen addresses per surface |
 | `OCTO_MAIL_ADMIN_TOKEN` | Bearer token guarding the admin API |
 | `OCTO_MAIL_NODE_ID` | Unique node identity for HA leader election |
+| `OCTO_MAIL_GATEWAY_SECRET` | Shared secret used to verify OCTO Gateway identity assertions; at least 32 bytes |
+| `OCTO_MAIL_AGENT_MAILBOX_DOMAIN` | Tenant-owned domain assigned to newly registered Agent mailboxes |
+| `OCTO_MAIL_AUTHORIZATION_URL` | Public OCTO browser URL for Agent mailbox device authorization |
+| `OCTO_MAIL_OUTBOUND_REVIEW_TERMS` | Comma-separated terms that route matching Agent sends to an owner-review Draft; empty disables keyword review |
+| `OCTO_MAIL_AUTO_REPLY_MAX_COUNT` | Maximum authenticated Agent automatic replies in one chain; defaults to `4`, `0` disables the limit |
+| `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total Agent mailboxes per owner in one OCTO Space, including the gateway default Agent mailbox; defaults to `2` |
+| `OCTO_MAIL_AUTO_REPLY_CHAIN_KEY` | Deployment-wide HMAC key for automatic-reply chain metadata; at least 32 bytes and required while the limit is enabled |
 
 Anti-abuse, queue, ACME, and deliverability knobs (`OCTO_MAIL_REJECT_DMARC`,
 `OCTO_MAIL_GREYLIST`, `OCTO_MAIL_QUEUE_BACKOFF`, `OCTO_MAIL_ACME_HOSTS`, …) are
 documented alongside their defaults in `config.go`.
+
+### Agent Mail owner-confirmation boundary
+
+In manual-confirmation mode, an `omb_` Agent credential may prepare a versioned
+Agent Draft. The trusted OpenClaw Mail Plugin must verify a direct-session Owner
+turn through OpenClaw `senderIsOwner`, exact confirmation text, session binding,
+expiry, and one-time consumption before it calls the existing versioned
+Draft-send endpoint with `X-Octo-Automation: owner-confirmed-draft`.
+
+octo-mail accepts that marker only for `POST /webapi/v0/drafts/{id}/send`, a
+positive `draftVersion`, and a valid idempotency key. The credential must belong
+to a mailbox in `manual_confirmation` mode, and the Draft must carry matching
+Agent-Draft metadata for that same account. Ordinary and policy Drafts remain
+owner-only.
+
+The automation marker is not a cryptographic proof of a chat message. octo-mail
+therefore relies on the trusted Plugin keeping the mailbox-scoped `omb_`
+credential unavailable to Agent-visible tool inputs, outputs, prompts, and
+logs. A holder of that credential could assert the marker, so deployments must
+preserve this credential boundary.
+
+Browser Gateway assertions remain a separate, single-use identity mechanism.
+They bind the browser user, Space, selected mailbox, HTTP method, request URI,
+body digest, expiry, and nonce; they do not authorize the Owner-confirmed Draft
+automation path.
+
+### Compatibility notes for this release
+
+- Mailbox `TEXT`/`BODY`, JMAP `filter.text`, and WebAPI message search use a
+  literal, case-insensitive substring over bounded MIME-decoded search text.
+  During the rolling backfill, rows without decoded text retain the previous
+  `tsvector` token-search fallback.
+- SMTP replies in the 5xx class are treated as permanent delivery failures and
+  produce the normal failure result instead of being retried as transient.
+- RFC 8620 discovery is available at `/.well-known/jmap` in addition to the
+  compatibility `/jmap/session` endpoint.
 
 The `octo-mail` binary also exposes operational subcommands:
 `serve`, `passwd`, `apikey`, `gendkim`, `export`, `import`.

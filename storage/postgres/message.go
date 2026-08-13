@@ -90,7 +90,8 @@ func (a *account) MessageAdd(tx store.Tx, mb *store.Mailbox, m *store.Message, b
 		return nil, err
 	}
 	if err := pt.record(store.ChangeAddUID{
-		MailboxID: mb.ID, UID: m.UID, ModSeq: seq, Flags: m.Flags, Keywords: m.Keywords,
+		MailboxID: mb.ID, UID: m.UID, MsgID: m.ID, EmailID: m.EffectiveEmailID(),
+		EmailExistedBefore: opts.EmailID != 0, ModSeq: seq, Flags: m.Flags, Keywords: m.Keywords,
 	}); err != nil {
 		return nil, err
 	}
@@ -178,12 +179,14 @@ func (a *account) MessageRemove(tx store.Tx, modseq store.ModSeq, mb *store.Mail
 	}
 	var uids []store.UID
 	var ids []int64
+	var emailIDs []int64
 	var totalSize int64
 	var unseen int
 	var deleted int
 	for _, m := range msgs {
 		uids = append(uids, m.UID)
 		ids = append(ids, m.ID)
+		emailIDs = append(emailIDs, m.EffectiveEmailID())
 		totalSize += m.Size
 		if !m.Seen {
 			unseen++
@@ -203,7 +206,10 @@ func (a *account) MessageRemove(tx store.Tx, modseq store.ModSeq, mb *store.Mail
 	if err := pt.bumpQuota(-len(msgs), -totalSize); err != nil {
 		return store.ChangeRemoveUIDs{}, store.ChangeMailboxCounts{}, err
 	}
-	cr := store.ChangeRemoveUIDs{MailboxID: mb.ID, UIDs: uids, ModSeq: modseq, MsgIDs: ids}
+	cr := store.ChangeRemoveUIDs{
+		MailboxID: mb.ID, UIDs: uids, ModSeq: modseq, MsgIDs: ids,
+		EmailIDs: emailIDs,
+	}
 	if err := pt.record(cr); err != nil {
 		return store.ChangeRemoveUIDs{}, store.ChangeMailboxCounts{}, err
 	}

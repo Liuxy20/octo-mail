@@ -79,6 +79,106 @@ func TestValidateS3CredsFailFast(t *testing.T) {
 	}
 }
 
+func TestAutoReplyChainConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	strongKey := []byte(strings.Repeat("k", 32))
+	tests := []struct {
+		name    string
+		cfg     config
+		wantErr bool
+	}{
+		{"disabled without key", config{autoReplyMaxCount: 0}, false},
+		{"enabled with strong key", config{autoReplyMaxCount: 4, autoReplyChainKey: strongKey}, false},
+		{"enabled without key", config{autoReplyMaxCount: 4}, true},
+		{"enabled with weak key", config{autoReplyMaxCount: 4, autoReplyChainKey: []byte("short")}, true},
+		{"negative maximum", config{autoReplyMaxCount: -1, autoReplyChainKey: strongKey}, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validate(test.cfg, log)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validate() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_MAX_COUNT", "")
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY", "")
+	if got := loadConfig().autoReplyMaxCount; got != 4 {
+		t.Fatalf("default auto-reply maximum = %d, want 4", got)
+	}
+}
+
+func TestAgentMailboxOwnerSpaceLimitConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY", strings.Repeat("k", 32))
+	t.Setenv("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE", "")
+	if got := loadConfig().maxAgentMailboxesPerOwnerSpace; got != 2 {
+		t.Fatalf("default Agent mailbox owner/Space limit = %d, want 2", got)
+	}
+
+	t.Setenv("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE", "7")
+	cfg := loadConfig()
+	if cfg.maxAgentMailboxesPerOwnerSpace != 7 {
+		t.Fatalf("configured Agent mailbox owner/Space limit = %d, want 7", cfg.maxAgentMailboxesPerOwnerSpace)
+	}
+	if err := validate(cfg, log); err != nil {
+		t.Fatalf("valid limit rejected: %v", err)
+	}
+
+	for _, invalid := range []string{"0", "-1", "1001", "not-a-number"} {
+		t.Run(invalid, func(t *testing.T) {
+			t.Setenv("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE", invalid)
+			if err := validate(loadConfig(), log); err == nil {
+				t.Fatalf("invalid limit %q accepted", invalid)
+			}
+		})
+	}
+}
+
+func TestAgentMailboxDomainConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY", strings.Repeat("k", 32))
+	t.Setenv("OCTO_MAIL_AGENT_MAILBOX_DOMAIN", "")
+	if got := loadConfig().agentMailboxDomain; got != "" {
+		t.Fatalf("default Agent mailbox domain = %q, want empty compatibility mode", got)
+	}
+
+	t.Setenv("OCTO_MAIL_AGENT_MAILBOX_DOMAIN", " MAIL.IMOCTO.CN ")
+	cfg := loadConfig()
+	if cfg.agentMailboxDomain != "mail.imocto.cn" {
+		t.Fatalf("configured Agent mailbox domain = %q, want mail.imocto.cn", cfg.agentMailboxDomain)
+	}
+	if err := validate(cfg, log); err != nil {
+		t.Fatalf("valid Agent mailbox domain rejected: %v", err)
+	}
+
+	t.Setenv("OCTO_MAIL_AGENT_MAILBOX_DOMAIN", "not a domain")
+	if err := validate(loadConfig(), log); err == nil {
+		t.Fatal("invalid Agent mailbox domain accepted")
+	}
+}
+
+func TestMaxMessageSizeConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY", strings.Repeat("k", 32))
+	t.Setenv("OCTO_MAIL_MAX_SIZE", "52428800")
+	if cfg := loadConfig(); cfg.maxSize != 50*1024*1024 {
+		t.Fatalf("configured max message size = %d, want %d", cfg.maxSize, int64(50*1024*1024))
+	} else if err := validate(cfg, log); err != nil {
+		t.Fatalf("valid max message size rejected: %v", err)
+	}
+
+	for _, invalid := range []string{"0", "-1", "not-a-number"} {
+		t.Run(invalid, func(t *testing.T) {
+			t.Setenv("OCTO_MAIL_MAX_SIZE", invalid)
+			if err := validate(loadConfig(), log); err == nil {
+				t.Fatalf("invalid max message size %q accepted", invalid)
+			}
+		})
+	}
+}
+
 // TestValidateAdminWarnsWhenExposed proves the admin-exposure warning: a
 // non-loopback admin listener with no token emits a warning (not a hard error),
 // while a loopback bind or a token present is silent.

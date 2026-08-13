@@ -105,12 +105,11 @@ func List(ctx context.Context, pool *pgxpool.Pool, f Filter) ([]Entry, error) {
 	return out, rows.Err()
 }
 
-// mutateLog runs a statement that must RETURN id, tenant_id, account_id, rcpt_to
-// for every affected row (an UPDATE ... RETURNING or DELETE ... RETURNING), then
-// appends one log entry of the given kind per affected row — all in one
-// transaction, preserving the spine invariant that a projection change and its
-// logged fact commit together. keep is non-nil for terminal kinds (sets the
-// retention horizon). Returns the affected count.
+// mutateLog runs a statement that must RETURN id, tenant_id, account_id,
+// message_id, rcpt_to for every affected row (an UPDATE ... RETURNING or DELETE
+// ... RETURNING), then appends one log entry of the given kind per affected row.
+// Terminal admin actions also update linked customer delivery projections in
+// the same transaction.
 func mutateLog(ctx context.Context, pool *pgxpool.Pool, kind string, payload any, keep *time.Time, sql string, args ...any) (int64, error) {
 	var affected []Msg
 	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
@@ -120,7 +119,7 @@ func mutateLog(ctx context.Context, pool *pgxpool.Pool, kind string, payload any
 		}
 		for rows.Next() {
 			var m Msg
-			if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.RcptTo); err != nil {
+			if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MessageID, &m.RcptTo); err != nil {
 				rows.Close()
 				return err
 			}
@@ -134,13 +133,24 @@ func mutateLog(ctx context.Context, pool *pgxpool.Pool, kind string, payload any
 			if err := appendLog(ctx, tx, m, kind, payload, keep); err != nil {
 				return err
 			}
+			if m.MessageID != 0 && (kind == kindFailed || kind == kindDropped) {
+				if _, err := tx.Exec(ctx,
+					`UPDATE outbound_deliveries
+					 SET status='failed', failed_at=now(),
+					     reason_code=CASE WHEN reason_code='' THEN 'delivery_failed' ELSE reason_code END,
+					     updated_at=now()
+					 WHERE account_id=$1 AND queue_id=$2`,
+					m.AccountID, m.ID); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	})
 	return int64(len(affected)), err
 }
 
-const returningIdent = ` RETURNING id, tenant_id, account_id, rcpt_to`
+const returningIdent = ` RETURNING id, tenant_id, account_id, COALESCE(message_id,0), rcpt_to`
 
 // Kick makes matching messages due immediately (next_attempt=now) and clears any
 // hold, so the next worker tick attempts them. Returns the number affected. This
@@ -218,7 +228,7 @@ func Drop(ctx context.Context, pool *pgxpool.Pool, f Filter) (int64, error) {
 func Fail(ctx context.Context, pool *pgxpool.Pool, f Filter, onFailed func(context.Context, Msg) error) (int64, error) {
 	cond, args := f.where(1)
 	rows, err := pool.Query(ctx,
-		`SELECT id, tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, attempts,
+		`SELECT id, tenant_id, account_id, COALESCE(message_id,0), mail_from, rcpt_to, blob_ref, size, attempts,
 		        COALESCE(dsn_notify,''), COALESCE(dsn_ret,''), COALESCE(dsn_envid,''), COALESCE(dsn_orcpt,'')
 		 FROM queue WHERE `+cond, args...)
 	if err != nil {
@@ -227,7 +237,7 @@ func Fail(ctx context.Context, pool *pgxpool.Pool, f Filter, onFailed func(conte
 	var msgs []Msg
 	for rows.Next() {
 		var m Msg
-		if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MailFrom, &m.RcptTo, &m.BlobRef, &m.Size, &m.Attempts,
+		if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MessageID, &m.MailFrom, &m.RcptTo, &m.BlobRef, &m.Size, &m.Attempts,
 			&m.Notify, &m.Ret, &m.EnvID, &m.ORcpt); err != nil {
 			rows.Close()
 			return 0, err
@@ -255,7 +265,20 @@ func Fail(ctx context.Context, pool *pgxpool.Pool, f Filter, onFailed func(conte
 				return nil
 			}
 			acted = true
-			return appendLog(ctx, tx, m, kindFailed, map[string]any{"attempts": m.Attempts, "admin": true}, &keep)
+			if err := appendLog(ctx, tx, m, kindFailed, map[string]any{"attempts": m.Attempts, "admin": true}, &keep); err != nil {
+				return err
+			}
+			if m.MessageID == 0 {
+				return nil
+			}
+			_, uerr := tx.Exec(ctx,
+				`UPDATE outbound_deliveries
+				 SET status='failed', failed_at=now(),
+				     reason_code=CASE WHEN reason_code='' THEN 'delivery_failed' ELSE reason_code END,
+				     updated_at=now()
+				 WHERE account_id=$1 AND queue_id=$2`,
+				m.AccountID, m.ID)
+			return uerr
 		})
 		if terr != nil {
 			if firstErr == nil {

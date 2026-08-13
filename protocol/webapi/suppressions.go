@@ -43,6 +43,9 @@ type suppressionBody struct {
 
 // PUT /webapi/v0/suppressions/{address} — add (idempotent).
 func (s *Server) putSuppression(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
+	if a.agentCredentialID > 0 {
+		return 0, nil, errStatus(http.StatusForbidden, "human_owner_required", "suppression entries must be managed by the human owner")
+	}
 	if s.Suppressions == nil {
 		return 0, nil, errStatus(http.StatusServiceUnavailable, "unavailable", "suppressions not enabled")
 	}
@@ -57,6 +60,9 @@ func (s *Server) putSuppression(ctx context.Context, a authCtx, r *http.Request)
 
 // DELETE /webapi/v0/suppressions/{address}
 func (s *Server) deleteSuppression(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
+	if a.agentCredentialID > 0 {
+		return 0, nil, errStatus(http.StatusForbidden, "human_owner_required", "suppression entries must be managed by the human owner")
+	}
 	if s.Suppressions == nil {
 		return 0, nil, errStatus(http.StatusServiceUnavailable, "unavailable", "suppressions not enabled")
 	}

@@ -73,6 +73,21 @@ func TestAdminProvisionEndToEnd(t *testing.T) {
 	post("/admin/domains", map[string]any{"tenant_id": tid, "domain": "example.com"})
 	post("/admin/addresses", map[string]any{"tenant_id": tid, "domain": "example.com", "localpart": "u1", "account": "u1"})
 	post("/admin/password", map[string]any{"login": "u1@example.com", "password": "s3cret"})
+	binding := post("/admin/gateway-identities", map[string]any{
+		"issuer": "octo-server", "subject": "octo-user-1", "spaceId": "space-1", "login": "u1@example.com",
+	})
+	if binding["ownerPrincipalId"] == nil || binding["defaultAccountId"] == nil {
+		t.Fatalf("gateway identity response = %#v", binding)
+	}
+	var mappedLogin string
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT p.login
+		 FROM gateway_identities g
+		 JOIN principals p ON p.id=g.owner_principal_id AND p.tenant_id=g.tenant_id
+		 WHERE g.issuer='octo-server' AND g.subject='octo-user-1' AND g.space_id='space-1' AND NOT g.disabled`,
+	).Scan(&mappedLogin); err != nil || mappedLogin != "u1@example.com" {
+		t.Fatalf("gateway mapping login=%q err=%v", mappedLogin, err)
+	}
 
 	// The provisioned account can authenticate over real IMAP.
 	imap := &imapd.Server{Dir: s.NewDirectory()}
@@ -125,7 +140,7 @@ func TestAdminProvisionEndToEnd(t *testing.T) {
 		t.Fatal("webhook sink never received POST")
 	}
 
-	t.Logf("OK: admin API provisioned tenant→domain→account→address→password; provisioned account logged in via real IMAP; healthz ok; webhook worker delivered event")
+	t.Logf("OK: admin API provisioned tenant→domain→account→address→password and explicit OCTO gateway identity; provisioned account logged in via real IMAP; healthz ok; webhook worker delivered event")
 }
 
 func TestMetricsEndpoint(t *testing.T) {
@@ -219,4 +234,93 @@ func TestDuplicateResourceConflict(t *testing.T) {
 		t.Fatalf("409 body leaked schema detail: %s", body)
 	}
 	t.Logf("OK: duplicate resource → 409 Conflict, no constraint-name leak")
+}
+
+func TestCreateAddressRejectsCrossTenantPrincipal(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, dsn, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE tenants RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+
+	var foreignTenantID, tenantID, accountID, reusableAccountID, reusablePrincipalID int64
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('foreign-principal') RETURNING id`).Scan(&foreignTenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('address-owner') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `INSERT INTO domains (tenant_id,domain) VALUES ($1,'owner.example')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx,
+		`INSERT INTO accounts (tenant_id,name) VALUES ($1,'victim') RETURNING id`, tenantID).Scan(&accountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx,
+		`INSERT INTO accounts (tenant_id,name) VALUES ($1,'reusable') RETURNING id`, tenantID).Scan(&reusableAccountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx,
+		`INSERT INTO principals (tenant_id,login) VALUES ($1,'victim@owner.example')`, foreignTenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx,
+		`INSERT INTO principals (tenant_id,login) VALUES ($1,'reusable@owner.example') RETURNING id`, tenantID).Scan(&reusablePrincipalID); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := &webadmin.Server{Pool: s.Pool, Dir: s.NewDirectory(), AdminToken: "secret-admin"}
+	hs := httptest.NewServer(admin.Handler())
+	defer hs.Close()
+	postAddress := func(localpart, account string) (int, []byte) {
+		body, _ := json.Marshal(map[string]any{
+			"tenant_id": tenantID, "domain": "owner.example", "localpart": localpart, "account": account,
+		})
+		req, _ := http.NewRequest(http.MethodPost, hs.URL+"/admin/addresses", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret-admin")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		responseBody, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, responseBody
+	}
+
+	status, body := postAddress("victim", "victim")
+	if status != http.StatusConflict {
+		t.Fatalf("cross-tenant principal status = %d, want 409; body=%s", status, body)
+	}
+	var addressCount int
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM addresses WHERE tenant_id=$1 AND account_id=$2`, tenantID, accountID).Scan(&addressCount); err != nil {
+		t.Fatal(err)
+	}
+	var principalID, ownerPrincipalID *int64
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT principal_id,owner_principal_id FROM accounts WHERE id=$1`, accountID).Scan(&principalID, &ownerPrincipalID); err != nil {
+		t.Fatal(err)
+	}
+	if addressCount != 0 || principalID != nil || ownerPrincipalID != nil {
+		t.Fatalf("cross-tenant conflict left partial state: addresses=%d principal=%v owner=%v", addressCount, principalID, ownerPrincipalID)
+	}
+
+	status, body = postAddress("reusable", "reusable")
+	if status != http.StatusOK {
+		t.Fatalf("same-tenant principal reuse status = %d; body=%s", status, body)
+	}
+	var linkedPrincipalID int64
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT principal_id FROM accounts WHERE id=$1`, reusableAccountID).Scan(&linkedPrincipalID); err != nil {
+		t.Fatal(err)
+	}
+	if linkedPrincipalID != reusablePrincipalID {
+		t.Fatalf("same-tenant principal id = %d, want %d", linkedPrincipalID, reusablePrincipalID)
+	}
 }

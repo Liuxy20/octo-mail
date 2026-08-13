@@ -9,8 +9,11 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/textproto"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
 )
 
 // attachment is a base64-encoded file to attach.
@@ -25,6 +28,7 @@ type composeInput struct {
 	From        string
 	To          []string
 	Cc          []string
+	DraftBcc    []string // persisted only for a Draft; stripped before submission
 	Subject     string
 	Text        string
 	HTML        string
@@ -32,6 +36,14 @@ type composeInput struct {
 	MessageID   string   // generated if empty
 	InReplyTo   string   // parent Message-ID (reply)
 	References  []string // reference chain (reply)
+	// Forward attribution is server-owned display metadata. It never changes the
+	// RFC reply target: forwarded mail replies to From unless it explicitly has
+	// a normal Reply-To header.
+	OriginalFrom string
+	SentBy       string
+	// TrustedHeaders are server-owned automation metadata. compose accepts only
+	// the fixed autoreplychain allowlist; request payloads must never populate it.
+	TrustedHeaders map[string]string
 }
 
 // compose renders an RFC 5322 message with CRLF line endings and a guaranteed
@@ -53,6 +65,9 @@ func compose(in composeInput, domain string) ([]byte, string, error) {
 	if len(in.Cc) > 0 {
 		writeHeader(&h, "Cc", strings.Join(in.Cc, ", "))
 	}
+	if len(in.DraftBcc) > 0 {
+		writeHeader(&h, "Bcc", strings.Join(in.DraftBcc, ", "))
+	}
 	writeHeader(&h, "Subject", in.Subject)
 	writeHeader(&h, "Message-ID", msgID)
 	writeHeader(&h, "Date", time.Now().Format(time.RFC1123Z))
@@ -62,6 +77,15 @@ func compose(in composeInput, domain string) ([]byte, string, error) {
 	}
 	if len(in.References) > 0 {
 		writeHeader(&h, "References", strings.Join(in.References, " "))
+	}
+	if in.OriginalFrom != "" {
+		writeHeader(&h, "X-Octo-Original-From", in.OriginalFrom)
+	}
+	if in.SentBy != "" {
+		writeHeader(&h, "X-Octo-Sent-By", in.SentBy)
+	}
+	if err := writeTrustedHeaders(&h, in.TrustedHeaders); err != nil {
+		return nil, "", err
 	}
 
 	body, ctype, err := composeBody(in)
@@ -75,6 +99,38 @@ func compose(in composeInput, domain string) ([]byte, string, error) {
 		h.WriteString("\r\n")
 	}
 	return h.Bytes(), msgID, nil
+}
+
+func writeTrustedHeaders(b *bytes.Buffer, headers map[string]string) error {
+	if len(headers) == 0 {
+		return nil
+	}
+	allowed := map[string]bool{
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderSubmitted): true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderTraceID):   true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderCount):     true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderRecipient): true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderExpires):   true,
+		textproto.CanonicalMIMEHeaderKey(autoreplychain.HeaderSignature): true,
+	}
+	names := make([]string, 0, len(headers))
+	values := make(map[string]string, len(headers))
+	for name, value := range headers {
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		if canonical == "" || !allowed[canonical] {
+			return internalErr("invalid_trusted_header", fmt.Errorf("unapproved trusted header %q", name))
+		}
+		if _, exists := values[canonical]; exists {
+			return internalErr("invalid_trusted_header", fmt.Errorf("duplicate trusted header %q", name))
+		}
+		values[canonical] = value
+		names = append(names, canonical)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		writeHeader(b, name, values[name])
+	}
+	return nil
 }
 
 func composeBody(in composeInput) (body []byte, contentType string, err error) {

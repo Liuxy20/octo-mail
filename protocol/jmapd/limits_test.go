@@ -43,7 +43,7 @@ func TestJMAPRequestLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test", Blob: bs}
+	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test", Blob: bs, MaxSizeUpload: 1024}
 	hs := httptest.NewServer(js.Handler())
 	defer hs.Close()
 
@@ -82,9 +82,30 @@ func TestJMAPRequestLimits(t *testing.T) {
 		t.Fatalf("11 MiB api body → %d, want 413", code)
 	}
 
-	// Oversized upload (> maxSizeUpload=50 MB) is rejected.
+	// The configured upload limit is both advertised and enforced.
+	sessionReq, _ := http.NewRequest("GET", hs.URL+"/jmap/session", nil)
+	sessionReq.SetBasicAuth("u1@example.com", "x")
+	sessionResp, err := http.DefaultClient.Do(sessionReq)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	var session struct {
+		Capabilities map[string]struct {
+			MaxSizeUpload int64 `json:"maxSizeUpload"`
+		} `json:"capabilities"`
+	}
+	if err := json.NewDecoder(sessionResp.Body).Decode(&session); err != nil {
+		sessionResp.Body.Close()
+		t.Fatalf("decode session: %v", err)
+	}
+	sessionResp.Body.Close()
+	if got := session.Capabilities["urn:ietf:params:jmap:core"].MaxSizeUpload; got != 1024 {
+		t.Fatalf("session maxSizeUpload = %d, want 1024", got)
+	}
+
+	// Oversized upload (> configured 1024 bytes) is rejected.
 	upReq, _ := http.NewRequest("POST", hs.URL+"/jmap/upload/"+itoa(accID)+"/",
-		strings.NewReader(strings.Repeat("A", 50_000_001)))
+		strings.NewReader(strings.Repeat("A", 1025)))
 	upReq.SetBasicAuth("u1@example.com", "x")
 	upReq.Header.Set("Content-Type", "application/octet-stream")
 	upResp, err := http.DefaultClient.Do(upReq)
@@ -93,7 +114,7 @@ func TestJMAPRequestLimits(t *testing.T) {
 	}
 	defer upResp.Body.Close()
 	if upResp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("50MB+1 upload → %d, want 413", upResp.StatusCode)
+		t.Fatalf("1025-byte upload → %d, want 413", upResp.StatusCode)
 	}
 
 	// Per-object cap: an Email/get with > maxObjectsInGet (1000) ids is rejected

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"sort"
 	"strconv"
@@ -556,54 +557,63 @@ func (s *Server) emailGet(ctx context.Context, acc store.Account, inv invocation
 	}
 }
 
-// Email/changes: THE symmetry with IMAP CONDSTORE. Given sinceState=n, return
-// ids created/updated/destroyed with modseq > n — the same changelog replay.
+// Email/changes implements the RFC 8621 change-state contract over the same
+// ordered account log that drives IMAP CONDSTORE/QRESYNC.
 func (s *Server) emailChanges(ctx context.Context, acc store.Account, inv invocation) (string, any) {
-	var sinceState string
-	_ = json.Unmarshal(inv.args["sinceState"], &sinceState)
-	since, _ := strconv.ParseInt(sinceState, 10, 64)
+	var accountID string
+	if raw, ok := inv.args["accountId"]; !ok || json.Unmarshal(raw, &accountID) != nil || accountID == "" {
+		return "error", map[string]any{"type": "invalidArguments", "description": "accountId is required"}
+	}
+	if accountID != strconv.FormatInt(acc.ID(), 10) {
+		return "error", map[string]any{"type": "accountNotFound"}
+	}
 
-	var created, updated []string
-	err := acc.ReadTx(ctx, func(tx store.Tx) error {
-		// Messages whose changelog offset (modseq) is greater than sinceState.
-		msgs, e := tx.QueryMessage().FilterModSeqGreater(store.ModSeq(since)).SortUID().List()
-		if e != nil {
-			return e
+	var sinceState string
+	if raw, ok := inv.args["sinceState"]; !ok || json.Unmarshal(raw, &sinceState) != nil || sinceState == "" {
+		return "error", map[string]any{"type": "invalidArguments", "description": "sinceState is required"}
+	}
+	since, err := strconv.ParseInt(sinceState, 10, 64)
+	if err != nil || since < 0 || strconv.FormatInt(since, 10) != sinceState {
+		return "error", map[string]any{"type": "invalidArguments", "description": "invalid sinceState"}
+	}
+
+	maxChanges := 1000
+	if raw, ok := inv.args["maxChanges"]; ok {
+		var requested *int
+		if json.Unmarshal(raw, &requested) != nil || (requested != nil && *requested <= 0) {
+			return "error", map[string]any{"type": "invalidArguments", "description": "maxChanges must be a positive integer"}
 		}
-		// Collapse rows to their email group. An email is "created" only if its
-		// original row (the one whose id is the group id) was created since; a
-		// changed sibling (new mailbox membership) counts as an update.
-		createdSet := map[int64]bool{}
-		updatedSet := map[int64]bool{}
-		for _, m := range msgs {
-			gid := m.EffectiveEmailID()
-			if m.EmailID == 0 && int64(m.CreateSeq) > since {
-				createdSet[gid] = true
-			} else {
-				updatedSet[gid] = true
-			}
+		if requested != nil && *requested < maxChanges {
+			maxChanges = *requested
 		}
-		for gid := range createdSet {
-			created = append(created, "E"+strconv.FormatInt(gid, 10))
-			delete(updatedSet, gid) // created wins over updated
-		}
-		for gid := range updatedSet {
-			updated = append(updated, "E"+strconv.FormatInt(gid, 10))
-		}
-		return nil
-	})
+	}
+
+	changeStore, ok := acc.(store.EmailChangeStore)
+	if !ok {
+		return s.serverFail(errors.New("account does not provide email change history"))
+	}
+	changes, err := changeStore.EmailChanges(ctx, store.ModSeq(since), maxChanges)
+	if errors.Is(err, store.ErrCannotCalculateEmailChanges) {
+		return "error", map[string]any{"type": "cannotCalculateChanges"}
+	}
 	if err != nil {
 		return s.serverFail(err)
 	}
-	newState, _ := accountState(ctx, acc)
+	formatIDs := func(ids []int64) []string {
+		out := make([]string, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, "E"+strconv.FormatInt(id, 10))
+		}
+		return out
+	}
 	return "Email/changes", map[string]any{
-		"accountId":      strconv.FormatInt(acc.ID(), 10),
+		"accountId":      accountID,
 		"oldState":       sinceState,
-		"newState":       newState,
-		"hasMoreChanges": false,
-		"created":        emptyIfNil(created),
-		"updated":        emptyIfNil(updated),
-		"destroyed":      []string{},
+		"newState":       strconv.FormatInt(int64(changes.NewState), 10),
+		"hasMoreChanges": changes.HasMore,
+		"created":        formatIDs(changes.Created),
+		"updated":        formatIDs(changes.Updated),
+		"destroyed":      formatIDs(changes.Destroyed),
 	}
 }
 

@@ -15,13 +15,16 @@ type Change interface {
 
 // ChangeAddUID: a new message appeared in a mailbox.
 type ChangeAddUID struct {
-	MailboxID        int64
-	UID              UID
-	ModSeq           ModSeq
-	Flags            Flags
-	Keywords         []string
-	MessageCountIMAP uint32
-	Unseen           uint32
+	MailboxID          int64
+	UID                UID
+	MsgID              int64 // Stable projection row id, persisted for replay after row GC.
+	EmailID            int64 // Effective JMAP Email id at the time of the change.
+	EmailExistedBefore bool  // The Email identity existed before this mailbox row was added.
+	ModSeq             ModSeq
+	Flags              Flags
+	Keywords           []string
+	MessageCountIMAP   uint32
+	Unseen             uint32
 }
 
 func (c ChangeAddUID) ChangeModSeq() ModSeq { return c.ModSeq }
@@ -32,6 +35,7 @@ type ChangeRemoveUIDs struct {
 	UIDs             []UID // Increasing UID order, for IMAP.
 	ModSeq           ModSeq
 	MsgIDs           []int64
+	EmailIDs         []int64 // Effective JMAP Email ids, parallel to MsgIDs.
 	UIDNext          UID
 	MessageCountIMAP uint32
 	Unseen           uint32
@@ -43,6 +47,8 @@ func (c ChangeRemoveUIDs) ChangeModSeq() ModSeq { return c.ModSeq }
 type ChangeFlags struct {
 	MailboxID   int64
 	UID         UID
+	MsgID       int64 // Stable projection row id, persisted for replay after row GC.
+	EmailID     int64 // Effective JMAP Email id at the time of the change.
 	ModSeq      ModSeq
 	Mask        Flags // Which flags are modified.
 	Flags       Flags // New values (all, not just mask).

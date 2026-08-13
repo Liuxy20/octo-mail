@@ -1,0 +1,5 @@
+{"file":".coding/spec/backend/index.md","reason":"Verify backend completion checklist and package boundaries."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Verify migration idempotency, SQL scoping, transaction safety, and indexes."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Verify Agent/Space isolation, compatibility, and full test gates."}
+{"file":".coding/spec/backend/error-handling.md","reason":"Verify fail-closed errors remain stable and non-leaky."}
+{"file":".coding/spec/guides/cross-layer-thinking-guide.md","reason":"Check end-to-end flows and negative-space behavior across layers."}

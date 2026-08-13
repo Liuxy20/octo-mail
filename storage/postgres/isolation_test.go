@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
@@ -121,7 +122,26 @@ func TestTenantScopeIsolation(t *testing.T) {
 		}
 	}
 
-	// 5. Wrong tenant's password never authenticates the other's login.
+	// 5. Address management is pinned to both tenant and account. Supplying B's
+	// account id through A's scope cannot list, create, or delete B's addresses.
+	bAddresses, err := scopeA.AccountAddresses(ctx, b.accID)
+	if err != nil || len(bAddresses) != 0 {
+		t.Fatalf("A.AccountAddresses(B) = %v, %v; want empty", bAddresses, err)
+	}
+	if _, err := scopeA.CreateAccountAlias(ctx, b.accID, "cross-tenant"); !errors.Is(err, directory.ErrAddressNotFound) {
+		t.Fatalf("A.CreateAccountAlias(B) error = %v, want address not found", err)
+	}
+	var bAddressID int64
+	must(t, s.Pool.QueryRow(ctx, `SELECT id FROM addresses WHERE tenant_id=$1 AND account_id=$2`, b.id, b.accID).Scan(&bAddressID))
+	if err := scopeA.DeleteAccountAlias(ctx, b.accID, bAddressID); !errors.Is(err, directory.ErrAddressNotFound) {
+		t.Fatalf("A.DeleteAccountAlias(B) error = %v, want address not found", err)
+	}
+	alias, err := scopeA.CreateAccountAlias(ctx, a.accID, "agent-alerts")
+	if err != nil || alias.Address != "agent-alerts@a.example" {
+		t.Fatalf("A.CreateAccountAlias(own) = %v, %v", alias, err)
+	}
+
+	// 6. Wrong tenant's password never authenticates the other's login.
 	if _, _, err := dir.AuthenticatePrincipal(ctx, a.login, directory.PasswordCredential("pw-tenant-b")); err == nil {
 		t.Fatalf("A's login authenticated with B's password")
 	}

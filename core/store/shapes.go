@@ -117,6 +117,26 @@ type Message struct {
 	SummaryFolded bool
 }
 
+// OutboundDelivery is the durable per-recipient result linked to a Sent
+// message. Status is operational storage state; protocol surfaces map it to
+// customer-facing delivery outcomes before returning it to clients.
+type OutboundDelivery struct {
+	QueueID         int64
+	MessageID       int64
+	Recipient       string
+	Status          string
+	AttemptCount    int
+	SMTPCode        int
+	SMTPSecode      string
+	ReasonCode      string
+	TechnicalDetail string
+	CreatedAt       time.Time
+	LastAttemptAt   time.Time
+	DeliveredAt     time.Time
+	FailedAt        time.Time
+	UpdatedAt       time.Time
+}
+
 // EffectiveEmailID returns the message's JMAP email identity: its EmailID group
 // if set, otherwise its own row ID (a plain, un-copied message is its own email).
 func (m Message) EffectiveEmailID() int64 {

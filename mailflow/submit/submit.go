@@ -7,10 +7,10 @@ package submit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/queue"
@@ -24,17 +24,48 @@ type Submitter struct {
 	Blob blob.Store
 }
 
+// ResultUnknownError means the queue transaction reached COMMIT but the client
+// could not determine whether PostgreSQL accepted it. Retrying automatically
+// could therefore duplicate external mail.
+type ResultUnknownError struct {
+	err error
+}
+
+func (e *ResultUnknownError) Error() string { return "submission result unknown: " + e.err.Error() }
+func (e *ResultUnknownError) Unwrap() error { return e.err }
+
+func IsResultUnknown(err error) bool {
+	var target *ResultUnknownError
+	return errors.As(err, &target)
+}
+
+// NewResultUnknownError exposes the ambiguous-COMMIT condition to protocol
+// adapters and their tests without exposing ResultUnknownError internals.
+func NewResultUnknownError(err error) error {
+	return &ResultUnknownError{err: err}
+}
+
 // Submit stores the raw message body in the tenant's blob store and enqueues one
 // delivery row per recipient. Returns the enqueued queue message ids.
 func (s *Submitter) Submit(ctx context.Context, tenantID, accountID int64, mailFrom string, rcptTo []string, raw []byte) ([]int64, error) {
-	return s.SubmitAt(ctx, tenantID, accountID, mailFrom, rcptTo, raw, time.Time{})
+	return s.submit(ctx, tenantID, accountID, 0, mailFrom, rcptTo, raw, time.Time{}, DSNParams{})
+}
+
+// SubmitForMessage enqueues an outbound message and links every recipient to a
+// durable Sent message delivery projection. messageID is the Sent message's
+// effective email id in accountID.
+func (s *Submitter) SubmitForMessage(ctx context.Context, tenantID, accountID, messageID int64, mailFrom string, rcptTo []string, raw []byte) ([]int64, error) {
+	if messageID <= 0 {
+		return nil, fmt.Errorf("invalid sent message id %d", messageID)
+	}
+	return s.submit(ctx, tenantID, accountID, messageID, mailFrom, rcptTo, raw, time.Time{}, DSNParams{})
 }
 
 // SubmitAt is like Submit but defers the first delivery attempt of every enqueued
 // message until notBefore (FUTURERELEASE, RFC 4865). A zero notBefore delivers as
 // soon as possible (identical to Submit).
 func (s *Submitter) SubmitAt(ctx context.Context, tenantID, accountID int64, mailFrom string, rcptTo []string, raw []byte, notBefore time.Time) ([]int64, error) {
-	return s.SubmitDSN(ctx, tenantID, accountID, mailFrom, rcptTo, raw, notBefore, DSNParams{})
+	return s.submit(ctx, tenantID, accountID, 0, mailFrom, rcptTo, raw, notBefore, DSNParams{})
 }
 
 // DSNParams carries RFC 3461 DSN request parameters from an SMTP submission into
@@ -54,6 +85,10 @@ type DSNParams struct {
 
 // SubmitDSN is SubmitAt plus per-recipient RFC 3461 DSN parameters.
 func (s *Submitter) SubmitDSN(ctx context.Context, tenantID, accountID int64, mailFrom string, rcptTo []string, raw []byte, notBefore time.Time, dsnp DSNParams) ([]int64, error) {
+	return s.submit(ctx, tenantID, accountID, 0, mailFrom, rcptTo, raw, notBefore, dsnp)
+}
+
+func (s *Submitter) submit(ctx context.Context, tenantID, accountID, messageID int64, mailFrom string, rcptTo []string, raw []byte, notBefore time.Time, dsnp DSNParams) ([]int64, error) {
 	if len(rcptTo) == 0 {
 		return nil, fmt.Errorf("no recipients")
 	}
@@ -77,34 +112,35 @@ func (s *Submitter) SubmitDSN(ctx context.Context, tenantID, accountID int64, ma
 	// (which a client retry would then re-enqueue → duplicate delivery to the
 	// earlier recipients). The blob Put above stays outside the tx — it is
 	// content-addressed, so an orphaned body on rollback is harmless and dedups.
-	ids := make([]int64, 0, len(rcptTo))
-	err = pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
-		ids = ids[:0]
-		for _, r := range rcptTo {
-			id, e := queue.EnqueueTx(ctx, tx, queue.Msg{
-				TenantID:     tenantID,
-				AccountID:    accountID,
-				MailFrom:     mailFrom,
-				RcptTo:       r,
-				BlobRef:      string(ref),
-				Size:         size,
-				NotBefore:    notBefore,
-				Ret:          dsnp.Ret,
-				EnvID:        dsnp.EnvID,
-				Notify:       dsnp.Notify[r],
-				ORcpt:        dsnp.ORcpt[r],
-				Body8BitMIME: dsnp.Body8BitMIME,
-				SMTPUTF8:     dsnp.SMTPUTF8,
-			})
-			if e != nil {
-				return fmt.Errorf("enqueue for %s: %w", r, e)
-			}
-			ids = append(ids, id)
-		}
-		return nil
-	})
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("begin queue transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+
+	ids := make([]int64, 0, len(rcptTo))
+	for _, r := range rcptTo {
+		id, e := queue.EnqueueTx(ctx, tx, queue.Msg{
+			TenantID: tenantID, AccountID: accountID, MessageID: messageID,
+			MailFrom:     mailFrom,
+			RcptTo:       r,
+			BlobRef:      string(ref),
+			Size:         size,
+			NotBefore:    notBefore,
+			Ret:          dsnp.Ret,
+			EnvID:        dsnp.EnvID,
+			Notify:       dsnp.Notify[r],
+			ORcpt:        dsnp.ORcpt[r],
+			Body8BitMIME: dsnp.Body8BitMIME,
+			SMTPUTF8:     dsnp.SMTPUTF8,
+		})
+		if e != nil {
+			return nil, fmt.Errorf("enqueue for %s: %w", r, e)
+		}
+		ids = append(ids, id)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, NewResultUnknownError(err)
 	}
 	return ids, nil
 }

@@ -90,6 +90,44 @@ func checkReporterConfig(cfg config) error {
 // admin listener on a non-loopback address). Called once in run() after the other
 // check* functions. Warnings need the logger; errors abort startup.
 func validate(cfg config, log *slog.Logger) error {
+	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_MAX_SIZE")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("OCTO_MAIL_MAX_SIZE must be an integer byte count")
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("OCTO_MAIL_MAX_SIZE must be greater than zero")
+		}
+	}
+	if cfg.maxSize < 0 {
+		return fmt.Errorf("OCTO_MAIL_MAX_SIZE must be greater than zero")
+	}
+	if cfg.agentMailboxDomain != "" {
+		if _, err := dns.ParseDomain(cfg.agentMailboxDomain); err != nil {
+			return fmt.Errorf("OCTO_MAIL_AGENT_MAILBOX_DOMAIN must be a valid DNS domain: %w", err)
+		}
+	}
+	if len(cfg.gatewaySecret) > 0 && len(cfg.gatewaySecret) < 32 {
+		return fmt.Errorf("OCTO_MAIL_GATEWAY_SECRET must contain at least 32 bytes when configured")
+	}
+	if cfg.autoReplyMaxCount < 0 || cfg.autoReplyMaxCount > 1_000_000 {
+		return fmt.Errorf("OCTO_MAIL_AUTO_REPLY_MAX_COUNT must be between 0 and 1000000")
+	}
+	if cfg.autoReplyMaxCount > 0 && len(cfg.autoReplyChainKey) < 32 {
+		return fmt.Errorf("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY must contain at least 32 bytes when automatic-reply limiting is enabled")
+	}
+	if cfg.maxAgentMailboxesPerOwnerSpace < 0 || cfg.maxAgentMailboxesPerOwnerSpace > 1000 {
+		return fmt.Errorf("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE must be between 1 and 1000")
+	}
+	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE must be an integer")
+		}
+		if parsed < 1 || parsed > 1000 {
+			return fmt.Errorf("OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE must be between 1 and 1000")
+		}
+	}
 	// Fail fast: an S3 endpoint needs a usable credential. This store uses a
 	// hand-rolled SigV4 signer keyed by the ACCESS+SECRET pair (see
 	// storage/blob/s3.go); it has no ambient-credential/IMDS chain, and the optional
@@ -115,8 +153,8 @@ func validate(cfg config, log *slog.Logger) error {
 	// instead of silently getting the default. The load helpers fold a parse error
 	// to the default (no behavior change); this re-checks the raw strings.
 	for _, k := range []string{
-		"OCTO_MAIL_MAX_SIZE", "OCTO_MAIL_MAX_CONNS", "OCTO_MAIL_QUEUE_DELAY_DSN", "OCTO_MAIL_MAX_HOPS",
-		"OCTO_MAIL_TRUSTED_HAM_COUNT", "OCTO_MAIL_SEND_RATE_MAX",
+		"OCTO_MAIL_MAX_CONNS", "OCTO_MAIL_QUEUE_DELAY_DSN", "OCTO_MAIL_MAX_HOPS",
+		"OCTO_MAIL_TRUSTED_HAM_COUNT", "OCTO_MAIL_SEND_RATE_MAX", "OCTO_MAIL_AUTO_REPLY_MAX_COUNT",
 	} {
 		if v := os.Getenv(k); v != "" {
 			if _, err := strconv.ParseInt(v, 10, 64); err != nil {
@@ -228,11 +266,12 @@ type config struct {
 	// s3SessionToken is an optional STS/IAM-role temporary-credential token.
 	s3SessionToken string
 
-	smtpAddr       string
-	submissionAddr string
-	imapAddr       string
-	jmapAddr       string
-	jmapBaseURL    string
+	smtpAddr         string
+	submissionAddr   string
+	imapAddr         string
+	jmapAddr         string
+	jmapBaseURL      string
+	authorizationURL string
 
 	queueInterval    time.Duration
 	projInterval     time.Duration
@@ -263,6 +302,22 @@ type config struct {
 
 	adminAddr  string
 	adminToken string
+	// gatewaySecret authenticates short-lived OCTO user/Space assertions.
+	gatewaySecret []byte
+	// outboundReviewTerms enables the deterministic local Agent outbound-policy
+	// workflow adapter. Empty preserves allow-all behavior.
+	outboundReviewTerms []string
+	// autoReplyMaxCount bounds one authenticated Bot-to-Bot automatic-reply
+	// chain. Zero is an explicit rollback/disable switch; the runtime default is
+	// four. autoReplyChainKey HMAC-authenticates the transported chain metadata.
+	autoReplyMaxCount int
+	autoReplyChainKey []byte
+	// maxAgentMailboxesPerOwnerSpace limits Agent mailbox registrations for one
+	// human owner inside one authenticated OCTO Space.
+	maxAgentMailboxesPerOwnerSpace int
+	// agentMailboxDomain is the tenant-owned address domain assigned to newly
+	// registered Agent mailboxes. Empty preserves source-account inheritance.
+	agentMailboxDomain string
 
 	// egressPool: when true, outbound deliveries bind a per-tenant source IP
 	// leased from the IPRouter (multi-egress warmup/reputation isolation).
@@ -309,11 +364,12 @@ func loadConfig() config {
 		s3Secret:       os.Getenv("OCTO_MAIL_S3_SECRET"),
 		s3SessionToken: os.Getenv("OCTO_MAIL_S3_SESSION_TOKEN"),
 
-		smtpAddr:       envDefault("OCTO_MAIL_SMTP_ADDR", ":25"),
-		submissionAddr: envDefault("OCTO_MAIL_SUBMISSION_ADDR", ":587"),
-		imapAddr:       envDefault("OCTO_MAIL_IMAP_ADDR", ":143"),
-		jmapAddr:       envDefault("OCTO_MAIL_JMAP_ADDR", ":8080"),
-		jmapBaseURL:    envDefault("OCTO_MAIL_JMAP_BASEURL", "http://localhost:8080"),
+		smtpAddr:         envDefault("OCTO_MAIL_SMTP_ADDR", ":25"),
+		submissionAddr:   envDefault("OCTO_MAIL_SUBMISSION_ADDR", ":587"),
+		imapAddr:         envDefault("OCTO_MAIL_IMAP_ADDR", ":143"),
+		jmapAddr:         envDefault("OCTO_MAIL_JMAP_ADDR", ":8080"),
+		jmapBaseURL:      envDefault("OCTO_MAIL_JMAP_BASEURL", "http://localhost:8080"),
+		authorizationURL: envDefault("OCTO_MAIL_AUTHORIZATION_URL", "/mail/authorize"),
 
 		queueInterval:    envDuration("OCTO_MAIL_QUEUE_INTERVAL", 5*time.Second),
 		projInterval:     envDuration("OCTO_MAIL_PROJECTION_INTERVAL", 10*time.Second),
@@ -339,8 +395,16 @@ func loadConfig() config {
 		webhookURL:    os.Getenv("OCTO_MAIL_WEBHOOK_URL"),
 		webhookSecret: []byte(os.Getenv("OCTO_MAIL_WEBHOOK_SECRET")),
 
-		adminAddr:  envDefault("OCTO_MAIL_ADMIN_ADDR", ":8081"),
-		adminToken: os.Getenv("OCTO_MAIL_ADMIN_TOKEN"),
+		adminAddr:           envDefault("OCTO_MAIL_ADMIN_ADDR", ":8081"),
+		adminToken:          os.Getenv("OCTO_MAIL_ADMIN_TOKEN"),
+		gatewaySecret:       []byte(os.Getenv("OCTO_MAIL_GATEWAY_SECRET")),
+		outboundReviewTerms: parseTrimmedList(os.Getenv("OCTO_MAIL_OUTBOUND_REVIEW_TERMS")),
+		autoReplyMaxCount:   int(envInt64("OCTO_MAIL_AUTO_REPLY_MAX_COUNT", 4)),
+		autoReplyChainKey:   []byte(os.Getenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY")),
+		maxAgentMailboxesPerOwnerSpace: int(envInt64(
+			"OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE", 2,
+		)),
+		agentMailboxDomain: envLower("OCTO_MAIL_AGENT_MAILBOX_DOMAIN"),
 
 		egressPool: os.Getenv("OCTO_MAIL_EGRESS_POOL") == "1",
 
@@ -352,6 +416,16 @@ func loadConfig() config {
 		acmeCacheDir:  envDefault("OCTO_MAIL_ACME_CACHE", "./acme"),
 		acmeHosts:     parseDomainList(os.Getenv("OCTO_MAIL_ACME_HOSTS")),
 	}
+}
+
+func parseTrimmedList(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func envFloat(k string, def float64) float64 {

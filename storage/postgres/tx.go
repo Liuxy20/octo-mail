@@ -84,7 +84,8 @@ func (pt *pgTx) Update(v any) error {
 			}
 		}
 		return pt.record(store.ChangeFlags{
-			MailboxID: x.MailboxID, UID: x.UID, ModSeq: seq, Flags: x.Flags, Mask: x.Flags, Keywords: x.Keywords,
+			MailboxID: x.MailboxID, UID: x.UID, MsgID: x.ID, EmailID: x.EffectiveEmailID(),
+			ModSeq: seq, Flags: x.Flags, Mask: x.Flags, Keywords: x.Keywords,
 		})
 	default:
 		return errUnknownChange
@@ -163,13 +164,22 @@ func (q *msgQuery) FilterFlags(mask, want store.Flags) store.MessageQuery {
 	return q
 }
 func (q *msgQuery) FilterFTS(query string) store.MessageQuery {
-	// Match messages whose fts tsvector matches the query. The fts projection is
-	// async, so very recently delivered messages may not yet be indexed — that is
-	// the tolerated staleness of a non-read-your-write projection.
+	// Mailbox search is deliberately an exact, case-insensitive substring match.
+	// This keeps Chinese text such as "各位同学们" searchable by "同学们" without
+	// depending on language-specific tokenization. The projection is async, so
+	// very recently delivered messages may not yet be indexed.
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
+	q.args = append(q.args, "%"+esc+"%")
+	substringPos := "$" + itoaPos(len(q.args))
+	// During rolling upgrade/backfill, preserve the previous token search for
+	// rows whose source text has not been populated yet. NULL is the explicit
+	// backfill marker; an empty string is a valid, already-indexed empty message.
 	q.args = append(q.args, query)
-	pos := "$" + itoaPos(len(q.args))
+	legacyPos := "$" + itoaPos(len(q.args))
 	q.wheres = append(q.wheres,
-		"id IN (SELECT message_id FROM fts WHERE account_id=messages.account_id AND tsv @@ plainto_tsquery('simple', "+pos+"))")
+		`id IN (SELECT message_id FROM fts WHERE account_id=messages.account_id AND (`+
+			`search_text ILIKE `+substringPos+` ESCAPE '\' OR `+
+			`(search_text IS NULL AND tsv @@ plainto_tsquery('simple', `+legacyPos+`))))`)
 	return q
 }
 func (q *msgQuery) FilterThread(id int64) store.MessageQuery { return q.add("thread_id=", id) }

@@ -52,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/addresses", s.requireAdmin(s.handleCreateAddress))              // POST {tenant_id,domain,localpart,account}
 	mux.HandleFunc("/admin/domains", s.requireAdmin(s.handleCreateDomain))                 // POST {tenant_id,domain}
 	mux.HandleFunc("/admin/password", s.requireAdmin(s.handleSetPassword))                 // POST {login,password}
+	mux.HandleFunc("/admin/gateway-identities", s.requireAdmin(s.handleGatewayIdentity))   // POST {issuer,subject,spaceId,login}
 	mux.HandleFunc("/admin/quota", s.requireAdmin(s.handleQuota))                          // GET ?account_id=
 	mux.HandleFunc("/admin/reputation", s.requireAdmin(s.handleReputation))                // GET ?tenant_id=&domain=
 	mux.HandleFunc("/admin/reputation/unpause", s.requireAdmin(s.handleReputationUnpause)) // POST {tenant_id,domain}
@@ -69,6 +70,68 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)                                             // GET (no auth)
 	mux.Handle("/metrics", s.requireAdmin(obs.Handler().ServeHTTP))                        // Prometheus metrics (admin-gated)
 	return mux
+}
+
+// handleGatewayIdentity binds one authenticated OCTO actor and Space to an
+// existing human mail owner and explicitly designates the account addressed by
+// that owner's login as the Space's default Agent mailbox. Unlike independently
+// registered Agent mailboxes, that initial mailbox may reuse the owner's login
+// principal; the gateway identity row is its authoritative Agent designation.
+// Provisioning remains an explicit admin operation, so an arbitrary signed
+// request cannot create or claim a mailbox implicitly.
+func (s *Server) handleGatewayIdentity(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Issuer  string `json:"issuer"`
+		Subject string `json:"subject"`
+		SpaceID string `json:"spaceId"`
+		Login   string `json:"login"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	req.Issuer = strings.TrimSpace(req.Issuer)
+	req.Subject = strings.TrimSpace(req.Subject)
+	req.SpaceID = strings.TrimSpace(req.SpaceID)
+	req.Login = strings.TrimSpace(req.Login)
+	if req.Issuer == "" || req.Subject == "" || req.SpaceID == "" || req.Login == "" ||
+		len(req.Issuer) > 200 || len(req.Subject) > 300 || len(req.SpaceID) > 300 || len(req.Login) > 320 {
+		s.writeErr(w, r, errStatus(http.StatusBadRequest, "issuer, subject, spaceId, and login are required"))
+		return
+	}
+	var principalID, tenantID, accountID int64
+	err := s.Pool.QueryRow(r.Context(),
+		`SELECT p.id,p.tenant_id,acc.id
+		 FROM principals p
+		 JOIN accounts acc ON acc.owner_principal_id=p.id AND acc.tenant_id=p.tenant_id AND NOT acc.disabled
+		 JOIN addresses addr ON addr.account_id=acc.id AND addr.tenant_id=acc.tenant_id AND NOT addr.is_alias
+		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
+		 WHERE p.login=$1 AND addr.localpart || '@' || dom.domain=$1
+		 ORDER BY acc.id LIMIT 1`, req.Login).Scan(&principalID, &tenantID, &accountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		s.writeErr(w, r, errStatus(http.StatusNotFound, "mail owner login was not found"))
+		return
+	}
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	var id int64
+	err = s.Pool.QueryRow(r.Context(),
+		`INSERT INTO gateway_identities
+		 (issuer,subject,space_id,tenant_id,owner_principal_id,default_account_id)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 ON CONFLICT (issuer,subject,space_id) DO UPDATE SET
+		 tenant_id=EXCLUDED.tenant_id,owner_principal_id=EXCLUDED.owner_principal_id,
+		 default_account_id=EXCLUDED.default_account_id,disabled=false,updated_at=now()
+		 RETURNING id`,
+		req.Issuer, req.Subject, req.SpaceID, tenantID, principalID, accountID).Scan(&id)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": id, "tenantId": tenantID, "ownerPrincipalId": principalID, "defaultAccountId": accountID,
+	})
 }
 
 // tokenValid reports whether the request carries the configured admin bearer
@@ -193,11 +256,29 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, err)
 		return
 	}
-	// A principal login for the address (so the account can authenticate). ON
-	// CONFLICT DO NOTHING tolerates a pre-existing login, but a genuine error must
-	// roll back the address insert rather than be discarded.
-	if _, err := tx.Exec(r.Context(), `INSERT INTO principals (tenant_id, login) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-		req.TenantID, req.Localpart+"@"+req.Domain); err != nil {
+	// A principal login for the address (so the account can authenticate). Reuse
+	// a pre-existing login only inside this tenant. Login is globally unique, so
+	// a conflict owned by another tenant must return no row and roll back instead
+	// of attaching that foreign principal to this account.
+	var principalID int64
+	if err := tx.QueryRow(r.Context(),
+		`INSERT INTO principals (tenant_id, login) VALUES ($1,$2)
+		 ON CONFLICT (login) DO UPDATE SET login=EXCLUDED.login
+		 WHERE principals.tenant_id=EXCLUDED.tenant_id
+		 RETURNING id`,
+		req.TenantID, req.Localpart+"@"+req.Domain).Scan(&principalID); errors.Is(err, pgx.ErrNoRows) {
+		s.writeErr(w, r, errStatus(http.StatusConflict, "address login already belongs to another tenant"))
+		return
+	} else if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE accounts
+		 SET principal_id=COALESCE(principal_id,$1),
+		     owner_principal_id=COALESCE(owner_principal_id,$1)
+		 WHERE id=$2 AND tenant_id=$3`,
+		principalID, accID, req.TenantID); err != nil {
 		s.writeErr(w, r, err)
 		return
 	}

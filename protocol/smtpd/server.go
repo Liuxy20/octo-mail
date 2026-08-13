@@ -99,6 +99,11 @@ type Server struct {
 	// Injected as a func to avoid coupling smtpd to the vacation store/queue.
 	VacationResponder func(ctx context.Context, accountID int64, sender, recipient string, raw []byte)
 
+	// MailRuleProcessor, when set, evaluates bounded product rules only after an
+	// Inbox delivery has committed. Errors are logged by the injected wrapper and
+	// never change the SMTP acceptance result.
+	MailRuleProcessor func(ctx context.Context, accountID, sourceEmailID int64, raw []byte)
+
 	// BURLResolver, when set (submission mode), resolves an RFC 4467 authorized
 	// IMAP URL to message bytes for the BURL command (RFC 4468), so a client can
 	// submit a message it composed in IMAP without downloading it. It is called
@@ -1170,6 +1175,7 @@ func (c *conn) processData(data []byte) error {
 	repAuthed := authenticated && authRes.SPF == spf.StatusPass &&
 		senderDomain != "" && strings.EqualFold(authRes.SPFDomain.ASCII, senderDomain)
 
+	rulesProcessed := make(map[int64]struct{})
 	for i, target := range c.rcpts {
 		m := &store.Message{}
 		if authenticated {
@@ -1241,6 +1247,16 @@ func (c *conn) processData(data []byte) error {
 		// Vacation auto-reply: only for real Inbox deliveries (not Junk/rulesets).
 		if c.srv.VacationResponder != nil && mailbox == "Inbox" && c.mailFrom != "" {
 			c.srv.VacationResponder(c.ctx, target.AccountID(), c.mailFrom, c.rcptAddrs[i], data)
+		}
+		if c.srv.MailRuleProcessor != nil && mailbox == "Inbox" {
+			accountID := target.AccountID()
+			if _, processed := rulesProcessed[accountID]; !processed {
+				stored := make([]byte, 0, len(m.MsgPrefix)+len(data))
+				stored = append(stored, m.MsgPrefix...)
+				stored = append(stored, data...)
+				c.srv.MailRuleProcessor(c.ctx, accountID, m.EffectiveEmailID(), stored)
+				rulesProcessed[accountID] = struct{}{}
+			}
 		}
 		obs.InboundDelivered.WithLabelValues(strings.ToLower(mailbox)).Inc()
 	}

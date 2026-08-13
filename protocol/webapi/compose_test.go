@@ -79,3 +79,75 @@ func TestComposeAttachmentHeaderInjection(t *testing.T) {
 	}
 	t.Logf("OK: attachment Content-Type CRLF stripped — no header injection")
 }
+
+func TestBCCIsEnvelopeOnly(t *testing.T) {
+	request := sendRequest{
+		To: []string{"to@example.com"}, Cc: []string{"cc@example.com"},
+		Bcc: []string{"hidden@example.com"}, Subject: "privacy", Text: "body",
+	}
+	raw, _, err := compose(composeInput{
+		From: "sender@example.com", To: request.To, Cc: request.Cc,
+		Subject: request.Subject, Text: request.Text,
+	}, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(bytes.ToLower(raw), []byte("bcc:")) || bytes.Contains(raw, []byte("hidden@example.com")) {
+		t.Fatalf("Bcc leaked into RFC 5322 message: %q", raw)
+	}
+	recipients := allRecipients(request.To, request.Cc, request.Bcc)
+	if len(recipients) != 3 || recipients[2] != "hidden@example.com" {
+		t.Fatalf("SMTP envelope recipients = %v, want Bcc recipient included", recipients)
+	}
+}
+
+func TestDraftBCCIsStoredButStrippedBeforeSubmission(t *testing.T) {
+	raw, _, err := compose(composeInput{
+		From: "sender@example.com", To: []string{"to@example.com"},
+		DraftBcc: []string{"hidden@example.com"}, Subject: "draft", Text: "body",
+	}, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := parseEnvelope(raw, nil, "")
+	if len(envelope.bcc) != 1 || envelope.bcc[0] != "hidden@example.com" {
+		t.Fatalf("stored Draft Bcc = %v, want hidden@example.com", envelope.bcc)
+	}
+	outbound := stripRFCHeader(raw, "Bcc")
+	if bytes.Contains(bytes.ToLower(outbound), []byte("bcc:")) || bytes.Contains(outbound, []byte("hidden@example.com")) {
+		t.Fatalf("Draft Bcc leaked into outbound bytes: %q", outbound)
+	}
+	if !bytes.Contains(outbound, []byte("Subject: draft\r\n")) || !bytes.Contains(outbound, []byte("\r\n\r\nbody\r\n")) {
+		t.Fatalf("stripping Bcc changed other message content: %q", outbound)
+	}
+}
+
+func TestForwardAttributionDoesNotChangeReplyTarget(t *testing.T) {
+	raw, _, err := compose(composeInput{
+		From: "forwarder@example.com", To: []string{"recipient@example.com"},
+		Subject: "Fwd: question", Text: "forwarded body",
+		OriginalFrom: "origin@example.net", SentBy: "forwarder@example.com",
+	}, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := parseEnvelope(raw, nil, "")
+	if envelope.from != "forwarder@example.com" || envelope.originalFrom != "" || envelope.sentBy != "" {
+		t.Fatalf("forward attribution = %#v", envelope)
+	}
+	if envelope.replyTo != "" {
+		t.Fatalf("forward unexpectedly redirects replies to %q", envelope.replyTo)
+	}
+	to, _ := replyRecipients(envelope, "recipient@example.com", false)
+	if len(to) != 1 || to[0] != "forwarder@example.com" {
+		t.Fatalf("forward reply recipients = %v, want forwarder@example.com", to)
+	}
+}
+
+func TestReplyRecipientsPreferExplicitReplyTo(t *testing.T) {
+	envelope := parseEnvelope([]byte("From: sender@example.com\r\nReply-To: replies@example.net\r\nTo: recipient@example.com\r\n\r\nbody\r\n"), nil, "")
+	to, _ := replyRecipients(envelope, "recipient@example.com", false)
+	if len(to) != 1 || to[0] != "replies@example.net" {
+		t.Fatalf("reply recipients = %v, want replies@example.net", to)
+	}
+}
