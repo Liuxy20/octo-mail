@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,12 @@ import (
 	"sort"
 	"strings"
 	"time"
+)
+
+const (
+	s3ProbeObjectName = ".octo-mail-probe"
+	s3ProbeTimeout    = 30 * time.Second
+	s3ProbeBodyLimit  = 64 << 10
 )
 
 // s3Store is an S3-compatible blob backend (tested against MinIO). It speaks the
@@ -61,9 +68,10 @@ type S3Config struct {
 	SessionToken string // optional STS/IAM-role temporary-credential token
 }
 
-// NewS3 returns an S3-backed blob store without contacting the endpoint. The
-// configured bucket must already exist; provisioning it is the deployment's
-// responsibility.
+// NewS3 returns an S3-backed blob store after verifying object-level access to
+// the configured, pre-provisioned bucket. Provisioning remains the deployment's
+// responsibility: the probe is a read-only GET for a deliberately absent key,
+// never a bucket-level HEAD or create request.
 func NewS3(cfg S3Config) (Store, error) {
 	prefixPath, err := normalizeS3PrefixPath(cfg.PrefixPath)
 	if err != nil {
@@ -100,7 +108,56 @@ func NewS3(cfg S3Config) (Store, error) {
 	if s.region == "" {
 		s.region = "us-east-1"
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), s3ProbeTimeout)
+	defer cancel()
+	if err := s.probe(ctx); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// probe verifies that the endpoint, credentials, bucket, and configured object
+// namespace are usable without requiring bucket-level IAM permissions or
+// mutating storage. S3's NoSuchKey response is the expected success signal: the
+// signed object GET reached an existing bucket and was authorized for this
+// prefix. Missing buckets, denied access, malformed responses, and transport
+// failures all fail startup rather than surfacing on the first delivered mail.
+func (s *s3Store) probe(ctx context.Context) error {
+	key := s3ProbeObjectName
+	if s.prefixPath != "" {
+		key = s.prefixPath + "/" + key
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint+"/"+s.bucket+"/"+key, nil)
+	if err != nil {
+		return fmt.Errorf("s3 probe: %w", err)
+	}
+	resp, err := s.retryDo(req, emptyHash, false)
+	if err != nil {
+		return fmt.Errorf("s3 probe: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, s3ProbeBodyLimit))
+	if readErr != nil {
+		return fmt.Errorf("s3 probe: read %s response: %w", resp.Status, readErr)
+	}
+	var apiErr struct {
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	}
+	if err := xml.Unmarshal(body, &apiErr); err != nil {
+		return fmt.Errorf("s3 probe: %s with invalid S3 error response: %w", resp.Status, err)
+	}
+	if resp.StatusCode == http.StatusNotFound && apiErr.Code == "NoSuchKey" {
+		return nil
+	}
+	if apiErr.Message != "" {
+		return fmt.Errorf("s3 probe: %s: %s: %s", resp.Status, apiErr.Code, apiErr.Message)
+	}
+	return fmt.Errorf("s3 probe: %s: %s", resp.Status, apiErr.Code)
 }
 
 // retryDo signs and sends req, retrying on transient failures (network error,

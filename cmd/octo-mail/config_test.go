@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -267,4 +270,30 @@ func TestOpenBlobStoreSelectsBackend(t *testing.T) {
 		t.Fatalf("blobDir not created: %v", err)
 	}
 	_ = ref
+}
+
+func TestOpenBlobStoreLogsNormalizedS3Prefix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `<Error><Code>NoSuchKey</Code><Message>not found</Message></Error>`)
+	}))
+	t.Cleanup(server.Close)
+
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	_, err := openBlobStore(config{
+		s3Endpoint:   server.URL,
+		s3Region:     "us-east-1",
+		s3Bucket:     "mail-bucket",
+		s3PrefixPath: "/mail/prod/",
+		s3Access:     "access",
+		s3Secret:     "secret",
+	}, log)
+	if err != nil {
+		t.Fatalf("open S3 backend: %v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "prefix_path=mail/prod") {
+		t.Fatalf("S3 log does not contain normalized prefix: %s", got)
+	}
 }

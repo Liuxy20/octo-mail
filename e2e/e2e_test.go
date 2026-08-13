@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -298,7 +299,7 @@ func TestBlobGC(t *testing.T) {
 
 	// Open a Store against the deployed Postgres + MinIO — the SAME backends the
 	// running node uses — so CollectGarbage acts on real deployed state.
-	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, AccessKey: s3Access, SecretKey: s3Secret})
+	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, PrefixPath: os.Getenv("OCTO_MAIL_S3_PREFIX_PATH"), AccessKey: s3Access, SecretKey: s3Secret})
 	if err != nil {
 		t.Fatalf("open s3: %v", err)
 	}
@@ -373,7 +374,7 @@ func TestAPIKeyAuth(t *testing.T) {
 	provisionAccount(t, "keyagent", "keydom.test", login, "key-pw")
 
 	// Mint a key via the store (the operator/CLI path is octo-mail apikey create).
-	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, AccessKey: s3Access, SecretKey: s3Secret})
+	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, PrefixPath: os.Getenv("OCTO_MAIL_S3_PREFIX_PATH"), AccessKey: s3Access, SecretKey: s3Secret})
 	if err != nil {
 		t.Fatalf("open s3: %v", err)
 	}
@@ -421,7 +422,7 @@ func TestRESTAPIFlow(t *testing.T) {
 	loginB := "restb@restdom2.test"
 	provisionAccount(t, "restb", "restdom2.test", loginB, "rest-pw2")
 
-	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, AccessKey: s3Access, SecretKey: s3Secret})
+	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, PrefixPath: os.Getenv("OCTO_MAIL_S3_PREFIX_PATH"), AccessKey: s3Access, SecretKey: s3Secret})
 	if err != nil {
 		t.Fatalf("open s3: %v", err)
 	}

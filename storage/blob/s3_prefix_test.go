@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
@@ -77,11 +76,13 @@ func TestS3ObjectKeyPrefix(t *testing.T) {
 	}
 }
 
-func TestNewS3DoesNotSendBucketRequests(t *testing.T) {
-	var requests atomic.Int64
+func TestNewS3UsesReadOnlyObjectProbe(t *testing.T) {
+	var requests []*http.Request
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		w.WriteHeader(http.StatusOK)
+		requests = append(requests, r.Clone(r.Context()))
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`))
 	}))
 	t.Cleanup(server.Close)
 
@@ -96,10 +97,61 @@ func TestNewS3DoesNotSendBucketRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewS3: %v", err)
 	}
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("NewS3 sent %d request(s), want none; bucket provisioning belongs to deployment infrastructure", got)
+	if len(requests) != 1 {
+		t.Fatalf("NewS3 sent %d request(s), want one object-level probe", len(requests))
+	}
+	req := requests[0]
+	if req.Method != http.MethodGet {
+		t.Fatalf("probe method = %s, want GET", req.Method)
+	}
+	if got, want := req.URL.Path, "/mail-bucket/mail/prod/"+s3ProbeObjectName; got != want {
+		t.Fatalf("probe path = %q, want %q", got, want)
+	}
+	if req.URL.Path == "/mail-bucket" || req.URL.Path == "/mail-bucket/" {
+		t.Fatalf("probe unexpectedly targeted bucket root: %q", req.URL.Path)
 	}
 	if got := store.(*s3Store).prefixPath; got != "mail/prod" {
 		t.Fatalf("normalized store prefix = %q, want mail/prod", got)
+	}
+}
+
+func TestNewS3FailsClosedOnObjectProbeErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{name: "missing bucket", status: http.StatusNotFound, code: "NoSuchBucket"},
+		{name: "access denied", status: http.StatusForbidden, code: "AccessDenied"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("probe method = %s, want GET", r.Method)
+				}
+				if r.URL.Path != "/mail-bucket/"+s3ProbeObjectName {
+					t.Errorf("probe path = %q, want object path", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(`<Error><Code>` + test.code + `</Code><Message>probe failed</Message></Error>`))
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := NewS3(S3Config{
+				Endpoint:  server.URL,
+				Region:    "us-east-1",
+				Bucket:    "mail-bucket",
+				AccessKey: "access",
+				SecretKey: "secret",
+			})
+			if err == nil {
+				t.Fatalf("NewS3 succeeded for %s; want fail-closed startup error", test.code)
+			}
+			if !strings.Contains(err.Error(), test.code) {
+				t.Fatalf("NewS3 error = %q, want S3 code %q", err, test.code)
+			}
+		})
 	}
 }

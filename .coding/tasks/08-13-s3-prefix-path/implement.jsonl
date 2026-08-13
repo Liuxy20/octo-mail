@@ -1,3 +1,2 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .coding/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
 {"file": ".coding/spec/backend/index.md", "reason": "Backend pre-development and quality checklist"}
 {"file": ".coding/spec/backend/quality-guidelines.md", "reason": "Go implementation and test quality requirements"}

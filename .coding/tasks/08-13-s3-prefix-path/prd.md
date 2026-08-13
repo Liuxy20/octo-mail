@@ -8,7 +8,7 @@ Allow one S3 bucket to be safely partitioned by a deployment-configured object-k
 
 - Add an optional `OCTO_MAIL_S3_PREFIX_PATH` environment variable and expose it in the repository's documented/container configuration surfaces.
 - When configured, prepend the normalized prefix to every S3 blob object key.
-- Treat `OCTO_MAIL_S3_BUCKET` as the name of a pre-provisioned bucket. Application startup must not issue bucket-level existence probes or bucket-creation requests; deployment infrastructure owns bucket provisioning.
+- Treat `OCTO_MAIL_S3_BUCKET` as the name of a pre-provisioned bucket. Application startup must not issue bucket-level existence probes or bucket-creation requests; deployment infrastructure owns bucket provisioning. Fail startup on endpoint, credential, bucket, or prefix-level permission errors by issuing a read-only GET for an absent sentinel object under the configured prefix; only `NoSuchKey` (or a successful GET) passes the probe.
 - Empty configuration must preserve the existing `<tenant>/<ab>/<cd>/<sha256>` object-key layout byte-for-byte.
 - Accept a conventional slash-delimited prefix with any number of optional leading/trailing slashes. After removing those outer slashes, allow only `[A-Za-z0-9._-]+` in each non-empty segment; fail startup on every other character or unsafe path form.
 - The prefix affects only the S3 backend; local filesystem storage remains unchanged.
@@ -17,7 +17,7 @@ Allow one S3 bucket to be safely partitioned by a deployment-configured object-k
 
 ## Acceptance Criteria
 
-- [x] AC1 (executable): `go test ./storage/blob ./cmd/octo-mail -count=1` → the per-segment allowlist (including rejection of every known wire/SigV4-divergent character), prefix normalization, key generation, no bucket-level startup requests, and env loading tests pass.
+- [x] AC1 (executable): `go test ./storage/blob ./cmd/octo-mail -count=1` → the per-segment allowlist (including rejection of every known wire/SigV4-divergent character), prefix normalization, key generation, read-only object-level startup probe, no bucket-level startup requests, and env loading tests pass.
 - [x] AC2: With no prefix configured, generated object keys exactly match the pre-change layout.
 - [x] AC3: With `OCTO_MAIL_S3_PREFIX_PATH=/mail/prod/`, all blob object operations use `mail/prod/<tenant>/<ab>/<cd>/<sha256>`.
 - [x] AC4: `.env.example`, `docker-compose.yml`, and `README.md` expose and explain the new setting, coordinated offline migration procedure, mixed-prefix prohibition, and irreversible summary/search metadata risk.

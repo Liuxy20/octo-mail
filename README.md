@@ -157,6 +157,9 @@ config file. The authoritative list lives in
 belong to deployment infrastructure. Its S3 identity only needs object
 `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` permissions under the
 configured prefix (or the bucket's object keys when no prefix is set).
+At startup, octo-mail performs a read-only `GetObject` for an absent sentinel
+under that prefix: `NoSuchKey` confirms access, while a missing bucket, denied
+credentials, or a transport failure stops startup before mail traffic begins.
 
 `OCTO_MAIL_S3_PREFIX_PATH` accepts values such as `mail/prod` or
 `/mail/prod/`; each slash-delimited segment may contain only ASCII letters,

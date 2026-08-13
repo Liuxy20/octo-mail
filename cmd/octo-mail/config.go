@@ -33,7 +33,7 @@ func openBlobStore(cfg config, log *slog.Logger) (blob.Store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("s3 blob store: %w", err)
 		}
-		log.Info("blob store", "backend", "s3", "endpoint", cfg.s3Endpoint, "bucket", cfg.s3Bucket, "prefix_path", cfg.s3PrefixPath)
+		log.Info("blob store", "backend", "s3", "endpoint", cfg.s3Endpoint, "bucket", cfg.s3Bucket, "prefix_path", strings.Trim(cfg.s3PrefixPath, "/"))
 		return bs, nil
 	}
 	bs, err := blob.NewFS(cfg.blobDir)
