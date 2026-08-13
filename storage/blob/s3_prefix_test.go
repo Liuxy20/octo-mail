@@ -1,6 +1,8 @@
 package blob
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,7 +124,6 @@ func TestNewS3FailsClosedOnObjectProbeErrors(t *testing.T) {
 		code   string
 	}{
 		{name: "missing bucket", status: http.StatusNotFound, code: "NoSuchBucket"},
-		{name: "access denied", status: http.StatusForbidden, code: "AccessDenied"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -153,5 +154,34 @@ func TestNewS3FailsClosedOnObjectProbeErrors(t *testing.T) {
 				t.Fatalf("NewS3 error = %q, want S3 code %q", err, test.code)
 			}
 		})
+	}
+}
+
+func TestNewS3AllowsAWSMissingObjectMask(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`))
+	}))
+	t.Cleanup(server.Close)
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	_, err := NewS3(S3Config{
+		Endpoint:   server.URL,
+		Region:     "us-east-1",
+		Bucket:     "mail-bucket",
+		PrefixPath: "mail/prod",
+		AccessKey:  "access",
+		SecretKey:  "secret",
+	})
+	if err != nil {
+		t.Fatalf("NewS3 rejected AWS missing-object mask: %v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "AccessDenied") {
+		t.Fatalf("startup warning missing AccessDenied context: %s", got)
 	}
 }

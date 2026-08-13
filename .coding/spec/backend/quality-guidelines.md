@@ -70,8 +70,10 @@ S3 buckets are deployment infrastructure. `blob.NewS3` consumes the configured,
 pre-provisioned bucket and must not require `HeadBucket` or `CreateBucket`
 permissions at startup. It must fail fast with a read-only object GET under the
 configured prefix: `NoSuchKey` proves object-level access without mutating S3,
-while `NoSuchBucket`, `AccessDenied`, malformed responses, and transport errors
-are startup failures. Local/CI infrastructure creates test buckets separately.
+while AWS's `AccessDenied` missing-object mask is allowed with a warning so
+`ListBucket` is not required. `NoSuchBucket`, invalid credentials/signatures,
+malformed responses, and transport errors are startup failures. Local/CI
+infrastructure creates test buckets separately.
 Real-S3 tests may skip only when the endpoint is unreachable; once it is reachable,
 credential, bucket, permission, and object-operation failures must fail the test.
 

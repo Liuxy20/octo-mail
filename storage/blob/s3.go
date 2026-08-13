@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -152,6 +153,16 @@ func (s *s3Store) probe(ctx context.Context) error {
 		return fmt.Errorf("s3 probe: %s with invalid S3 error response: %w", resp.Status, err)
 	}
 	if resp.StatusCode == http.StatusNotFound && apiErr.Code == "NoSuchKey" {
+		return nil
+	}
+	if resp.StatusCode == http.StatusForbidden && apiErr.Code == "AccessDenied" {
+		// AWS S3 masks a missing object's existence as AccessDenied when the
+		// caller has object permissions but no bucket-level ListBucket grant.
+		// That policy is intentionally supported: bucket provisioning and
+		// listing are outside octo-mail. Keep the probe read-only, warn that it
+		// could not prove object access, and let the first real object operation
+		// report any actual prefix/permission mismatch.
+		slog.Warn("S3 startup probe returned AccessDenied; continuing because AWS S3 uses this response for missing objects when s3:ListBucket is not granted", "bucket", s.bucket, "prefix_path", s.prefixPath)
 		return nil
 	}
 	if apiErr.Message != "" {
