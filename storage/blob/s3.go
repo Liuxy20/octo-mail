@@ -20,18 +20,20 @@ import (
 // s3Store is an S3-compatible blob backend (tested against MinIO). It speaks the
 // S3 REST API directly with AWS Signature V4 — no SDK dependency — keeping the
 // kernel free of a heavy vendored client. Bodies are content-addressed exactly
-// like the fs backend: key = <tenant>/<ab>/<cd>/<sha256>, so identical messages
-// dedup within a tenant (a PUT of an existing key is idempotent).
+// like the fs backend: key = [<prefix>/]<tenant>/<ab>/<cd>/<sha256>, so
+// identical messages dedup within a tenant (a PUT of an existing key is
+// idempotent).
 //
 // Ranged reads (IMAP FETCH BODY[]<partial>) map to HTTP Range GETs, so a partial
 // fetch never streams the whole object.
 type s3Store struct {
-	client    *http.Client
-	endpoint  string // e.g. "http://localhost:29000" (no trailing slash)
-	region    string
-	bucket    string
-	accessKey string
-	secretKey string
+	client     *http.Client
+	endpoint   string // e.g. "http://localhost:29000" (no trailing slash)
+	region     string
+	bucket     string
+	prefixPath string
+	accessKey  string
+	secretKey  string
 	// sessionToken, when set, is the STS/IAM-role temporary-credential token; it is
 	// sent as X-Amz-Security-Token and included in the SigV4 signed headers. Empty
 	// for static long-lived credentials.
@@ -53,6 +55,7 @@ type S3Config struct {
 	Endpoint     string
 	Region       string
 	Bucket       string
+	PrefixPath   string // optional slash-delimited object-key prefix
 	AccessKey    string
 	SecretKey    string
 	SessionToken string // optional STS/IAM-role temporary-credential token
@@ -60,6 +63,10 @@ type S3Config struct {
 
 // NewS3 returns an S3-backed blob store and ensures the bucket exists.
 func NewS3(cfg S3Config) (Store, error) {
+	prefixPath, err := normalizeS3PrefixPath(cfg.PrefixPath)
+	if err != nil {
+		return nil, err
+	}
 	s := &s3Store{
 		// No whole-request Client.Timeout: a large streaming GET/PUT body can take
 		// longer than any fixed cap. Bound the risky phases (connect, TLS, response
@@ -80,6 +87,7 @@ func NewS3(cfg S3Config) (Store, error) {
 		endpoint:       strings.TrimRight(cfg.Endpoint, "/"),
 		region:         cfg.Region,
 		bucket:         cfg.Bucket,
+		prefixPath:     prefixPath,
 		accessKey:      cfg.AccessKey,
 		secretKey:      cfg.SecretKey,
 		sessionToken:   cfg.SessionToken,
@@ -204,7 +212,43 @@ func (s *s3Store) key(tenantID int64, ref Ref) string {
 	if len(h) >= 4 {
 		ab, cd = h[0:2], h[2:4]
 	}
-	return itoa(tenantID) + "/" + ab + "/" + cd + "/" + h
+	key := itoa(tenantID) + "/" + ab + "/" + cd + "/" + h
+	if s.prefixPath != "" {
+		return s.prefixPath + "/" + key
+	}
+	return key
+}
+
+// normalizeS3PrefixPath accepts the conventional /foo/bar/ operator spelling
+// while rejecting path forms whose meaning can change across URL parsers,
+// proxies, and S3-compatible implementations. Prefixes are configuration, not
+// user input, so failing startup is safer than silently cleaning a typo into a
+// different object namespace.
+func normalizeS3PrefixPath(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(raw) != raw {
+		return "", errors.New("s3 prefix path must not have leading or trailing whitespace")
+	}
+	prefix := strings.Trim(raw, "/")
+	if prefix == "" {
+		return "", errors.New("s3 prefix path must contain at least one non-slash segment")
+	}
+	for _, segment := range strings.Split(prefix, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("s3 prefix path contains invalid segment %q", segment)
+		}
+		if strings.ContainsAny(segment, `\\%?#`) {
+			return "", fmt.Errorf("s3 prefix path segment %q contains an unsafe URL path character", segment)
+		}
+		for _, r := range segment {
+			if r < 0x20 || r == 0x7f {
+				return "", fmt.Errorf("s3 prefix path segment %q contains a control character", segment)
+			}
+		}
+	}
+	return prefix, nil
 }
 
 func (s *s3Store) ensureBucket(ctx context.Context) error {

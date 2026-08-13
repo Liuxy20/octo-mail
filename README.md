@@ -140,6 +140,7 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_DSN` | PostgreSQL connection string (**required**) |
 | `OCTO_MAIL_HOSTNAME` | Server hostname (HELO / Message-ID / TLS) |
 | `OCTO_MAIL_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_ACCESS` / `_SECRET` | S3-compatible blob store; falls back to `OCTO_MAIL_BLOB_DIR` for local FS |
+| `OCTO_MAIL_S3_PREFIX_PATH` | Optional slash-delimited object-key prefix inside the S3 bucket; empty preserves the existing key layout |
 | `OCTO_MAIL_SMTP_ADDR` / `_SUBMISSION_ADDR` / `_IMAP_ADDR` / `_JMAP_ADDR` / `_ADMIN_ADDR` | Listen addresses per surface |
 | `OCTO_MAIL_ADMIN_TOKEN` | Bearer token guarding the admin API |
 | `OCTO_MAIL_NODE_ID` | Unique node identity for HA leader election |
@@ -150,6 +151,13 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_AUTO_REPLY_MAX_COUNT` | Maximum authenticated Agent automatic replies in one chain; defaults to `4`, `0` disables the limit |
 | `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total Agent mailboxes per owner in one OCTO Space, including the gateway default Agent mailbox; defaults to `2` |
 | `OCTO_MAIL_AUTO_REPLY_CHAIN_KEY` | Deployment-wide HMAC key for automatic-reply chain metadata; at least 32 bytes and required while the limit is enabled |
+
+`OCTO_MAIL_S3_PREFIX_PATH` accepts values such as `mail/prod` or
+`/mail/prod/`; outer slashes are removed before object keys are generated. The
+prefix applies only to blob objects, not to bucket creation or lookup. Changing
+it does **not** migrate existing objects: move the objects to the new prefix
+before changing a running deployment, or previously stored message bodies will
+be unreachable.
 
 Anti-abuse, queue, ACME, and deliverability knobs (`OCTO_MAIL_REJECT_DMARC`,
 `OCTO_MAIL_GREYLIST`, `OCTO_MAIL_QUEUE_BACKOFF`, `OCTO_MAIL_ACME_HOSTS`, …) are

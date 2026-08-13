@@ -79,6 +79,18 @@ func TestValidateS3CredsFailFast(t *testing.T) {
 	}
 }
 
+func TestS3PrefixPathConfig(t *testing.T) {
+	t.Setenv("OCTO_MAIL_S3_PREFIX_PATH", "")
+	if got := loadConfig().s3PrefixPath; got != "" {
+		t.Fatalf("default S3 prefix path = %q, want empty", got)
+	}
+
+	t.Setenv("OCTO_MAIL_S3_PREFIX_PATH", "/mail/prod/")
+	if got := loadConfig().s3PrefixPath; got != "/mail/prod/" {
+		t.Fatalf("configured S3 prefix path = %q, want %q", got, "/mail/prod/")
+	}
+}
+
 func TestAutoReplyChainConfig(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	strongKey := []byte(strings.Repeat("k", 32))

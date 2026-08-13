@@ -20,11 +20,12 @@ func TestS3BackedDeliveryAndFetch(t *testing.T) {
 	ctx := context.Background()
 
 	cfg := blob.S3Config{
-		Endpoint:  envOr("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
-		Region:    "us-east-1",
-		Bucket:    envOr("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
-		AccessKey: envOr("OCTO_MAIL_S3_ACCESS", "octoadmin"),
-		SecretKey: envOr("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
+		Endpoint:   envOr("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
+		Region:     "us-east-1",
+		Bucket:     envOr("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
+		PrefixPath: envOr("OCTO_MAIL_S3_PREFIX_PATH", "tests/postgres"),
+		AccessKey:  envOr("OCTO_MAIL_S3_ACCESS", "octoadmin"),
+		SecretKey:  envOr("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
 	}
 	bs, err := blob.NewS3(cfg)
 	if err != nil {

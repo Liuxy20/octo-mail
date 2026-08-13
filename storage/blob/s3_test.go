@@ -22,11 +22,12 @@ func s3TestConfig() blob.S3Config {
 		return def
 	}
 	return blob.S3Config{
-		Endpoint:  get("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
-		Region:    "us-east-1",
-		Bucket:    get("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
-		AccessKey: get("OCTO_MAIL_S3_ACCESS", "octoadmin"),
-		SecretKey: get("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
+		Endpoint:   get("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
+		Region:     "us-east-1",
+		Bucket:     get("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
+		PrefixPath: get("OCTO_MAIL_S3_PREFIX_PATH", "tests/blob-roundtrip"),
+		AccessKey:  get("OCTO_MAIL_S3_ACCESS", "octoadmin"),
+		SecretKey:  get("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
 	}
 }
 

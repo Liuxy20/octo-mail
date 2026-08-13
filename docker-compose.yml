@@ -50,6 +50,7 @@ services:
       OCTO_MAIL_S3_ENDPOINT: "http://minio:9000"
       OCTO_MAIL_S3_REGION: "us-east-1"
       OCTO_MAIL_S3_BUCKET: "octo-mail"
+      OCTO_MAIL_S3_PREFIX_PATH: "${OCTO_MAIL_S3_PREFIX_PATH:-}"
       OCTO_MAIL_S3_ACCESS: "minioadmin"
       OCTO_MAIL_S3_SECRET: "minioadmin"
       # Listen addresses (container-internal; mapped below).
