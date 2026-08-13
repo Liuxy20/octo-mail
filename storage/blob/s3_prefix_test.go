@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -17,6 +18,8 @@ func TestNormalizeS3PrefixPath(t *testing.T) {
 		{name: "empty keeps legacy layout", raw: "", want: ""},
 		{name: "plain", raw: "mail/prod", want: "mail/prod"},
 		{name: "outer slashes", raw: "/mail/prod/", want: "mail/prod"},
+		{name: "multiple outer slashes", raw: "///mail/prod///", want: "mail/prod"},
+		{name: "allowed segment characters", raw: "Mail_Prod-2.0", want: "Mail_Prod-2.0"},
 		{name: "slash only", raw: "/", wantErr: true},
 		{name: "empty inner segment", raw: "mail//prod", wantErr: true},
 		{name: "current segment", raw: "mail/./prod", wantErr: true},
@@ -26,7 +29,25 @@ func TestNormalizeS3PrefixPath(t *testing.T) {
 		{name: "fragment delimiter", raw: "mail#prod", wantErr: true},
 		{name: "percent encoding", raw: "mail/%2e%2e/prod", wantErr: true},
 		{name: "outer whitespace", raw: " mail/prod", wantErr: true},
+		{name: "inner whitespace", raw: "mail/pro d", wantErr: true},
 		{name: "control character", raw: "mail/\nprod", wantErr: true},
+		{name: "tilde", raw: "mail/~prod", wantErr: true},
+		{name: "non-ASCII", raw: "mail/生产", wantErr: true},
+		{name: "divergent exclamation", raw: "mail/prod!v2", wantErr: true},
+		{name: "divergent dollar", raw: "mail/prod$v2", wantErr: true},
+		{name: "divergent ampersand", raw: "mail/prod&v2", wantErr: true},
+		{name: "divergent apostrophe", raw: "mail/prod'v2", wantErr: true},
+		{name: "divergent left parenthesis", raw: "mail/prod(v2", wantErr: true},
+		{name: "divergent right parenthesis", raw: "mail/prod)v2", wantErr: true},
+		{name: "divergent asterisk", raw: "mail/prod*v2", wantErr: true},
+		{name: "divergent plus", raw: "mail/prod+v2", wantErr: true},
+		{name: "divergent comma", raw: "mail/prod,v2", wantErr: true},
+		{name: "divergent semicolon", raw: "mail/prod;v2", wantErr: true},
+		{name: "divergent equals", raw: "mail/prod=v2", wantErr: true},
+		{name: "divergent colon", raw: "mail/prod:v2", wantErr: true},
+		{name: "divergent at sign", raw: "mail/prod@v2", wantErr: true},
+		{name: "divergent left bracket", raw: "mail/prod[v2", wantErr: true},
+		{name: "divergent right bracket", raw: "mail/prod]v2", wantErr: true},
 	}
 
 	for _, test := range tests {
@@ -56,10 +77,10 @@ func TestS3ObjectKeyPrefix(t *testing.T) {
 	}
 }
 
-func TestS3PrefixDoesNotAffectBucketProbe(t *testing.T) {
-	var gotMethod, gotPath string
+func TestNewS3DoesNotSendBucketRequests(t *testing.T) {
+	var requests atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotMethod, gotPath = r.Method, r.URL.Path
+		requests.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(server.Close)
@@ -75,8 +96,8 @@ func TestS3PrefixDoesNotAffectBucketProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewS3: %v", err)
 	}
-	if gotMethod != http.MethodHead || gotPath != "/mail-bucket" {
-		t.Fatalf("bucket probe = %s %s, want HEAD /mail-bucket", gotMethod, gotPath)
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("NewS3 sent %d request(s), want none; bucket provisioning belongs to deployment infrastructure", got)
 	}
 	if got := store.(*s3Store).prefixPath; got != "mail/prod" {
 		t.Fatalf("normalized store prefix = %q, want mail/prod", got)

@@ -66,6 +66,12 @@ by extending the `config` struct + `loadConfig`, with a sensible default, and va
 it in `validate`/`check*` if a wrong value is unsafe. Naming: env `OCTO_MAIL_*`,
 metrics `octo_mail_*`, DSN user/db `octo_mail` (see Directory Structure).
 
+S3 buckets are deployment infrastructure. `blob.NewS3` consumes the configured,
+pre-provisioned bucket and must not require `HeadBucket` or `CreateBucket`
+permissions at startup. Local/CI infrastructure creates test buckets separately.
+Real-S3 tests may skip only when the endpoint is unreachable; once it is reachable,
+credential, bucket, permission, and object-operation failures must fail the test.
+
 ---
 
 ## Commands

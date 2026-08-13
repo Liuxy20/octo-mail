@@ -2,9 +2,12 @@ package postgres
 
 import (
 	"context"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
@@ -17,19 +20,39 @@ import (
 // (body → S3), then read it back through the kernel (body ← S3 ranged GET),
 // asserting the round-trip is byte-exact and the changelog invariant holds.
 func TestS3BackedDeliveryAndFetch(t *testing.T) {
-	ctx := context.Background()
-
 	cfg := blob.S3Config{
-		Endpoint:   envOr("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
-		Region:     "us-east-1",
-		Bucket:     envOr("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
-		PrefixPath: envOr("OCTO_MAIL_S3_PREFIX_PATH", "tests/postgres"),
-		AccessKey:  envOr("OCTO_MAIL_S3_ACCESS", "octoadmin"),
-		SecretKey:  envOr("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
+		Endpoint:  envOr("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
+		Region:    "us-east-1",
+		Bucket:    envOr("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
+		AccessKey: envOr("OCTO_MAIL_S3_ACCESS", "octoadmin"),
+		SecretKey: envOr("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
 	}
+	requireS3Endpoint(t, cfg.Endpoint)
+	configuredPrefix := os.Getenv("OCTO_MAIL_S3_PREFIX_PATH")
+	if configuredPrefix == "" {
+		configuredPrefix = "tests/postgres"
+	}
+	for _, test := range []struct {
+		name   string
+		prefix string
+	}{
+		{name: "legacy empty prefix", prefix: ""},
+		{name: "configured prefix", prefix: configuredPrefix},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caseCfg := cfg
+			caseCfg.PrefixPath = test.prefix
+			testS3BackedDeliveryAndFetch(t, caseCfg)
+		})
+	}
+}
+
+func testS3BackedDeliveryAndFetch(t *testing.T, cfg blob.S3Config) {
+	t.Helper()
+	ctx := context.Background()
 	bs, err := blob.NewS3(cfg)
 	if err != nil {
-		t.Skipf("S3/MinIO not available (%v)", err)
+		t.Fatalf("new S3 store: %v", err)
 	}
 	s, err := Open(ctx, testDSN, bs)
 	if err != nil {
@@ -102,6 +125,36 @@ func TestS3BackedDeliveryAndFetch(t *testing.T) {
 		t.Fatalf("changelog invariant broken with S3 backend: head=%d max=%d", head, maxSeq)
 	}
 	t.Logf("OK: delivery→S3, kernel read←S3 byte-exact (%d bytes); changelog head==max(seq)=%d", len(got), head)
+}
+
+// requireS3Endpoint skips only when no server is listening. Once the endpoint
+// is reachable, bad credentials, a missing bucket, and object-operation errors
+// are test failures rather than local-infrastructure skips.
+func requireS3Endpoint(t *testing.T, endpoint string) {
+	t.Helper()
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatalf("parse S3 endpoint: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		t.Fatalf("S3 endpoint scheme = %q, want http or https", u.Scheme)
+	}
+	host, port := u.Hostname(), u.Port()
+	if host == "" {
+		t.Fatalf("S3 endpoint %q has no host", endpoint)
+	}
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+	if err != nil {
+		t.Skipf("S3/MinIO endpoint is not reachable: %v", err)
+	}
+	_ = conn.Close()
 }
 
 func envOr(k, def string) string {

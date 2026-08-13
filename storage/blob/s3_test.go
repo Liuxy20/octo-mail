@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 )
@@ -22,13 +25,43 @@ func s3TestConfig() blob.S3Config {
 		return def
 	}
 	return blob.S3Config{
-		Endpoint:   get("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
-		Region:     "us-east-1",
-		Bucket:     get("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
-		PrefixPath: get("OCTO_MAIL_S3_PREFIX_PATH", "tests/blob-roundtrip"),
-		AccessKey:  get("OCTO_MAIL_S3_ACCESS", "octoadmin"),
-		SecretKey:  get("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
+		Endpoint:  get("OCTO_MAIL_S3_ENDPOINT", "http://localhost:29000"),
+		Region:    "us-east-1",
+		Bucket:    get("OCTO_MAIL_S3_BUCKET", "octo-mail-test"),
+		AccessKey: get("OCTO_MAIL_S3_ACCESS", "octoadmin"),
+		SecretKey: get("OCTO_MAIL_S3_SECRET", "70521a1a521a5dfd103ce85fe475d8cc"),
 	}
+}
+
+// requireS3Endpoint skips only when no server is listening. Configuration,
+// authorization, bucket provisioning, and object-operation failures must still
+// fail the test (especially in CI), rather than being mistaken for absent local
+// infrastructure.
+func requireS3Endpoint(t *testing.T, endpoint string) {
+	t.Helper()
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatalf("parse S3 endpoint: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		t.Fatalf("S3 endpoint scheme = %q, want http or https", u.Scheme)
+	}
+	host, port := u.Hostname(), u.Port()
+	if host == "" {
+		t.Fatalf("S3 endpoint %q has no host", endpoint)
+	}
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+	if err != nil {
+		t.Skipf("S3/MinIO endpoint is not reachable: %v", err)
+	}
+	_ = conn.Close()
 }
 
 // TestS3BlobRoundTrip proves the S3 backend satisfies the same blob.Store
@@ -36,9 +69,32 @@ func s3TestConfig() blob.S3Config {
 // Put with dedup, full Open+Read, ranged ReadAt (IMAP FETCH BODY[]<partial>),
 // and Delete. SigV4 signing is exercised on every verb.
 func TestS3BlobRoundTrip(t *testing.T) {
-	s, err := blob.NewS3(s3TestConfig())
+	cfg := s3TestConfig()
+	requireS3Endpoint(t, cfg.Endpoint)
+	configuredPrefix := os.Getenv("OCTO_MAIL_S3_PREFIX_PATH")
+	if configuredPrefix == "" {
+		configuredPrefix = "tests/blob-roundtrip"
+	}
+	for _, test := range []struct {
+		name   string
+		prefix string
+	}{
+		{name: "legacy empty prefix", prefix: ""},
+		{name: "configured prefix", prefix: configuredPrefix},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caseCfg := cfg
+			caseCfg.PrefixPath = test.prefix
+			testS3BlobRoundTrip(t, caseCfg)
+		})
+	}
+}
+
+func testS3BlobRoundTrip(t *testing.T, cfg blob.S3Config) {
+	t.Helper()
+	s, err := blob.NewS3(cfg)
 	if err != nil {
-		t.Skipf("S3/MinIO not available (%v)", err)
+		t.Fatalf("new S3 store: %v", err)
 	}
 	ctx := context.Background()
 	const tenant = int64(42)

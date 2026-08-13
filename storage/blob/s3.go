@@ -40,7 +40,7 @@ type s3Store struct {
 	sessionToken string
 	// maxAttempts bounds per-request retries on transient failures (5xx / SlowDown /
 	// network errors). attemptTimeout bounds each individual attempt for BOUNDED
-	// control requests (HEAD/DELETE/bucket, ranged ReadAt) — a stuck attempt is
+	// control requests (object HEAD/DELETE, ranged ReadAt) — a stuck attempt is
 	// abandoned and retried. Streaming transfers (a full-object GET body, a PUT
 	// upload) are NOT subject to this deadline: a slow-but-progressing large body
 	// must not be capped (see retryDo's streaming parameter).
@@ -61,7 +61,9 @@ type S3Config struct {
 	SessionToken string // optional STS/IAM-role temporary-credential token
 }
 
-// NewS3 returns an S3-backed blob store and ensures the bucket exists.
+// NewS3 returns an S3-backed blob store without contacting the endpoint. The
+// configured bucket must already exist; provisioning it is the deployment's
+// responsibility.
 func NewS3(cfg S3Config) (Store, error) {
 	prefixPath, err := normalizeS3PrefixPath(cfg.PrefixPath)
 	if err != nil {
@@ -98,9 +100,6 @@ func NewS3(cfg S3Config) (Store, error) {
 	if s.region == "" {
 		s.region = "us-east-1"
 	}
-	if err := s.ensureBucket(context.Background()); err != nil {
-		return nil, err
-	}
 	return s, nil
 }
 
@@ -112,7 +111,7 @@ func NewS3(cfg S3Config) (Store, error) {
 // close.
 //
 // streaming distinguishes the two request classes. For a bounded control request
-// (HEAD/DELETE/bucket, or a size-bounded ranged ReadAt) each attempt gets its own
+// (object HEAD/DELETE, or a size-bounded ranged ReadAt) each attempt gets its own
 // attemptTimeout deadline, so a stuck attempt is abandoned and retried. For a
 // STREAMING transfer (a large GET body held for sequential read, or a PUT upload)
 // no fixed whole-body deadline is imposed — a legitimately slow but steadily
@@ -220,10 +219,11 @@ func (s *s3Store) key(tenantID int64, ref Ref) string {
 }
 
 // normalizeS3PrefixPath accepts the conventional /foo/bar/ operator spelling
-// while rejecting path forms whose meaning can change across URL parsers,
-// proxies, and S3-compatible implementations. Prefixes are configuration, not
-// user input, so failing startup is safer than silently cleaning a typo into a
-// different object namespace.
+// while restricting each segment to a conservative ASCII allowlist. Keeping
+// prefix bytes to letters, digits, dot, underscore, and hyphen guarantees the
+// HTTP wire path and SigV4 canonical path encode them identically across S3
+// implementations. Prefixes are configuration, not user input, so failing
+// startup is safer than accepting an ambiguous object namespace.
 func normalizeS3PrefixPath(raw string) (string, error) {
 	if raw == "" {
 		return "", nil
@@ -239,47 +239,16 @@ func normalizeS3PrefixPath(raw string) (string, error) {
 		if segment == "" || segment == "." || segment == ".." {
 			return "", fmt.Errorf("s3 prefix path contains invalid segment %q", segment)
 		}
-		if strings.ContainsAny(segment, `\\%?#`) {
-			return "", fmt.Errorf("s3 prefix path segment %q contains an unsafe URL path character", segment)
-		}
 		for _, r := range segment {
-			if r < 0x20 || r == 0x7f {
-				return "", fmt.Errorf("s3 prefix path segment %q contains a control character", segment)
+			if !((r >= 'a' && r <= 'z') ||
+				(r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') ||
+				r == '.' || r == '_' || r == '-') {
+				return "", fmt.Errorf("s3 prefix path segment %q must contain only ASCII letters, digits, '.', '_', or '-'", segment)
 			}
 		}
 	}
 	return prefix, nil
-}
-
-func (s *s3Store) ensureBucket(ctx context.Context) error {
-	// HEAD bucket; create on 404.
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.endpoint+"/"+s.bucket, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := s.retryDo(req, emptyHash, false)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		return nil
-	}
-	// Create the bucket (PUT).
-	creq, err := http.NewRequestWithContext(ctx, http.MethodPut, s.endpoint+"/"+s.bucket, nil)
-	if err != nil {
-		return err
-	}
-	cresp, err := s.retryDo(creq, emptyHash, false)
-	if err != nil {
-		return err
-	}
-	defer cresp.Body.Close()
-	if cresp.StatusCode != http.StatusOK && cresp.StatusCode != http.StatusConflict {
-		b, _ := io.ReadAll(cresp.Body)
-		return fmt.Errorf("s3 create bucket: %s: %s", cresp.Status, string(b))
-	}
-	return nil
 }
 
 func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, int64, error) {
