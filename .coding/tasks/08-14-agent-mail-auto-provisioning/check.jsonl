@@ -1,0 +1,4 @@
+{"file":".coding/spec/backend/index.md","reason":"Check dependency direction and structural tenant isolation."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Check transaction, locking, changelog, and live PostgreSQL coverage."}
+{"file":".coding/spec/backend/error-handling.md","reason":"Check branchable errors and wrapping."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Check configuration and mandatory quality gates."}

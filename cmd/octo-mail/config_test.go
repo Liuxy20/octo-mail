@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
+	"github.com/mjl-/mox/smtpclient"
 )
 
 // TestCheckVERPConfig proves the security control that closes the nil-vs-empty
@@ -108,6 +112,103 @@ func TestS3ForcePathStyleConfig(t *testing.T) {
 	t.Setenv("OCTO_MAIL_S3_FORCE_PATH_STYLE", "0")
 	if !loadConfig().s3VirtualHostedStyle {
 		t.Fatal("OCTO_MAIL_S3_FORCE_PATH_STYLE=0 did not enable virtual-hosted style")
+	}
+}
+
+func TestOutboundRelayConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tests := []struct {
+		name    string
+		cfg     config
+		wantErr bool
+	}{
+		{name: "direct MX compatibility", cfg: config{}},
+		{name: "complete implicit TLS relay", cfg: config{
+			outboundRelayAddr: "smtp.example.com:465", outboundRelayUsername: "mailer", outboundRelayPassword: "secret",
+		}},
+		{name: "address only", cfg: config{outboundRelayAddr: "smtp.example.com:465"}, wantErr: true},
+		{name: "missing password", cfg: config{
+			outboundRelayAddr: "smtp.example.com:465", outboundRelayUsername: "mailer",
+		}, wantErr: true},
+		{name: "missing username", cfg: config{
+			outboundRelayAddr: "smtp.example.com:465", outboundRelayPassword: "secret",
+		}, wantErr: true},
+		{name: "STARTTLS port refused", cfg: config{
+			outboundRelayAddr: "smtp.example.com:587", outboundRelayUsername: "mailer", outboundRelayPassword: "secret",
+		}, wantErr: true},
+		{name: "missing port", cfg: config{
+			outboundRelayAddr: "smtp.example.com", outboundRelayUsername: "mailer", outboundRelayPassword: "secret",
+		}, wantErr: true},
+		{name: "URL refused", cfg: config{
+			outboundRelayAddr: "smtps://smtp.example.com:465", outboundRelayUsername: "mailer", outboundRelayPassword: "secret",
+		}, wantErr: true},
+		{name: "invalid hostname", cfg: config{
+			outboundRelayAddr: "bad host:465", outboundRelayUsername: "mailer", outboundRelayPassword: "secret",
+		}, wantErr: true},
+		{name: "IP literal", cfg: config{
+			outboundRelayAddr: "127.0.0.1:465", outboundRelayUsername: "mailer", outboundRelayPassword: "secret",
+		}, wantErr: true},
+		{name: "egress pool conflict", cfg: config{
+			outboundRelayAddr: "smtp.example.com:465", outboundRelayUsername: "mailer", outboundRelayPassword: "secret", egressPool: true,
+		}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validate(test.cfg, log)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validate() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+
+	t.Setenv("OCTO_MAIL_OUTBOUND_RELAY_ADDR", " smtp.example.com:465 ")
+	t.Setenv("OCTO_MAIL_OUTBOUND_RELAY_USERNAME", " mailer@example.com ")
+	t.Setenv("OCTO_MAIL_OUTBOUND_RELAY_PASSWORD", " password with spaces ")
+	cfg := loadConfig()
+	if cfg.outboundRelayAddr != "smtp.example.com:465" {
+		t.Fatalf("relay address = %q", cfg.outboundRelayAddr)
+	}
+	if cfg.outboundRelayUsername != "mailer@example.com" {
+		t.Fatalf("relay username = %q", cfg.outboundRelayUsername)
+	}
+	if cfg.outboundRelayPassword != " password with spaces " {
+		t.Fatalf("relay password was normalized; got %q", cfg.outboundRelayPassword)
+	}
+}
+
+func TestConfigureOutboundSMTP(t *testing.T) {
+	direct := &submit.SMTPDeliverer{}
+	if err := configureOutboundSMTP(config{}, direct, nil); err != nil {
+		t.Fatalf("configure direct MX: %v", err)
+	}
+	if direct.TLSMode != smtpclient.TLSOpportunistic || direct.Dial == nil {
+		t.Fatalf("direct transport not configured: mode=%q dial=%v", direct.TLSMode, direct.Dial != nil)
+	}
+	if direct.TLSModeFor == nil || direct.DANEFor == nil || direct.Auth != nil || direct.TLSConfig != nil {
+		t.Fatal("direct transport did not retain MTA-STS/DANE or unexpectedly enabled relay auth")
+	}
+
+	relay := &submit.SMTPDeliverer{
+		// Seed direct-policy callbacks to prove relay selection clears them.
+		TLSModeFor: direct.TLSModeFor,
+		DANEFor:    direct.DANEFor,
+	}
+	cfg := config{
+		outboundRelayAddr:     "smtp.example.com:465",
+		outboundRelayUsername: "mailer",
+		outboundRelayPassword: "secret",
+	}
+	if err := configureOutboundSMTP(cfg, relay, nil); err != nil {
+		t.Fatalf("configure relay: %v", err)
+	}
+	if relay.TLSMode != smtpclient.TLSImmediate || relay.Dial == nil || relay.Auth == nil {
+		t.Fatalf("relay transport not configured: mode=%q dial=%v auth=%v", relay.TLSMode, relay.Dial != nil, relay.Auth != nil)
+	}
+	if relay.TLSModeFor != nil || relay.DANEFor != nil {
+		t.Fatal("relay transport retained recipient MTA-STS/DANE callbacks")
+	}
+	if relay.TLSConfig == nil || relay.TLSConfig.ServerName != "smtp.example.com" || relay.TLSConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("relay TLS config = %#v", relay.TLSConfig)
 	}
 }
 

@@ -1,0 +1,28 @@
+{
+  "id": "agent-mail-auto-provisioning",
+  "name": "agent-mail-auto-provisioning",
+  "title": "Agent Mail automatic owner provisioning",
+  "description": "Automatically provision the authenticated OCTO user and Space in octo-mail before browser mail requests are proxied.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": "backend",
+  "package": null,
+  "priority": "P1",
+  "creator": "codex",
+  "assignee": "codex",
+  "createdAt": "2026-08-14",
+  "completedAt": "2026-08-14",
+  "branch": "feat/agent-mail-auto-provisioning",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": "https://github.com/Mininglamp-OSS/octo-mail/pull/57",
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Tracks https://github.com/Mininglamp-OSS/octo-mail/issues/55",
+  "meta": {
+    "issue_url": "https://github.com/Mininglamp-OSS/octo-mail/issues/55"
+  }
+}

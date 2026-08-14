@@ -3,6 +3,7 @@ package submit
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/mjl-/adns"
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/message"
+	"github.com/mjl-/mox/sasl"
 	"github.com/mjl-/mox/smtpclient"
 )
 
@@ -52,7 +54,13 @@ type SMTPDeliverer struct {
 	Dial         Dialer
 	EHLOHostname dns.Domain
 	TLSMode      smtpclient.TLSMode
-	Log          *slog.Logger
+	// TLSVerifyPKIX, TLSConfig, and Auth are used by authenticated submission
+	// relays. Direct MX delivery keeps their zero values and retains its existing
+	// opportunistic/DANE/MTA-STS behavior.
+	TLSVerifyPKIX bool
+	TLSConfig     *tls.Config
+	Auth          func([]string, *tls.ConnectionState) (sasl.Client, error)
+	Log           *slog.Logger
 
 	// Gate, if set, is the per-tenant reputation send gate: it is consulted with
 	// (tenantID, remoteDomain) before each delivery. Returning a non-nil error
@@ -200,7 +208,7 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 	// DANE: if the MX host publishes DNSSEC-authenticated TLSA records, require
 	// STARTTLS and verify the peer certificate against them. DANE takes
 	// precedence over opportunistic TLS — a downgrade would defeat it.
-	var opts smtpclient.Opts
+	opts := smtpclient.Opts{Auth: d.Auth, TLSConfig: d.TLSConfig}
 	if d.DANEFor != nil {
 		records, moreHosts, err := d.DANEFor(ctx, domain, remote)
 		if err != nil {
@@ -221,7 +229,7 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 	// applied last so it wins over the domain policy: true forces verified STARTTLS
 	// (never downgrade); false permits plaintext even where a policy would require
 	// TLS (operator override for a broken peer). nil leaves the resolved mode.
-	if m.RequireTLS != nil {
+	if m.RequireTLS != nil && tlsMode != smtpclient.TLSImmediate {
 		if *m.RequireTLS {
 			tlsMode = smtpclient.TLSRequiredStartTLS
 		} else {
@@ -230,7 +238,7 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 			opts.DANEMoreHostnames = nil
 		}
 	}
-	cl, err := smtpclient.New(ctx, log, conn, tlsMode, false, d.EHLOHostname, remote, opts)
+	cl, err := smtpclient.New(ctx, log, conn, tlsMode, d.TLSVerifyPKIX, d.EHLOHostname, remote, opts)
 	if err != nil {
 		if d.OnSendError != nil {
 			d.OnSendError(ctx, m, err)

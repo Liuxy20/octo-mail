@@ -390,6 +390,7 @@ func run() error {
 		mux.Handle("/.well-known/jmap", js.Handler())
 		mux.Handle("/jmap/", js.Handler())
 		mux.Handle("/webapi/", wa.Handler())
+		mux.Handle("/internal/", wa.Handler())
 		mux.Handle("/webmail", webui.Handler())
 		mux.Handle("/webmail/", webui.Handler())
 		srv := &http.Server{Addr: cfg.jmapAddr, Handler: mux}
@@ -407,10 +408,10 @@ func run() error {
 	}
 
 	// --- Background workers ---
-	// Outbound send-hardening: suppression list, webhook events, MTA-STS TLS.
+	// Outbound send-hardening: suppression list and webhook events. Direct-MX
+	// MTA-STS/DANE policy is attached below only when no fixed relay is configured.
 	suppress := &deliverability.Suppressions{Pool: s.Pool}
 	webhooks := &deliverability.Webhooks{Pool: s.Pool}
-	tlsPolicy := &deliverability.TLSPolicy{Resolver: dns.StrictResolver{Pkg: "octo-mail"}}
 
 	// Outbound queue delivery. When an egress IP pool is configured, deliveries
 	// bind a per-tenant source IP leased from the IPRouter (warmup/reputation
@@ -431,12 +432,9 @@ func run() error {
 			return leased.IP, nil
 		}
 	}
-	dial := submit.SourceIPDialer(resolveMX, pickSource)
 	deliverer := &submit.SMTPDeliverer{
 		Blob:         bs,
-		Dial:         dial,
 		EHLOHostname: dns.Domain{ASCII: cfg.hostname},
-		TLSMode:      smtpclient.TLSOpportunistic,
 		Log:          log,
 		Gate: func(ctx context.Context, tid int64, dom string) error {
 			r, e := repo.Gate(ctx, tid, dom)
@@ -461,14 +459,6 @@ func run() error {
 		Sign:       signer.Sign,
 		RecordSent: repo.RecordSent,
 		Suppressed: suppress.Suppressed,
-		TLSModeFor: func(ctx context.Context, domain string) (smtpclient.TLSMode, error) {
-			mode, _, err := tlsPolicy.ModeFor(ctx, domain)
-			return mode, err
-		},
-		// DANE (RFC 7672): when the MX host publishes DNSSEC-authenticated TLSA
-		// records, require STARTTLS and verify the peer against them. Gated on the
-		// adns authentic bit — no downgrade to unauthenticated TLSA data.
-		DANEFor: deliverability.Lookup(dns.StrictResolver{Pkg: "octo-mail"}),
 		OnDelivered: func(ctx context.Context, m queue.Msg) {
 			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "delivered",
 				map[string]any{"rcpt": m.RcptTo, "msgid": m.ID})
@@ -477,6 +467,12 @@ func run() error {
 			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "error",
 				map[string]any{"rcpt": m.RcptTo, "error": err.Error()})
 		},
+	}
+	if err := configureOutboundSMTP(cfg, deliverer, pickSource); err != nil {
+		return err
+	}
+	if cfg.outboundRelayAddr != "" {
+		log.Info("outbound SMTP relay enabled", "addr", cfg.outboundRelayAddr, "tls", "implicit")
 	}
 	// VERP: when a bounce domain is configured, rewrite the envelope MAIL FROM to
 	// a per-message VERP token so bounces + FBL complaints attribute to the exact
@@ -1077,6 +1073,51 @@ func resolveMX(ctx context.Context, domain string) ([]submit.MXHost, error) {
 		out = append(out, submit.MXHost{Host: dns.Domain{ASCII: domain}, Addr: net.JoinHostPort(domain, "25")})
 	}
 	return out, nil
+}
+
+// configureOutboundSMTP selects exactly one transport policy for queued mail.
+// Direct mode preserves recipient MX lookup, optional source-IP routing,
+// opportunistic/MTA-STS STARTTLS, and DANE. Relay mode instead uses one trusted
+// submission endpoint with implicit, PKIX-verified TLS and SMTP AUTH; recipient
+// DNS policy does not describe that endpoint and must not be consulted.
+func configureOutboundSMTP(
+	cfg config,
+	deliverer *submit.SMTPDeliverer,
+	pickSource func(context.Context, string, dns.Domain) (net.IP, error),
+) error {
+	if cfg.outboundRelayAddr == "" {
+		tlsPolicy := &deliverability.TLSPolicy{Resolver: dns.StrictResolver{Pkg: "octo-mail"}}
+		deliverer.Dial = submit.SourceIPDialer(resolveMX, pickSource)
+		deliverer.TLSMode = smtpclient.TLSOpportunistic
+		deliverer.TLSVerifyPKIX = false
+		deliverer.TLSConfig = nil
+		deliverer.Auth = nil
+		deliverer.TLSModeFor = func(ctx context.Context, domain string) (smtpclient.TLSMode, error) {
+			mode, _, err := tlsPolicy.ModeFor(ctx, domain)
+			return mode, err
+		}
+		// DANE (RFC 7672): when the MX host publishes DNSSEC-authenticated TLSA
+		// records, require STARTTLS and verify the peer against them. Gated on the
+		// adns authentic bit — no downgrade to unauthenticated TLSA data.
+		deliverer.DANEFor = deliverability.Lookup(dns.StrictResolver{Pkg: "octo-mail"})
+		return nil
+	}
+
+	relayHost, err := parseOutboundRelayAddr(cfg.outboundRelayAddr)
+	if err != nil {
+		return err
+	}
+	deliverer.Dial = submit.RelayDialer(cfg.outboundRelayAddr, relayHost)
+	deliverer.TLSMode = smtpclient.TLSImmediate
+	deliverer.TLSVerifyPKIX = true
+	deliverer.TLSConfig = &tls.Config{
+		ServerName: relayHost.ASCII,
+		MinVersion: tls.VersionTLS12,
+	}
+	deliverer.Auth = submit.RelayAuth(cfg.outboundRelayUsername, cfg.outboundRelayPassword)
+	deliverer.TLSModeFor = nil
+	deliverer.DANEFor = nil
+	return nil
 }
 
 func redactDSN(dsn string) string {

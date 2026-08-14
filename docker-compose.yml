@@ -72,6 +72,11 @@ services:
       # Listen addresses (container-internal; mapped below).
       OCTO_MAIL_SMTP_ADDR: ":25"
       OCTO_MAIL_SUBMISSION_ADDR: ":587"
+      # Optional fixed outbound relay. Set all three in the uncommitted .env to
+      # use implicit TLS + SMTP AUTH on port 465 instead of recipient MX/25.
+      OCTO_MAIL_OUTBOUND_RELAY_ADDR: "${OCTO_MAIL_OUTBOUND_RELAY_ADDR:-}"
+      OCTO_MAIL_OUTBOUND_RELAY_USERNAME: "${OCTO_MAIL_OUTBOUND_RELAY_USERNAME:-}"
+      OCTO_MAIL_OUTBOUND_RELAY_PASSWORD: "${OCTO_MAIL_OUTBOUND_RELAY_PASSWORD:-}"
       OCTO_MAIL_IMAP_ADDR: ":143"
       OCTO_MAIL_JMAP_ADDR: ":8080"
       # Advertise the externally reachable JMAP resources. Standalone use keeps
