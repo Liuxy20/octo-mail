@@ -1,0 +1,3 @@
+{"file": ".coding/spec/backend/quality-guidelines.md", "reason": "S3 configuration and startup probe contract"}
+{"file": ".coding/spec/backend/error-handling.md", "reason": "Preserve contextual startup and request errors"}
+{"file": ".coding/spec/guides/code-reuse-thinking-guide.md", "reason": "Use one shared object URL builder"}

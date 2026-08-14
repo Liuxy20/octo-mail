@@ -1,0 +1,33 @@
+{
+  "id": "s3-virtual-hosted-style",
+  "name": "s3-virtual-hosted-style",
+  "title": "Support virtual-hosted-style S3 addressing",
+  "description": "Add an opt-in virtual-hosted S3 addressing mode for Tencent Cloud COS compatibility.",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "storage/blob, cmd/octo-mail S3 config, docs, tests",
+  "package": null,
+  "priority": "P2",
+  "creator": "codex",
+  "assignee": "codex",
+  "createdAt": "2026-08-14",
+  "completedAt": null,
+  "branch": "feat/s3-virtual-hosted-style",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Tracks https://github.com/Mininglamp-OSS/octo-mail/issues/51",
+  "meta": {
+    "issue_url": "https://github.com/Mininglamp-OSS/octo-mail/issues/51",
+    "loop": {
+      "check_status": "pass",
+      "iteration_count": 0,
+      "last_check_at": "2026-08-14T04:03:28Z"
+    }
+  }
+}

@@ -22,13 +22,14 @@ import (
 func openBlobStore(cfg config, log *slog.Logger) (blob.Store, error) {
 	if cfg.s3Endpoint != "" {
 		bs, err := blob.NewS3(blob.S3Config{
-			Endpoint:     cfg.s3Endpoint,
-			Region:       cfg.s3Region,
-			Bucket:       cfg.s3Bucket,
-			PrefixPath:   cfg.s3PrefixPath,
-			AccessKey:    cfg.s3Access,
-			SecretKey:    cfg.s3Secret,
-			SessionToken: cfg.s3SessionToken,
+			Endpoint:           cfg.s3Endpoint,
+			Region:             cfg.s3Region,
+			Bucket:             cfg.s3Bucket,
+			PrefixPath:         cfg.s3PrefixPath,
+			VirtualHostedStyle: cfg.s3VirtualHostedStyle,
+			AccessKey:          cfg.s3Access,
+			SecretKey:          cfg.s3Secret,
+			SessionToken:       cfg.s3SessionToken,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("s3 blob store: %w", err)
@@ -259,12 +260,13 @@ type config struct {
 
 	blobDir string // fs blob store dir (used when s3Endpoint is empty)
 
-	s3Endpoint   string
-	s3Region     string
-	s3Bucket     string
-	s3PrefixPath string
-	s3Access     string
-	s3Secret     string
+	s3Endpoint           string
+	s3Region             string
+	s3Bucket             string
+	s3PrefixPath         string
+	s3VirtualHostedStyle bool
+	s3Access             string
+	s3Secret             string
 	// s3SessionToken is an optional STS/IAM-role temporary-credential token.
 	s3SessionToken string
 
@@ -359,13 +361,14 @@ func loadConfig() config {
 
 		blobDir: envDefault("OCTO_MAIL_BLOB_DIR", "./blobs"),
 
-		s3Endpoint:     os.Getenv("OCTO_MAIL_S3_ENDPOINT"),
-		s3Region:       envDefault("OCTO_MAIL_S3_REGION", "us-east-1"),
-		s3Bucket:       envDefault("OCTO_MAIL_S3_BUCKET", "octo-mail"),
-		s3PrefixPath:   os.Getenv("OCTO_MAIL_S3_PREFIX_PATH"),
-		s3Access:       os.Getenv("OCTO_MAIL_S3_ACCESS"),
-		s3Secret:       os.Getenv("OCTO_MAIL_S3_SECRET"),
-		s3SessionToken: os.Getenv("OCTO_MAIL_S3_SESSION_TOKEN"),
+		s3Endpoint:           os.Getenv("OCTO_MAIL_S3_ENDPOINT"),
+		s3Region:             envDefault("OCTO_MAIL_S3_REGION", "us-east-1"),
+		s3Bucket:             envDefault("OCTO_MAIL_S3_BUCKET", "octo-mail"),
+		s3PrefixPath:         os.Getenv("OCTO_MAIL_S3_PREFIX_PATH"),
+		s3VirtualHostedStyle: envDefault("OCTO_MAIL_S3_FORCE_PATH_STYLE", "1") == "0",
+		s3Access:             os.Getenv("OCTO_MAIL_S3_ACCESS"),
+		s3Secret:             os.Getenv("OCTO_MAIL_S3_SECRET"),
+		s3SessionToken:       os.Getenv("OCTO_MAIL_S3_SESSION_TOKEN"),
 
 		smtpAddr:         envDefault("OCTO_MAIL_SMTP_ADDR", ":25"),
 		submissionAddr:   envDefault("OCTO_MAIL_SUBMISSION_ADDR", ":587"),
