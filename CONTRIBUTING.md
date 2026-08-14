@@ -46,9 +46,14 @@ Point the tests at a database with `OCTO_MAIL_DSN` (default
 `postgres://…@localhost:55432`). The quickest way to get one:
 
 ```sh
-docker compose up -d postgres minio
+docker compose up -d postgres minio minio-init
 make test
 ```
+
+`minio-init` creates both the runtime `octo-mail` bucket and the
+`octo-mail-test` bucket used by the integration suites. If you run MinIO outside
+Compose, create both buckets before starting octo-mail or the tests; the
+application deliberately does not create S3 buckets.
 
 Some suites are gated behind the `e2e` build tag and drive the full deployed
 stack over the wire:

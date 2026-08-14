@@ -35,14 +35,29 @@ services:
       timeout: 3s
       retries: 30
 
+  # Bucket provisioning belongs to deployment infrastructure. Keep it separate
+  # from octo-mail so the application only needs object-level S3 permissions.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/octo-mail
+        mc mb --ignore-existing local/octo-mail-test
+
   octo-mail:
     build: .
     image: octo-mail:local
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
-        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
     environment:
       OCTO_MAIL_DSN: "postgres://octo_mail:octo_mail@postgres:5432/octo_mail?sslmode=disable"
       OCTO_MAIL_HOSTNAME: "mail.octo-mail.test"
@@ -50,6 +65,7 @@ services:
       OCTO_MAIL_S3_ENDPOINT: "http://minio:9000"
       OCTO_MAIL_S3_REGION: "us-east-1"
       OCTO_MAIL_S3_BUCKET: "octo-mail"
+      OCTO_MAIL_S3_PREFIX_PATH: "${OCTO_MAIL_S3_PREFIX_PATH:-}"
       OCTO_MAIL_S3_ACCESS: "minioadmin"
       OCTO_MAIL_S3_SECRET: "minioadmin"
       # Listen addresses (container-internal; mapped below).

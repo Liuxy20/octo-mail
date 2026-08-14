@@ -5,9 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -17,28 +19,36 @@ import (
 	"time"
 )
 
+const (
+	s3ProbeObjectName = ".octo-mail-probe"
+	s3ProbeTimeout    = 30 * time.Second
+	s3ProbeBodyLimit  = 64 << 10
+)
+
 // s3Store is an S3-compatible blob backend (tested against MinIO). It speaks the
 // S3 REST API directly with AWS Signature V4 — no SDK dependency — keeping the
 // kernel free of a heavy vendored client. Bodies are content-addressed exactly
-// like the fs backend: key = <tenant>/<ab>/<cd>/<sha256>, so identical messages
-// dedup within a tenant (a PUT of an existing key is idempotent).
+// like the fs backend: key = [<prefix>/]<tenant>/<ab>/<cd>/<sha256>, so
+// identical messages dedup within a tenant (a PUT of an existing key is
+// idempotent).
 //
 // Ranged reads (IMAP FETCH BODY[]<partial>) map to HTTP Range GETs, so a partial
 // fetch never streams the whole object.
 type s3Store struct {
-	client    *http.Client
-	endpoint  string // e.g. "http://localhost:29000" (no trailing slash)
-	region    string
-	bucket    string
-	accessKey string
-	secretKey string
+	client     *http.Client
+	endpoint   string // e.g. "http://localhost:29000" (no trailing slash)
+	region     string
+	bucket     string
+	prefixPath string
+	accessKey  string
+	secretKey  string
 	// sessionToken, when set, is the STS/IAM-role temporary-credential token; it is
 	// sent as X-Amz-Security-Token and included in the SigV4 signed headers. Empty
 	// for static long-lived credentials.
 	sessionToken string
 	// maxAttempts bounds per-request retries on transient failures (5xx / SlowDown /
 	// network errors). attemptTimeout bounds each individual attempt for BOUNDED
-	// control requests (HEAD/DELETE/bucket, ranged ReadAt) — a stuck attempt is
+	// control requests (object HEAD/DELETE, ranged ReadAt) — a stuck attempt is
 	// abandoned and retried. Streaming transfers (a full-object GET body, a PUT
 	// upload) are NOT subject to this deadline: a slow-but-progressing large body
 	// must not be capped (see retryDo's streaming parameter).
@@ -53,13 +63,21 @@ type S3Config struct {
 	Endpoint     string
 	Region       string
 	Bucket       string
+	PrefixPath   string // optional slash-delimited object-key prefix
 	AccessKey    string
 	SecretKey    string
 	SessionToken string // optional STS/IAM-role temporary-credential token
 }
 
-// NewS3 returns an S3-backed blob store and ensures the bucket exists.
+// NewS3 returns an S3-backed blob store after verifying object-level access to
+// the configured, pre-provisioned bucket. Provisioning remains the deployment's
+// responsibility: the probe is a read-only GET for a deliberately absent key,
+// never a bucket-level HEAD or create request.
 func NewS3(cfg S3Config) (Store, error) {
+	prefixPath, err := normalizeS3PrefixPath(cfg.PrefixPath)
+	if err != nil {
+		return nil, err
+	}
 	s := &s3Store{
 		// No whole-request Client.Timeout: a large streaming GET/PUT body can take
 		// longer than any fixed cap. Bound the risky phases (connect, TLS, response
@@ -80,6 +98,7 @@ func NewS3(cfg S3Config) (Store, error) {
 		endpoint:       strings.TrimRight(cfg.Endpoint, "/"),
 		region:         cfg.Region,
 		bucket:         cfg.Bucket,
+		prefixPath:     prefixPath,
 		accessKey:      cfg.AccessKey,
 		secretKey:      cfg.SecretKey,
 		sessionToken:   cfg.SessionToken,
@@ -90,10 +109,66 @@ func NewS3(cfg S3Config) (Store, error) {
 	if s.region == "" {
 		s.region = "us-east-1"
 	}
-	if err := s.ensureBucket(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), s3ProbeTimeout)
+	defer cancel()
+	if err := s.probe(ctx); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// probe verifies that the endpoint, credentials, bucket, and configured object
+// namespace are usable without requiring bucket-level IAM permissions or
+// mutating storage. S3's NoSuchKey response is the expected success signal: the
+// signed object GET reached an existing bucket and was authorized for this
+// prefix. Missing buckets, denied access, malformed responses, and transport
+// failures all fail startup rather than surfacing on the first delivered mail.
+func (s *s3Store) probe(ctx context.Context) error {
+	key := s3ProbeObjectName
+	if s.prefixPath != "" {
+		key = s.prefixPath + "/" + key
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint+"/"+s.bucket+"/"+key, nil)
+	if err != nil {
+		return fmt.Errorf("s3 probe: %w", err)
+	}
+	resp, err := s.retryDo(req, emptyHash, false)
+	if err != nil {
+		return fmt.Errorf("s3 probe: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, s3ProbeBodyLimit))
+	if readErr != nil {
+		return fmt.Errorf("s3 probe: read %s response: %w", resp.Status, readErr)
+	}
+	var apiErr struct {
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	}
+	if err := xml.Unmarshal(body, &apiErr); err != nil {
+		return fmt.Errorf("s3 probe: %s with invalid S3 error response: %w", resp.Status, err)
+	}
+	if resp.StatusCode == http.StatusNotFound && apiErr.Code == "NoSuchKey" {
+		return nil
+	}
+	if resp.StatusCode == http.StatusForbidden && apiErr.Code == "AccessDenied" {
+		// AWS S3 masks a missing object's existence as AccessDenied when the
+		// caller has object permissions but no bucket-level ListBucket grant.
+		// That policy is intentionally supported: bucket provisioning and
+		// listing are outside octo-mail. Keep the probe read-only, warn that it
+		// could not prove object access, and let the first real object operation
+		// report any actual prefix/permission mismatch.
+		slog.Warn("S3 startup probe returned AccessDenied; continuing because AWS S3 uses this response for missing objects when s3:ListBucket is not granted", "bucket", s.bucket, "prefix_path", s.prefixPath)
+		return nil
+	}
+	if apiErr.Message != "" {
+		return fmt.Errorf("s3 probe: %s: %s: %s", resp.Status, apiErr.Code, apiErr.Message)
+	}
+	return fmt.Errorf("s3 probe: %s: %s", resp.Status, apiErr.Code)
 }
 
 // retryDo signs and sends req, retrying on transient failures (network error,
@@ -104,7 +179,7 @@ func NewS3(cfg S3Config) (Store, error) {
 // close.
 //
 // streaming distinguishes the two request classes. For a bounded control request
-// (HEAD/DELETE/bucket, or a size-bounded ranged ReadAt) each attempt gets its own
+// (object HEAD/DELETE, or a size-bounded ranged ReadAt) each attempt gets its own
 // attemptTimeout deadline, so a stuck attempt is abandoned and retried. For a
 // STREAMING transfer (a large GET body held for sequential read, or a PUT upload)
 // no fixed whole-body deadline is imposed — a legitimately slow but steadily
@@ -204,38 +279,44 @@ func (s *s3Store) key(tenantID int64, ref Ref) string {
 	if len(h) >= 4 {
 		ab, cd = h[0:2], h[2:4]
 	}
-	return itoa(tenantID) + "/" + ab + "/" + cd + "/" + h
+	key := itoa(tenantID) + "/" + ab + "/" + cd + "/" + h
+	if s.prefixPath != "" {
+		return s.prefixPath + "/" + key
+	}
+	return key
 }
 
-func (s *s3Store) ensureBucket(ctx context.Context) error {
-	// HEAD bucket; create on 404.
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.endpoint+"/"+s.bucket, nil)
-	if err != nil {
-		return err
+// normalizeS3PrefixPath accepts the conventional /foo/bar/ operator spelling
+// while restricting each segment to a conservative ASCII allowlist. Keeping
+// prefix bytes to letters, digits, dot, underscore, and hyphen guarantees the
+// HTTP wire path and SigV4 canonical path encode them identically across S3
+// implementations. Prefixes are configuration, not user input, so failing
+// startup is safer than accepting an ambiguous object namespace.
+func normalizeS3PrefixPath(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
 	}
-	resp, err := s.retryDo(req, emptyHash, false)
-	if err != nil {
-		return err
+	if strings.TrimSpace(raw) != raw {
+		return "", errors.New("s3 prefix path must not have leading or trailing whitespace")
 	}
-	resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		return nil
+	prefix := strings.Trim(raw, "/")
+	if prefix == "" {
+		return "", errors.New("s3 prefix path must contain at least one non-slash segment")
 	}
-	// Create the bucket (PUT).
-	creq, err := http.NewRequestWithContext(ctx, http.MethodPut, s.endpoint+"/"+s.bucket, nil)
-	if err != nil {
-		return err
+	for _, segment := range strings.Split(prefix, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("s3 prefix path contains invalid segment %q", segment)
+		}
+		for _, r := range segment {
+			if !((r >= 'a' && r <= 'z') ||
+				(r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') ||
+				r == '.' || r == '_' || r == '-') {
+				return "", fmt.Errorf("s3 prefix path segment %q must contain only ASCII letters, digits, '.', '_', or '-'", segment)
+			}
+		}
 	}
-	cresp, err := s.retryDo(creq, emptyHash, false)
-	if err != nil {
-		return err
-	}
-	defer cresp.Body.Close()
-	if cresp.StatusCode != http.StatusOK && cresp.StatusCode != http.StatusConflict {
-		b, _ := io.ReadAll(cresp.Body)
-		return fmt.Errorf("s3 create bucket: %s: %s", cresp.Status, string(b))
-	}
-	return nil
+	return prefix, nil
 }
 
 func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, int64, error) {

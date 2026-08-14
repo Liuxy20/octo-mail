@@ -139,7 +139,8 @@ config file. The authoritative list lives in
 |---|---|
 | `OCTO_MAIL_DSN` | PostgreSQL connection string (**required**) |
 | `OCTO_MAIL_HOSTNAME` | Server hostname (HELO / Message-ID / TLS) |
-| `OCTO_MAIL_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_ACCESS` / `_SECRET` | S3-compatible blob store; falls back to `OCTO_MAIL_BLOB_DIR` for local FS |
+| `OCTO_MAIL_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_ACCESS` / `_SECRET` | S3-compatible blob store using a pre-provisioned bucket; falls back to `OCTO_MAIL_BLOB_DIR` for local FS |
+| `OCTO_MAIL_S3_PREFIX_PATH` | Optional slash-delimited object-key prefix inside the S3 bucket; empty preserves the existing key layout |
 | `OCTO_MAIL_SMTP_ADDR` / `_SUBMISSION_ADDR` / `_IMAP_ADDR` / `_JMAP_ADDR` / `_ADMIN_ADDR` | Listen addresses per surface |
 | `OCTO_MAIL_ADMIN_TOKEN` | Bearer token guarding the admin API |
 | `OCTO_MAIL_NODE_ID` | Unique node identity for HA leader election |
@@ -150,6 +151,35 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_AUTO_REPLY_MAX_COUNT` | Maximum authenticated Agent automatic replies in one chain; defaults to `4`, `0` disables the limit |
 | `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total Agent mailboxes per owner in one OCTO Space, including the gateway default Agent mailbox; defaults to `2` |
 | `OCTO_MAIL_AUTO_REPLY_CHAIN_KEY` | Deployment-wide HMAC key for automatic-reply chain metadata; at least 32 bytes and required while the limit is enabled |
+
+`OCTO_MAIL_S3_BUCKET` must exist before octo-mail starts. octo-mail does not send
+`HeadBucket` or `CreateBucket` requests; bucket creation and bucket-level policy
+belong to deployment infrastructure. Its S3 identity only needs object
+`s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` permissions under the
+configured prefix (or the bucket's object keys when no prefix is set).
+At startup, octo-mail performs a read-only `GetObject` for an absent sentinel
+under that prefix. `NoSuchKey` confirms access. AWS S3 can instead return
+`AccessDenied` for the absent sentinel when the identity has object permissions
+but no `s3:ListBucket`; octo-mail logs a warning and continues in that case so
+bucket-level permission is not required. Invalid credentials or signatures, a
+missing bucket, and transport failures still stop startup.
+
+`OCTO_MAIL_S3_PREFIX_PATH` accepts values such as `mail/prod` or
+`/mail/prod/`; each slash-delimited segment may contain only ASCII letters,
+digits, `.`, `_`, and `-`. Outer slashes are removed before object keys are
+generated.
+
+Changing this value is an offline storage migration; octo-mail does **not** move
+existing objects. Stop all octo-mail writers and projection workers before
+copying or moving the objects, switch every node to the new prefix together,
+and resume traffic only after verifying the new object paths. Do not roll this
+change through an HA deployment: old- and new-prefix nodes must never overlap.
+
+If a projection worker runs while the prefix is wrong or mixed, messages whose
+summaries have not yet been folded can be marked folded while their subject,
+sender, recipients, preview, and search metadata are permanently cleared.
+Restoring the old prefix or moving objects back later does not automatically
+repair that metadata.
 
 Anti-abuse, queue, ACME, and deliverability knobs (`OCTO_MAIL_REJECT_DMARC`,
 `OCTO_MAIL_GREYLIST`, `OCTO_MAIL_QUEUE_BACKOFF`, `OCTO_MAIL_ACME_HOSTS`, …) are
