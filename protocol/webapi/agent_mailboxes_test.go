@@ -126,6 +126,26 @@ func TestAgentMailboxCreationIsIndependent(t *testing.T) {
 	if internalAccountName != "agent-mailbox:support@mail.imocto.cn" {
 		t.Fatalf("Agent mailbox internal account name = %q", internalAccountName)
 	}
+	ownerScope, _, err := dir.AuthenticatePrincipal(ctx, "owner@example.com", directory.PasswordCredential("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentAccount, err := ownerScope.AccountForID(ctx, createdID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentAccount.ReadTx(ctx, func(tx store.Tx) error {
+		inbox, err := agentAccount.MailboxFind(tx, "Inbox")
+		if err != nil {
+			return err
+		}
+		if inbox == nil {
+			return fmt.Errorf("new Agent mailbox has no Inbox")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	verifier := "agent-mailbox-mode-verifier-with-enough-entropy"
 	digest := sha256.Sum256([]byte(verifier))
