@@ -94,6 +94,23 @@ func TestS3PrefixPathConfig(t *testing.T) {
 	}
 }
 
+func TestS3ForcePathStyleConfig(t *testing.T) {
+	t.Setenv("OCTO_MAIL_S3_FORCE_PATH_STYLE", "")
+	if loadConfig().s3VirtualHostedStyle {
+		t.Fatal("default S3 addressing mode must remain path style")
+	}
+
+	t.Setenv("OCTO_MAIL_S3_FORCE_PATH_STYLE", "1")
+	if loadConfig().s3VirtualHostedStyle {
+		t.Fatal("OCTO_MAIL_S3_FORCE_PATH_STYLE=1 did not enable path style")
+	}
+
+	t.Setenv("OCTO_MAIL_S3_FORCE_PATH_STYLE", "0")
+	if !loadConfig().s3VirtualHostedStyle {
+		t.Fatal("OCTO_MAIL_S3_FORCE_PATH_STYLE=0 did not enable virtual-hosted style")
+	}
+}
+
 func TestAutoReplyChainConfig(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	strongKey := []byte(strings.Repeat("k", 32))

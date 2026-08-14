@@ -141,6 +141,7 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_HOSTNAME` | Server hostname (HELO / Message-ID / TLS) |
 | `OCTO_MAIL_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_ACCESS` / `_SECRET` | S3-compatible blob store using a pre-provisioned bucket; falls back to `OCTO_MAIL_BLOB_DIR` for local FS |
 | `OCTO_MAIL_S3_PREFIX_PATH` | Optional slash-delimited object-key prefix inside the S3 bucket; empty preserves the existing key layout |
+| `OCTO_MAIL_S3_FORCE_PATH_STYLE` | S3 addressing mode: `1` (default) keeps the bucket in the path; `0` puts it in the hostname |
 | `OCTO_MAIL_SMTP_ADDR` / `_SUBMISSION_ADDR` / `_IMAP_ADDR` / `_JMAP_ADDR` / `_ADMIN_ADDR` | Listen addresses per surface |
 | `OCTO_MAIL_ADMIN_TOKEN` | Bearer token guarding the admin API |
 | `OCTO_MAIL_NODE_ID` | Unique node identity for HA leader election |
@@ -163,6 +164,18 @@ under that prefix. `NoSuchKey` confirms access. AWS S3 can instead return
 but no `s3:ListBucket`; octo-mail logs a warning and continues in that case so
 bucket-level permission is not required. Invalid credentials or signatures, a
 missing bucket, and transport failures still stop startup.
+
+Path-style addressing remains the default for compatibility with existing
+MinIO deployments. Providers that require virtual-hosted-style requests, such
+as Tencent Cloud COS, use the same S3 configuration with path style disabled;
+the endpoint remains the provider endpoint and does not include the bucket:
+
+```sh
+OCTO_MAIL_S3_ENDPOINT=https://cos.ap-shanghai.myqcloud.com
+OCTO_MAIL_S3_REGION=ap-shanghai
+OCTO_MAIL_S3_BUCKET=<bucket-appid>
+OCTO_MAIL_S3_FORCE_PATH_STYLE=0
+```
 
 `OCTO_MAIL_S3_PREFIX_PATH` accepts values such as `mail/prod` or
 `/mail/prod/`; each slash-delimited segment may contain only ASCII letters,

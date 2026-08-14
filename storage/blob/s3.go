@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -35,13 +36,13 @@ const (
 // Ranged reads (IMAP FETCH BODY[]<partial>) map to HTTP Range GETs, so a partial
 // fetch never streams the whole object.
 type s3Store struct {
-	client     *http.Client
-	endpoint   string // e.g. "http://localhost:29000" (no trailing slash)
-	region     string
-	bucket     string
-	prefixPath string
-	accessKey  string
-	secretKey  string
+	client        *http.Client
+	objectBaseURL string // endpoint addressed to the bucket, without a trailing slash
+	region        string
+	bucket        string
+	prefixPath    string
+	accessKey     string
+	secretKey     string
 	// sessionToken, when set, is the STS/IAM-role temporary-credential token; it is
 	// sent as X-Amz-Security-Token and included in the SigV4 signed headers. Empty
 	// for static long-lived credentials.
@@ -60,13 +61,14 @@ type s3Store struct {
 
 // S3Config configures an S3-compatible blob store.
 type S3Config struct {
-	Endpoint     string
-	Region       string
-	Bucket       string
-	PrefixPath   string // optional slash-delimited object-key prefix
-	AccessKey    string
-	SecretKey    string
-	SessionToken string // optional STS/IAM-role temporary-credential token
+	Endpoint           string
+	Region             string
+	Bucket             string
+	PrefixPath         string // optional slash-delimited object-key prefix
+	VirtualHostedStyle bool   // put the bucket in the hostname; false preserves path style
+	AccessKey          string
+	SecretKey          string
+	SessionToken       string // optional STS/IAM-role temporary-credential token
 }
 
 // NewS3 returns an S3-backed blob store after verifying object-level access to
@@ -75,6 +77,10 @@ type S3Config struct {
 // never a bucket-level HEAD or create request.
 func NewS3(cfg S3Config) (Store, error) {
 	prefixPath, err := normalizeS3PrefixPath(cfg.PrefixPath)
+	if err != nil {
+		return nil, err
+	}
+	objectBaseURL, err := s3ObjectBaseURL(cfg.Endpoint, cfg.Bucket, cfg.VirtualHostedStyle)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +101,7 @@ func NewS3(cfg S3Config) (Store, error) {
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
-		endpoint:       strings.TrimRight(cfg.Endpoint, "/"),
+		objectBaseURL:  objectBaseURL,
 		region:         cfg.Region,
 		bucket:         cfg.Bucket,
 		prefixPath:     prefixPath,
@@ -128,7 +134,7 @@ func (s *s3Store) probe(ctx context.Context) error {
 	if s.prefixPath != "" {
 		key = s.prefixPath + "/" + key
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint+"/"+s.bucket+"/"+key, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.objectURL(key), nil)
 	if err != nil {
 		return fmt.Errorf("s3 probe: %w", err)
 	}
@@ -286,6 +292,28 @@ func (s *s3Store) key(tenantID int64, ref Ref) string {
 	return key
 }
 
+func s3ObjectBaseURL(endpoint, bucket string, virtualHostedStyle bool) (string, error) {
+	endpoint = strings.TrimRight(endpoint, "/")
+	if !virtualHostedStyle {
+		return endpoint + "/" + bucket, nil
+	}
+
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("s3 endpoint: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("s3 endpoint must be an absolute http(s) URL")
+	}
+	u.Host = bucket + "." + u.Host
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+// objectURL is the single URL-construction path for every S3 object operation.
+func (s *s3Store) objectURL(key string) string {
+	return s.objectBaseURL + "/" + key
+}
+
 // normalizeS3PrefixPath accepts the conventional /foo/bar/ operator spelling
 // while restricting each segment to a conservative ASCII allowlist. Keeping
 // prefix bytes to letters, digits, dot, underscore, and hyphen guarantees the
@@ -349,8 +377,7 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 		return "", 0, err
 	}
-	url := s.endpoint + "/" + s.bucket + "/" + key
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, tmp)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.objectURL(key), tmp)
 	if err != nil {
 		return "", 0, err
 	}
@@ -383,7 +410,7 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 // transient failure (network, signing, non-404 status) — the caller should
 // retry. A definitive 404 is (false, 0, nil): the object is permanently absent.
 func (s *s3Store) head(ctx context.Context, key string) (bool, int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.endpoint+"/"+s.bucket+"/"+key, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.objectURL(key), nil)
 	if err != nil {
 		return false, 0, err
 	}
@@ -415,7 +442,7 @@ func (s *s3Store) Delete(ctx context.Context, tenantID int64, ref Ref) error {
 	if !ref.Valid() {
 		return ErrBadRef
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.endpoint+"/"+s.bucket+"/"+s.key(tenantID, ref), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.objectURL(s.key(tenantID, ref)), nil)
 	if err != nil {
 		return err
 	}
@@ -470,7 +497,7 @@ func (r *s3Reader) openStream(off int64) error {
 		r.body.Close()
 		r.body = nil
 	}
-	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.s.endpoint+"/"+r.s.bucket+"/"+r.key, nil)
+	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.s.objectURL(r.key), nil)
 	if err != nil {
 		return err
 	}
@@ -556,7 +583,7 @@ func (r *s3Reader) ReadAt(p []byte, off int64) (int, error) {
 	if end >= r.size {
 		end = r.size - 1
 	}
-	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.s.endpoint+"/"+r.s.bucket+"/"+r.key, nil)
+	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.s.objectURL(r.key), nil)
 	if err != nil {
 		return 0, err
 	}
