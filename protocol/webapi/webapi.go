@@ -111,10 +111,14 @@ func (s *Server) maxMessageSize() int64 {
 	return defaultMaxMessageSize
 }
 
-// Handler mounts the REST routes under /webapi/v0 using method+path patterns
-// (Go 1.22 ServeMux). Every route is authenticated in the handler via s.auth.
+// Handler mounts the REST routes using Go 1.22 method+path patterns. Business
+// routes under /webapi/v0 authenticate via s.auth; the internal provisioning
+// route verifies its own request-bound gateway assertion.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Trusted OCTO gateway provisioning. This path is not reachable through the
+	// browser gateway; it authenticates its own exact request-bound assertion.
+	mux.HandleFunc("POST /internal/v0/gateway-identities/ensure", s.ensureGatewayIdentity)
 	// Messages.
 	mux.HandleFunc("GET /webapi/v0/messages", s.h(s.listMessages))
 	mux.HandleFunc("POST /webapi/v0/messages", s.hAgentConfirmed("mail.message.send", s.sendMessage))

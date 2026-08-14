@@ -40,6 +40,11 @@ var (
 	ErrMailRuleLimit              = errors.New("directory: enabled mail rule limit reached")
 )
 
+var (
+	ErrGatewayIdentityDisabled     = errors.New("directory: gateway identity disabled")
+	ErrGatewayProvisioningConflict = errors.New("directory: gateway provisioning conflict")
+)
+
 // TenantInfo identifies a tenant. Quota/limits hang off it.
 type TenantInfo struct {
 	ID         int64
@@ -236,6 +241,30 @@ type AgentAuthorizationDirectory interface {
 // optional; when present it must still be owned by that exact principal.
 type GatewayIdentityDirectory interface {
 	AuthenticateGatewayIdentity(ctx context.Context, issuer, subject, spaceID string, selectedAccountID int64) (TenantScope, Principal, int64, error)
+}
+
+// GatewayProvisioningDirectory is the narrow trusted capability used by the
+// OCTO gateway to ensure a human owner exists before its first browser Mail
+// request. Tenant and domain selection remain server-side; callers provide no
+// database identifiers.
+type GatewayProvisioningDirectory interface {
+	EnsureGatewayIdentity(ctx context.Context, input GatewayProvisioningInput) (GatewayProvisioningResult, error)
+}
+
+type GatewayProvisioningInput struct {
+	Issuer    string
+	Subject   string
+	SpaceID   string
+	Localpart string
+	Domain    string
+}
+
+type GatewayProvisioningResult struct {
+	TenantID         int64
+	PrincipalID      int64
+	DefaultAccountID int64
+	Address          string
+	Created          bool
 }
 
 // GatewayAssertionReplayDirectory consumes one signed gateway assertion nonce.

@@ -1,0 +1,28 @@
+{
+  "id": "outbound-smtp-relay",
+  "name": "outbound-smtp-relay",
+  "title": "Outbound SMTP relay over implicit TLS",
+  "description": "Deliver queued mail through a fixed authenticated SMTP relay on TCP 465 for cloud environments that block outbound TCP 25.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": "cmd/octo-mail config and composition, mailflow/submit transport, docs, tests",
+  "package": null,
+  "priority": "P1",
+  "creator": "codex",
+  "assignee": "codex",
+  "createdAt": "2026-08-14",
+  "completedAt": "2026-08-14",
+  "branch": "feat/agent-mail-auto-provisioning",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Tracks https://github.com/Mininglamp-OSS/octo-mail/issues/56. Based on Tencent Cloud CVM guidance for using third-party SMTP services over port 465 when outbound TCP 25 is blocked.",
+  "meta": {
+    "issue_url": "https://github.com/Mininglamp-OSS/octo-mail/issues/56"
+  }
+}

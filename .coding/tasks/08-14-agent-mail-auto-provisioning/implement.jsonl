@@ -1,0 +1,5 @@
+{"file":".coding/spec/backend/index.md","reason":"Dependency direction and tenant-isolation contract."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"PostgreSQL transaction, locking, changelog, and real-infra test rules."}
+{"file":".coding/spec/backend/error-handling.md","reason":"Sentinel and wrapped-error conventions."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Configuration, tenant isolation, and required gates."}
+{"file":".coding/spec/guides/cross-layer-thinking-guide.md","reason":"Internal API to storage contract crosses protocol/core/storage layers."}

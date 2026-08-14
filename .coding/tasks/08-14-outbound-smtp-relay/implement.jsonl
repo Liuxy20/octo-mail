@@ -1,0 +1,5 @@
+{"file":".coding/spec/backend/error-handling.md","reason":"Relay connection and startup failures must retain actionable context."}
+{"file":".coding/spec/backend/logging-guidelines.md","reason":"SMTP credentials are secrets and must not enter logs."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Environment validation and load-bearing transport changes require fail-fast checks and tests."}
+{"file":".coding/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse the existing SMTPDeliverer and vendored mox SMTP/SASL implementation."}
+{"file":".coding/spec/guides/cross-layer-thinking-guide.md","reason":"Trace deployment config through transport selection to the SMTP wire."}

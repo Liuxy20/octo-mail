@@ -142,6 +142,28 @@ func validate(cfg config, log *slog.Logger) error {
 			cfg.s3Endpoint)
 	}
 
+	// A submission relay is one authenticated transport configuration. Refuse
+	// partial values rather than falling back to direct MX delivery and port 25,
+	// which would make a missing secret look like a successful rollout until the
+	// first queued message is attempted.
+	relayValues := 0
+	for _, value := range []string{cfg.outboundRelayAddr, cfg.outboundRelayUsername, cfg.outboundRelayPassword} {
+		if value != "" {
+			relayValues++
+		}
+	}
+	if relayValues != 0 && relayValues != 3 {
+		return fmt.Errorf("OCTO_MAIL_OUTBOUND_RELAY_ADDR, OCTO_MAIL_OUTBOUND_RELAY_USERNAME, and OCTO_MAIL_OUTBOUND_RELAY_PASSWORD must be configured together")
+	}
+	if relayValues == 3 {
+		if _, err := parseOutboundRelayAddr(cfg.outboundRelayAddr); err != nil {
+			return err
+		}
+		if cfg.egressPool {
+			return fmt.Errorf("OCTO_MAIL_OUTBOUND_RELAY_ADDR and OCTO_MAIL_EGRESS_POOL=1 cannot be used together: relay delivery uses the provider connection rather than per-tenant source-IP routing")
+		}
+	}
+
 	// Warn: the admin API on a non-loopback address without a token. The default
 	// ":8081" binds all interfaces; with no token that exposes admin operations to
 	// anything that can reach the node.
@@ -276,6 +298,12 @@ type config struct {
 	jmapAddr         string
 	jmapBaseURL      string
 	authorizationURL string
+	// outboundRelay* configure an authenticated third-party SMTP submission
+	// relay. When set, queued deliveries use implicit TLS on port 465 instead of
+	// resolving recipient MX records and connecting to port 25.
+	outboundRelayAddr     string
+	outboundRelayUsername string
+	outboundRelayPassword string
 
 	queueInterval    time.Duration
 	projInterval     time.Duration
@@ -370,12 +398,15 @@ func loadConfig() config {
 		s3Secret:             os.Getenv("OCTO_MAIL_S3_SECRET"),
 		s3SessionToken:       os.Getenv("OCTO_MAIL_S3_SESSION_TOKEN"),
 
-		smtpAddr:         envDefault("OCTO_MAIL_SMTP_ADDR", ":25"),
-		submissionAddr:   envDefault("OCTO_MAIL_SUBMISSION_ADDR", ":587"),
-		imapAddr:         envDefault("OCTO_MAIL_IMAP_ADDR", ":143"),
-		jmapAddr:         envDefault("OCTO_MAIL_JMAP_ADDR", ":8080"),
-		jmapBaseURL:      envDefault("OCTO_MAIL_JMAP_BASEURL", "http://localhost:8080"),
-		authorizationURL: envDefault("OCTO_MAIL_AUTHORIZATION_URL", "/mail/authorize"),
+		smtpAddr:              envDefault("OCTO_MAIL_SMTP_ADDR", ":25"),
+		submissionAddr:        envDefault("OCTO_MAIL_SUBMISSION_ADDR", ":587"),
+		imapAddr:              envDefault("OCTO_MAIL_IMAP_ADDR", ":143"),
+		jmapAddr:              envDefault("OCTO_MAIL_JMAP_ADDR", ":8080"),
+		jmapBaseURL:           envDefault("OCTO_MAIL_JMAP_BASEURL", "http://localhost:8080"),
+		authorizationURL:      envDefault("OCTO_MAIL_AUTHORIZATION_URL", "/mail/authorize"),
+		outboundRelayAddr:     strings.TrimSpace(os.Getenv("OCTO_MAIL_OUTBOUND_RELAY_ADDR")),
+		outboundRelayUsername: strings.TrimSpace(os.Getenv("OCTO_MAIL_OUTBOUND_RELAY_USERNAME")),
+		outboundRelayPassword: os.Getenv("OCTO_MAIL_OUTBOUND_RELAY_PASSWORD"),
 
 		queueInterval:    envDuration("OCTO_MAIL_QUEUE_INTERVAL", 5*time.Second),
 		projInterval:     envDuration("OCTO_MAIL_PROJECTION_INTERVAL", 10*time.Second),
@@ -422,6 +453,28 @@ func loadConfig() config {
 		acmeCacheDir:  envDefault("OCTO_MAIL_ACME_CACHE", "./acme"),
 		acmeHosts:     parseDomainList(os.Getenv("OCTO_MAIL_ACME_HOSTS")),
 	}
+}
+
+// parseOutboundRelayAddr validates the deliberately narrow relay transport:
+// implicit TLS on TCP 465 to a DNS hostname. Supporting URLs, IP literals, or
+// STARTTLS ports here would introduce different certificate and protocol
+// semantics, so they are rejected instead of guessed.
+func parseOutboundRelayAddr(addr string) (dns.Domain, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return dns.Domain{}, fmt.Errorf("OCTO_MAIL_OUTBOUND_RELAY_ADDR must be a DNS host and port in the form smtp.example.com:465: %w", err)
+	}
+	if port != "465" {
+		return dns.Domain{}, fmt.Errorf("OCTO_MAIL_OUTBOUND_RELAY_ADDR must use TCP port 465 for implicit TLS, got %q", port)
+	}
+	if net.ParseIP(host) != nil {
+		return dns.Domain{}, fmt.Errorf("OCTO_MAIL_OUTBOUND_RELAY_ADDR must use a DNS hostname so the relay certificate identity is explicit")
+	}
+	domain, err := dns.ParseDomain(host)
+	if err != nil {
+		return dns.Domain{}, fmt.Errorf("OCTO_MAIL_OUTBOUND_RELAY_ADDR must use a valid DNS hostname: %w", err)
+	}
+	return domain, nil
 }
 
 func parseTrimmedList(value string) []string {

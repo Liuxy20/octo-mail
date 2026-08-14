@@ -143,6 +143,7 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_S3_PREFIX_PATH` | Optional slash-delimited object-key prefix inside the S3 bucket; empty preserves the existing key layout |
 | `OCTO_MAIL_S3_FORCE_PATH_STYLE` | S3 addressing mode: `1` (default) keeps the bucket in the path; `0` puts it in the hostname |
 | `OCTO_MAIL_SMTP_ADDR` / `_SUBMISSION_ADDR` / `_IMAP_ADDR` / `_JMAP_ADDR` / `_ADMIN_ADDR` | Listen addresses per surface |
+| `OCTO_MAIL_OUTBOUND_RELAY_ADDR` / `_USERNAME` / `_PASSWORD` | Optional authenticated outbound SMTP relay; all three are required together and the address must use implicit TLS port `465` |
 | `OCTO_MAIL_ADMIN_TOKEN` | Bearer token guarding the admin API |
 | `OCTO_MAIL_NODE_ID` | Unique node identity for HA leader election |
 | `OCTO_MAIL_GATEWAY_SECRET` | Shared secret used to verify OCTO Gateway identity assertions; at least 32 bytes |
@@ -197,6 +198,36 @@ repair that metadata.
 Anti-abuse, queue, ACME, and deliverability knobs (`OCTO_MAIL_REJECT_DMARC`,
 `OCTO_MAIL_GREYLIST`, `OCTO_MAIL_QUEUE_BACKOFF`, `OCTO_MAIL_ACME_HOSTS`, …) are
 documented alongside their defaults in `config.go`.
+
+### Outbound SMTP relay on TCP 465
+
+By default, octo-mail delivers queued messages directly to each recipient
+domain's MX over TCP 25. Cloud environments that block outbound TCP 25 must
+configure a third-party SMTP relay. In particular, Tencent Cloud CVM documents
+using a third-party mail service on port 465:
+<https://cloud.tencent.com/document/product/213/106640>.
+
+Configure the provider's fixed SMTP hostname and client credential on every
+octo-mail node:
+
+```sh
+OCTO_MAIL_OUTBOUND_RELAY_ADDR=smtp.example.com:465
+OCTO_MAIL_OUTBOUND_RELAY_USERNAME=<smtp-account>
+OCTO_MAIL_OUTBOUND_RELAY_PASSWORD=<smtp-client-password>
+```
+
+All three values are one configuration unit; partial configuration stops
+startup. Relay mode connects using implicit TLS before any SMTP bytes, verifies
+the provider certificate, and authenticates with PLAIN or LOGIN only inside the
+TLS connection. It sends the existing MAIL FROM, RCPT TO, DATA, DKIM, and VERP
+values through that relay; recipient MX, MTA-STS, DANE/TLSA, and the local egress
+IP pool are not used. `OCTO_MAIL_EGRESS_POOL=1` therefore cannot be combined
+with a fixed relay.
+
+The selected provider must authorize the deployment's sender/envelope domains
+and addresses (including the configured bounce/VERP domain when enabled).
+Removing the relay variables restores direct MX delivery; on Tencent Cloud that
+path remains unavailable while outbound TCP 25 is blocked.
 
 ### Agent Mail owner-confirmation boundary
 
