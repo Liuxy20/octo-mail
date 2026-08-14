@@ -239,15 +239,6 @@ func TestAgentCredentialJMAPReadOnly(t *testing.T) {
 		 VALUES ($1,$2,$3,'space-jmap')`, tenantID, accountID, principalID)
 
 	dir := s.NewDirectory()
-	address, _ := smtp.ParseAddress("agent-owner@example.com")
-	target, err := dir.ResolveInbound(ctx, address.Path())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := target.Deliver(ctx, &store.Message{}, mem("Subject: agent jmap\r\n\r\nbody\r\n")); err != nil {
-		t.Fatal(err)
-	}
-
 	verifier := "jmap-agent-verifier-with-enough-entropy"
 	digest := sha256.Sum256([]byte(verifier))
 	agentDir := directory.AgentAuthorizationDirectory(dir)
@@ -307,6 +298,21 @@ func TestAgentCredentialJMAPReadOnly(t *testing.T) {
 		_ = json.Unmarshal(out.MethodResponses[0][0], &name)
 		_ = json.Unmarshal(out.MethodResponses[0][1], &args)
 		return name, args
+	}
+
+	name, mailboxes := invoke(`["Mailbox/get", {"accountId":"` + itoa(accountID) + `"}, "empty"]`)
+	list, ok := mailboxes["list"].([]any)
+	if name != "Mailbox/get" || !ok || len(list) != 0 {
+		t.Fatalf("empty Agent Mailbox/get = %s %v, want list=[]", name, mailboxes)
+	}
+
+	address, _ := smtp.ParseAddress("agent-owner@example.com")
+	target, err := dir.ResolveInbound(ctx, address.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("Subject: agent jmap\r\n\r\nbody\r\n")); err != nil {
+		t.Fatal(err)
 	}
 
 	name, changes := invoke(`["Email/changes", {"accountId":"` + itoa(accountID) + `","sinceState":"0"}, "read"]`)

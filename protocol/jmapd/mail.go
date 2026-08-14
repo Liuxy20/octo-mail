@@ -77,7 +77,7 @@ func mailboxState(ctx context.Context, acc store.Account) string {
 
 // Mailbox/get: list the account's mailboxes as JMAP Mailbox objects.
 func (s *Server) mailboxGet(ctx context.Context, acc store.Account, inv invocation) (string, any) {
-	var list []map[string]any
+	list := make([]map[string]any, 0)
 	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		mbs, e := tx.QueryMailbox().List()
 		if e != nil {

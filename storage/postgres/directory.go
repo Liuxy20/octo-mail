@@ -759,6 +759,17 @@ func (t *tenantScope) CreateAgentMailbox(ctx context.Context, principalID, sourc
 		t.info.ID, mailbox.ID, principalID, spaceID); err != nil {
 		return directory.AgentMailbox{}, fmt.Errorf("register Agent mailbox in Space: %w", err)
 	}
+	// Provision Inbox before publishing the new account. Reuse the normal mailbox
+	// writer so the projection and changelog start in sync; no account-scoped
+	// writer can race here because the account is still invisible until commit.
+	account := t.s.openAccount(mailbox.ID, t.info.ID, "agent-mailbox:"+mailbox.Address)
+	mailboxTx := &pgTx{ctx: ctx, tx: tx, acc: account, write: true}
+	if _, err := mailboxTx.ensureMailbox("Inbox", true, store.SpecialUse{}); err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("create Agent mailbox Inbox: %w", err)
+	}
+	if err := mailboxTx.flush(); err != nil {
+		return directory.AgentMailbox{}, fmt.Errorf("initialize Agent mailbox changelog: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return directory.AgentMailbox{}, fmt.Errorf("commit agent mailbox: %w", err)
 	}
