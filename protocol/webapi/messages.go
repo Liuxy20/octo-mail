@@ -381,6 +381,8 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 		sourceRaw               []byte
 		automaticIntentDigest   []byte
 		automaticIdempotencyKey string
+		trustedForward          rulemetadata.Metadata
+		trustedForwardOK        bool
 	)
 	sourceRaw, err := readMessageBytes(ctx, a.acc, id)
 	if err != nil {
@@ -397,14 +399,15 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	if automatic {
 		automaticIdempotencyKey = strings.TrimSpace(r.Header.Get(outboundIdempotencyHeader))
 		sourceIdentity := id
-		if metadata, ok := s.trustedRuleForwardMetadata(ctx, a, sourceRaw); ok {
+		trustedForward, trustedForwardOK = s.trustedRuleForwardMetadata(ctx, a, sourceRaw)
+		if trustedForwardOK {
 			// A signed forwarding Message-ID identifies the same server-generated
 			// message across repeated SMTP deliveries, while local Email ids do
 			// not. Scope the internal key to the receiving account so one trusted
 			// forward can trigger at most one automatic reply in that mailbox.
-			sourceIdentity = metadata.MessageID
+			sourceIdentity = trustedForward.MessageID
 			automaticIdempotencyKey = scopedOutboundIdempotencyKey(
-				a.acc.ID(), "trusted-rule-forward:"+metadata.MessageID,
+				a.acc.ID(), "trusted-rule-forward:"+trustedForward.MessageID,
 			)
 		}
 		// Idempotency binds the caller's request, not server-generated transport
@@ -427,7 +430,7 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 			if err != nil {
 				return 0, nil, internalErr("message_id_failed", err)
 			}
-			metadata, err := s.nextAutoReplyMetadata(ctx, a, id, sourceRaw, messageID, to[0])
+			metadata, err := s.nextAutoReplyMetadata(ctx, a, id, sourceRaw, messageID, to[0], trustedForwardOK)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -453,11 +456,18 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	if all {
 		operation = "mail.message.reply_all"
 	}
-	if err := s.enforceAgentOutboundPolicy(ctx, a, r, outboundpolicy.Intent{
+	policyDedupe := outboundPolicyDedupe{}
+	if trustedForwardOK {
+		policyDedupe = outboundPolicyDedupe{
+			requestKey:     automaticIdempotencyKey,
+			sourceIdentity: trustedForward.MessageID,
+		}
+	}
+	if err := s.enforceAgentOutboundPolicyWithDedupe(ctx, a, r, outboundpolicy.Intent{
 		Source: outboundPolicySource(r), Operation: operation, SourceEmailID: id,
 		To: to, Cc: cc, Subject: subject, Text: req.Text, HTML: req.HTML,
 		AttachmentCount: len(req.Attachments),
-	}, raw); err != nil {
+	}, raw, policyDedupe); err != nil {
 		return 0, nil, err
 	}
 	var automaticIntentClaimed bool

@@ -17,6 +17,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	"github.com/Mininglamp-OSS/octo-mail/protocol/webapi"
@@ -424,6 +425,40 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 	if status != http.StatusAccepted {
 		t.Fatalf("manual trusted replay reply = %d %#v", status, manualTrustedReply)
 	}
+
+	// Owner-review Drafts use the same signed Message-ID identity as accepted
+	// automatic replies. Re-delivery under another local Email id and caller key
+	// must return the existing Draft instead of creating another approval item.
+	server.OutboundPolicy = outboundpolicy.NewKeywordEvaluator([]string{"review this"})
+	reviewTrustedRaw := signedRuleForwardSourceWithMessageID(t, ruleAuthenticator, "support@example.com", "<trusted-review@example.net>")
+	reviewTrusted := &store.Message{}
+	if _, err := target.Deliver(ctx, reviewTrusted, mem(string(reviewTrustedRaw))); err != nil {
+		t.Fatal(err)
+	}
+	reviewTrustedReplay := &store.Message{}
+	if _, err := target.Deliver(ctx, reviewTrustedReplay, mem(string(reviewTrustedRaw))); err != nil {
+		t.Fatal(err)
+	}
+	counts(&sentBefore, &queueBefore, &draftsBefore)
+	reviewBody := map[string]any{"text": "Please review this automatic reply."}
+	status, firstReview, _ := do(http.MethodPost,
+		"/webapi/v0/messages/E"+strconv.FormatInt(reviewTrusted.EffectiveEmailID(), 10)+"/reply",
+		reviewBody, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "trusted-review-first"})
+	if status != http.StatusConflict || firstReview["error"].(map[string]any)["code"] != "outbound_review_required" {
+		t.Fatalf("trusted forward review = %d %#v", status, firstReview)
+	}
+	firstReviewDraftID := firstReview["policy"].(map[string]any)["draftId"]
+	status, repeatedReview, _ := do(http.MethodPost,
+		"/webapi/v0/messages/E"+strconv.FormatInt(reviewTrustedReplay.EffectiveEmailID(), 10)+"/reply",
+		reviewBody, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "trusted-review-replay"})
+	if status != http.StatusConflict || repeatedReview["policy"].(map[string]any)["draftId"] != firstReviewDraftID {
+		t.Fatalf("replayed trusted forward review = %d %#v, want Draft %v", status, repeatedReview, firstReviewDraftID)
+	}
+	counts(&sentAfter, &queueAfter, &draftsAfter)
+	if sentAfter != sentBefore || queueAfter != queueBefore || draftsAfter != draftsBefore+1 {
+		t.Fatalf("trusted review replay side effects sent %d→%d queue %d→%d drafts %d→%d", sentBefore, sentAfter, queueBefore, queueAfter, draftsBefore, draftsAfter)
+	}
+	server.OutboundPolicy = nil
 
 	// Identical visible content with a newly signed Message-ID is a new message
 	// and may independently trigger an automatic reply.

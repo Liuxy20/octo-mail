@@ -94,7 +94,7 @@ func (a *Authenticator) Verify(raw []byte, expectedRecipient string, now time.Ti
 // in the signed recipient set. This lets aliases retain trust without widening
 // it beyond addresses that actually belong to the receiving account.
 func (a *Authenticator) VerifyAny(raw []byte, expectedRecipients []string, now time.Time) (Metadata, bool) {
-	header, contentDigest, ok := messageContentDigest(raw)
+	header, contentDigest, ok := verificationContentDigest(raw)
 	if !ok {
 		return Metadata{}, false
 	}
@@ -390,9 +390,23 @@ var contentBoundHeaders = []string{
 // matching, MIME interpretation, and the complete MIME body. Transport-added
 // headers such as Received and DKIM-Signature are deliberately excluded.
 func messageContentDigest(raw []byte) (textproto.MIMEHeader, [sha256.Size]byte, bool) {
+	return messageContentDigestWithSignatureRequirement(raw, false)
+}
+
+// verificationContentDigest avoids hashing ordinary messages that carry no
+// rule signature. Signed messages still bind the full selected header set and
+// MIME body before any chain trust is granted.
+func verificationContentDigest(raw []byte) (textproto.MIMEHeader, [sha256.Size]byte, bool) {
+	return messageContentDigestWithSignatureRequirement(raw, true)
+}
+
+func messageContentDigestWithSignatureRequirement(raw []byte, requireSignature bool) (textproto.MIMEHeader, [sha256.Size]byte, bool) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
 	header, err := textproto.NewReader(reader).ReadMIMEHeader()
 	if err != nil {
+		return nil, [sha256.Size]byte{}, false
+	}
+	if requireSignature && len(header.Values(HeaderSignature)) == 0 {
 		return nil, [sha256.Size]byte{}, false
 	}
 	digest := sha256.New()

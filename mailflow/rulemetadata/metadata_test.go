@@ -41,6 +41,16 @@ func TestAuthenticatorAcceptsLegacySingleRuleMetadataForAttributionOnly(t *testi
 	}
 }
 
+func TestVerificationContentDigestRequiresRuleSignature(t *testing.T) {
+	raw := []byte("From: sender@example.net\r\nTo: agent@example.org\r\nSubject: ordinary\r\n\r\n" + strings.Repeat("body", 1024))
+	if _, _, ok := verificationContentDigest(raw); ok {
+		t.Fatal("verificationContentDigest accepted an unsigned message")
+	}
+	if _, _, ok := messageContentDigest(raw); !ok {
+		t.Fatal("messageContentDigest rejected unsigned content needed for signing")
+	}
+}
+
 func TestAuthenticatorBindsForwardContentAndRouting(t *testing.T) {
 	authenticator, err := New([]byte(strings.Repeat("k", 32)))
 	if err != nil {

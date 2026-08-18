@@ -87,7 +87,7 @@ func (s *Server) logInvalidAutoReplyChain(ctx context.Context, a authCtx, emailI
 		"account_id", a.acc.ID(), "email_id", emailID)
 }
 
-func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID string, sourceRaw []byte, outgoingMessageID, outgoingRecipient string) (autoreplychain.Metadata, error) {
+func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID string, sourceRaw []byte, outgoingMessageID, outgoingRecipient string, trustedRuleForward bool) (autoreplychain.Metadata, error) {
 	if s.AutoReplyChain == nil {
 		return autoreplychain.Metadata{}, nil
 	}
@@ -96,7 +96,7 @@ func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID s
 		chainContext autoreplychain.Context
 		err          error
 	)
-	if s.isTrustedRuleForward(ctx, a, sourceRaw) {
+	if trustedRuleForward {
 		metadata, chainContext, err = s.AutoReplyChain.NextFromTrustedForward(sourceRaw, outgoingMessageID, a.login, outgoingRecipient, time.Now())
 	} else {
 		metadata, chainContext, err = s.AutoReplyChain.Next(sourceRaw, outgoingMessageID, a.login, outgoingRecipient, time.Now())
