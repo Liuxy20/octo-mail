@@ -17,6 +17,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	"github.com/Mininglamp-OSS/octo-mail/protocol/webapi"
 	"github.com/Mininglamp-OSS/octo-mail/security/gatewayassert"
@@ -65,10 +67,15 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ruleAuthenticator, err := rulemetadata.New([]byte(strings.Repeat("r", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	gatewaySecret := []byte(strings.Repeat("g", 32))
 	server := &webapi.Server{
 		Dir: dir, Submission: &submit.Submitter{Pool: db.Pool, Blob: bs},
-		AutoReplyChain: chain, GatewaySecret: gatewaySecret, MaxAgentMailboxesPerOwnerSpace: 3,
+		AutoReplyChain: chain, RuleMetadata: ruleAuthenticator,
+		GatewaySecret: gatewaySecret, MaxAgentMailboxesPerOwnerSpace: 3,
 	}
 	httpServer := httptest.NewServer(server.Handler())
 	defer httpServer.Close()
@@ -360,6 +367,114 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 		t.Fatalf("external auto-reply created side effects sent %d→%d queue %d→%d drafts %d→%d", sentBefore, sentAfter, queueBefore, queueAfter, draftsBefore, draftsAfter)
 	}
 
+	trustedForwardRaw := signedRuleForwardSource(t, ruleAuthenticator, "support@example.com")
+	trustedForward := &store.Message{}
+	if _, err := target.Deliver(ctx, trustedForward, mem(string(trustedForwardRaw))); err != nil {
+		t.Fatal(err)
+	}
+	trustedForwardID := "E" + strconv.FormatInt(trustedForward.EffectiveEmailID(), 10)
+	status, trustedContext, _ := do(http.MethodGet, "/webapi/v0/messages/"+trustedForwardID+"/auto-reply-context", nil, requestAuth{bearer: agentToken})
+	if status != http.StatusOK || trustedContext["autoReplyCount"] != float64(0) || trustedContext["limitReached"] != false || trustedContext["enabled"] != true {
+		t.Fatalf("trusted forward context = %d %#v", status, trustedContext)
+	}
+	status, trustedReply, _ := do(http.MethodPost, "/webapi/v0/messages/"+trustedForwardID+"/reply", map[string]any{
+		"text": "Reply to the direct forwarding mailbox.",
+	}, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "trusted-forward-reply"})
+	if status != http.StatusAccepted {
+		t.Fatalf("trusted forward automatic reply = %d %#v", status, trustedReply)
+	}
+	status, _, trustedReplyRaw := do(http.MethodGet, "/webapi/v0/messages/"+trustedReply["messageId"].(string)+"/raw", nil, requestAuth{bearer: agentToken})
+	if status != http.StatusOK {
+		t.Fatalf("read trusted forward reply = %d", status)
+	}
+	trustedReplyContext := chain.Verify(trustedReplyRaw, "upstream@example.net", time.Now())
+	if trustedReplyContext.Verification != autoreplychain.VerificationValid || trustedReplyContext.Count != 1 {
+		t.Fatalf("trusted forward reply metadata = %#v", trustedReplyContext)
+	}
+
+	// SMTP may deliver the same signed forwarding message more than once, each
+	// time under a different local Email id. Its signed Message-ID, rather than
+	// the local id or caller-supplied retry key, is the automatic-reply identity.
+	trustedReplay := &store.Message{}
+	if _, err := target.Deliver(ctx, trustedReplay, mem(string(trustedForwardRaw))); err != nil {
+		t.Fatal(err)
+	}
+	trustedReplayID := "E" + strconv.FormatInt(trustedReplay.EffectiveEmailID(), 10)
+	counts(&sentBefore, &queueBefore, &draftsBefore)
+	status, repeatedTrustedReply, _ := do(http.MethodPost, "/webapi/v0/messages/"+trustedReplayID+"/reply", map[string]any{
+		"text": "Reply to the direct forwarding mailbox.",
+	}, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "different-caller-retry-key"})
+	if status != http.StatusAccepted || repeatedTrustedReply["messageId"] != trustedReply["messageId"] {
+		t.Fatalf("replayed trusted forward reply = %d %#v, want existing %#v", status, repeatedTrustedReply, trustedReply)
+	}
+	counts(&sentAfter, &queueAfter, &draftsAfter)
+	if sentAfter != sentBefore || queueAfter != queueBefore || draftsAfter != draftsBefore {
+		t.Fatalf("trusted replay created side effects sent %d→%d queue %d→%d drafts %d→%d", sentBefore, sentAfter, queueBefore, queueAfter, draftsBefore, draftsAfter)
+	}
+	status, trustedConflict, _ := do(http.MethodPost, "/webapi/v0/messages/"+trustedReplayID+"/reply", map[string]any{
+		"text": "A different automatic reply must not be sent twice.",
+	}, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "another-caller-retry-key"})
+	if status != http.StatusConflict || trustedConflict["error"].(map[string]any)["code"] != "idempotency_key_conflict" {
+		t.Fatalf("conflicting trusted replay = %d %#v", status, trustedConflict)
+	}
+
+	// Human-owner replies are not part of automatic-reply deduplication.
+	status, manualTrustedReply, _ := do(http.MethodPost, "/webapi/v0/messages/"+trustedReplayID+"/reply", map[string]any{
+		"text": "A manually confirmed reply remains allowed.",
+	}, requestAuth{gatewaySubject: "octo-owner", spaceID: "space-a", gatewayMailbox: mailboxID})
+	if status != http.StatusAccepted {
+		t.Fatalf("manual trusted replay reply = %d %#v", status, manualTrustedReply)
+	}
+
+	// Owner-review Drafts use the same signed Message-ID identity as accepted
+	// automatic replies. Re-delivery under another local Email id and caller key
+	// must return the existing Draft instead of creating another approval item.
+	server.OutboundPolicy = outboundpolicy.NewKeywordEvaluator([]string{"review this"})
+	reviewTrustedRaw := signedRuleForwardSourceWithMessageID(t, ruleAuthenticator, "support@example.com", "<trusted-review@example.net>")
+	reviewTrusted := &store.Message{}
+	if _, err := target.Deliver(ctx, reviewTrusted, mem(string(reviewTrustedRaw))); err != nil {
+		t.Fatal(err)
+	}
+	reviewTrustedReplay := &store.Message{}
+	if _, err := target.Deliver(ctx, reviewTrustedReplay, mem(string(reviewTrustedRaw))); err != nil {
+		t.Fatal(err)
+	}
+	counts(&sentBefore, &queueBefore, &draftsBefore)
+	reviewBody := map[string]any{"text": "Please review this automatic reply."}
+	status, firstReview, _ := do(http.MethodPost,
+		"/webapi/v0/messages/E"+strconv.FormatInt(reviewTrusted.EffectiveEmailID(), 10)+"/reply",
+		reviewBody, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "trusted-review-first"})
+	if status != http.StatusConflict || firstReview["error"].(map[string]any)["code"] != "outbound_review_required" {
+		t.Fatalf("trusted forward review = %d %#v", status, firstReview)
+	}
+	firstReviewDraftID := firstReview["policy"].(map[string]any)["draftId"]
+	status, repeatedReview, _ := do(http.MethodPost,
+		"/webapi/v0/messages/E"+strconv.FormatInt(reviewTrustedReplay.EffectiveEmailID(), 10)+"/reply",
+		reviewBody, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "trusted-review-replay"})
+	if status != http.StatusConflict || repeatedReview["policy"].(map[string]any)["draftId"] != firstReviewDraftID {
+		t.Fatalf("replayed trusted forward review = %d %#v, want Draft %v", status, repeatedReview, firstReviewDraftID)
+	}
+	counts(&sentAfter, &queueAfter, &draftsAfter)
+	if sentAfter != sentBefore || queueAfter != queueBefore || draftsAfter != draftsBefore+1 {
+		t.Fatalf("trusted review replay side effects sent %d→%d queue %d→%d drafts %d→%d", sentBefore, sentAfter, queueBefore, queueAfter, draftsBefore, draftsAfter)
+	}
+	server.OutboundPolicy = nil
+
+	// Identical visible content with a newly signed Message-ID is a new message
+	// and may independently trigger an automatic reply.
+	secondTrustedRaw := signedRuleForwardSourceWithMessageID(t, ruleAuthenticator, "support@example.com", "<trusted-forward-2@example.net>")
+	secondTrusted := &store.Message{}
+	if _, err := target.Deliver(ctx, secondTrusted, mem(string(secondTrustedRaw))); err != nil {
+		t.Fatal(err)
+	}
+	secondTrustedID := "E" + strconv.FormatInt(secondTrusted.EffectiveEmailID(), 10)
+	status, secondTrustedReply, _ := do(http.MethodPost, "/webapi/v0/messages/"+secondTrustedID+"/reply", map[string]any{
+		"text": "Reply to the direct forwarding mailbox.",
+	}, requestAuth{bearer: agentToken, automation: true, idempotencyKey: "second-trusted-message"})
+	if status != http.StatusAccepted || secondTrustedReply["messageId"] == trustedReply["messageId"] {
+		t.Fatalf("new trusted Message-ID reply = %d %#v", status, secondTrustedReply)
+	}
+
 	forgedRaw := []byte("From: attacker@example.net\r\nTo: support@example.com\r\nSubject: forged\r\nMessage-ID: <forged@example.net>\r\n" +
 		autoreplychain.HeaderTraceID + ": attacker\r\n" + autoreplychain.HeaderCount + ": 4\r\n" +
 		autoreplychain.HeaderSignature + ": v1.invalid\r\n\r\nhello\r\n")
@@ -399,6 +514,41 @@ func TestAgentAutomaticReplyChainStopsBeforeSideEffects(t *testing.T) {
 	if bytes.Contains(unlimitedRaw, []byte(autoreplychain.HeaderTraceID+":")) {
 		t.Fatalf("unlimited automatic reply unexpectedly carried count-chain metadata: %.500q", unlimitedRaw)
 	}
+}
+
+func signedRuleForwardSource(t *testing.T, authenticator *rulemetadata.Authenticator, recipient string) []byte {
+	return signedRuleForwardSourceWithMessageID(t, authenticator, recipient, "<trusted-forward@example.net>")
+}
+
+func signedRuleForwardSourceWithMessageID(t *testing.T, authenticator *rulemetadata.Authenticator, recipient, messageID string) []byte {
+	t.Helper()
+	metadata := rulemetadata.Metadata{
+		OriginalFrom: "customer@example.net", SentBy: "upstream@example.net",
+		RuleID: 77, Hop: 1, RuleTrace: []int64{77},
+		MessageID: messageID, Recipients: []string{recipient},
+		ExpiresAt: rulemetadata.Expiry(time.Now()),
+	}
+	trace, err := rulemetadata.FormatRuleTrace(metadata.RuleTrace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipients, err := rulemetadata.CanonicalRecipients(metadata.Recipients)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte("From: upstream@example.net\r\nTo: " + recipient + "\r\nSubject: forwarded\r\n" +
+		"Message-ID: " + metadata.MessageID + "\r\nAuto-Submitted: auto-generated\r\n" +
+		rulemetadata.HeaderOriginalFrom + ": " + metadata.OriginalFrom + "\r\n" +
+		rulemetadata.HeaderSentBy + ": " + metadata.SentBy + "\r\n" +
+		rulemetadata.HeaderRuleID + ": 77\r\n" + rulemetadata.HeaderRuleHop + ": 1\r\n" +
+		rulemetadata.HeaderRuleTrace + ": " + trace + "\r\n" +
+		rulemetadata.HeaderRecipients + ": " + recipients + "\r\n" +
+		rulemetadata.HeaderExpires + ": " + strconv.FormatInt(metadata.ExpiresAt, 10) + "\r\n\r\nforwarded body\r\n")
+	signature, err := authenticator.Sign(metadata, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []byte(strings.Replace(string(raw), "\r\n\r\n", "\r\n"+rulemetadata.HeaderSignature+": "+signature+"\r\n\r\n", 1))
 }
 
 func signedAutomaticReplySource(t *testing.T, chain *autoreplychain.Chain, count int) []byte {

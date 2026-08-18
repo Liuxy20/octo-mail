@@ -9,8 +9,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/textproto"
 	"sort"
 	"strconv"
@@ -23,16 +25,18 @@ const (
 	HeaderSentBy       = "X-Octo-Sent-By"
 	HeaderRuleID       = "X-Octo-Rule-ID"
 	HeaderRuleHop      = "X-Octo-Rule-Hop"
+	HeaderRuleTrace    = "X-Octo-Rule-Trace"
 	HeaderRecipients   = "X-Octo-Rule-Recipients"
 	HeaderExpires      = "X-Octo-Rule-Expires"
 	HeaderSignature    = "X-Octo-Rule-Signature"
 
-	signatureVersion  = "v2"
-	minKeyBytes       = 32
-	maxAddressBytes   = 320
-	maxHop            = 1_000_000
-	signatureValidity = 24 * time.Hour
-	clockSkew         = 5 * time.Minute
+	signatureVersion       = "v3"
+	legacySignatureVersion = "v2"
+	minKeyBytes            = 32
+	maxAddressBytes        = 320
+	maxHop                 = 1_000_000
+	signatureValidity      = 24 * time.Hour
+	clockSkew              = 5 * time.Minute
 )
 
 // Metadata is the complete server-owned rule-forwarding tuple. MessageID binds
@@ -42,9 +46,14 @@ type Metadata struct {
 	SentBy       string
 	RuleID       int64
 	Hop          int
+	RuleTrace    []int64
 	MessageID    string
 	Recipients   []string
 	ExpiresAt    int64
+	// ChainTrusted is set only after a content-bound v3 signature verifies.
+	// Legacy v2 metadata remains readable for attribution, but cannot grant
+	// permission to continue an automatic-reply or forwarding chain.
+	ChainTrusted bool
 }
 
 // Authenticator signs and verifies metadata with a deployment-wide key.
@@ -59,25 +68,40 @@ func New(key []byte) (*Authenticator, error) {
 	return &Authenticator{key: bytes.Clone(key)}, nil
 }
 
-func (a *Authenticator) Sign(metadata Metadata) (string, error) {
+func (a *Authenticator) Sign(metadata Metadata, raw []byte) (string, error) {
 	metadata, err := canonicalMetadata(metadata)
 	if err != nil {
 		return "", err
 	}
-	return signatureVersion + "." + base64.RawURLEncoding.EncodeToString(a.mac(metadata)), nil
+	header, contentDigest, ok := messageContentDigest(raw)
+	if !ok {
+		return "", errors.New("invalid forwarded message content")
+	}
+	messageID, ok := singleHeader(header, "Message-ID")
+	if !ok || messageID != metadata.MessageID {
+		return "", errors.New("forwarded message id does not match rule metadata")
+	}
+	return signatureVersion + "." + base64.RawURLEncoding.EncodeToString(a.mac(metadata, signatureVersion, contentDigest)), nil
 }
 
 // Verify checks a raw RFC 5322 message. Missing, partial, duplicated, malformed,
 // or tampered metadata is rejected as one unit.
 func (a *Authenticator) Verify(raw []byte, expectedRecipient string, now time.Time) (Metadata, bool) {
-	header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
-	if err != nil {
-		return Metadata{}, false
-	}
-	return a.VerifyHeader(header, expectedRecipient, now)
+	return a.VerifyAny(raw, []string{expectedRecipient}, now)
 }
 
-func (a *Authenticator) VerifyHeader(header textproto.MIMEHeader, expectedRecipient string, now time.Time) (Metadata, bool) {
+// VerifyAny accepts metadata only when at least one account address is included
+// in the signed recipient set. This lets aliases retain trust without widening
+// it beyond addresses that actually belong to the receiving account.
+func (a *Authenticator) VerifyAny(raw []byte, expectedRecipients []string, now time.Time) (Metadata, bool) {
+	header, contentDigest, ok := verificationContentDigest(raw)
+	if !ok {
+		return Metadata{}, false
+	}
+	return a.verifyHeader(header, expectedRecipients, now, contentDigest)
+}
+
+func (a *Authenticator) verifyHeader(header textproto.MIMEHeader, expectedRecipients []string, now time.Time, contentDigest [sha256.Size]byte) (Metadata, bool) {
 	originalFrom, ok := singleHeader(header, HeaderOriginalFrom)
 	if !ok {
 		return Metadata{}, false
@@ -122,39 +146,123 @@ func (a *Authenticator) VerifyHeader(header textproto.MIMEHeader, expectedRecipi
 	if err != nil || expiresAt <= now.Unix() || expiresAt > now.Add(signatureValidity+clockSkew).Unix() {
 		return Metadata{}, false
 	}
-	metadata, err := canonicalMetadata(Metadata{
+	version, signature, ok := decodeSignature(signatureText)
+	if !ok {
+		return Metadata{}, false
+	}
+	traceText := ""
+	if version == signatureVersion {
+		var traceOK bool
+		traceText, traceOK = singleHeader(header, HeaderRuleTrace)
+		if !traceOK {
+			return Metadata{}, false
+		}
+	}
+	metadata := Metadata{
 		OriginalFrom: originalFrom,
 		SentBy:       sentBy,
 		RuleID:       ruleID,
 		Hop:          hop,
 		MessageID:    messageID,
-		Recipients:   strings.Split(recipientsText, ","),
 		ExpiresAt:    expiresAt,
-	})
+	}
+	metadata, err = canonicalScalarMetadata(metadata)
 	if err != nil {
 		return Metadata{}, false
 	}
-	expectedRecipient = canonicalAddress(expectedRecipient)
-	if expectedRecipient == "" || !containsRecipient(metadata.Recipients, expectedRecipient) {
+	// Authenticate the bounded scalar fields plus the raw trace and recipient
+	// lists before splitting either attacker-controlled list. Server-generated
+	// messages always use the same canonical strings when signing.
+	if !hmac.Equal(signature, a.macFields(metadata, version, traceText, recipientsText, contentDigest)) {
 		return Metadata{}, false
 	}
-	signature, ok := decodeSignature(signatureText)
-	if !ok || !hmac.Equal(signature, a.mac(metadata)) {
+	metadata.Recipients = strings.Split(recipientsText, ",")
+	metadata, err = canonicalBaseMetadata(metadata)
+	if err != nil {
 		return Metadata{}, false
 	}
+	if !containsAnyRecipient(metadata.Recipients, expectedRecipients) {
+		return Metadata{}, false
+	}
+	if version == signatureVersion {
+		metadata.RuleTrace, err = parseRuleTrace(traceText)
+		if err != nil {
+			return Metadata{}, false
+		}
+		metadata, err = canonicalMetadata(metadata)
+		if err != nil {
+			return Metadata{}, false
+		}
+	} else {
+		// v2 remains verifiable for attribution only. It did not authenticate
+		// content, so it must not authorize continuation of a rule chain.
+		metadata.RuleTrace = []int64{ruleID}
+	}
+	metadata.ChainTrusted = version == signatureVersion
 	return metadata, true
 }
 
-func (a *Authenticator) mac(metadata Metadata) []byte {
+func (a *Authenticator) mac(metadata Metadata, version string, contentDigest [sha256.Size]byte) []byte {
+	traceText := ""
+	if version == signatureVersion {
+		traceText = formatRuleTrace(metadata.RuleTrace)
+	}
+	return a.macFields(metadata, version, traceText, strings.Join(metadata.Recipients, ","), contentDigest)
+}
+
+func (a *Authenticator) macFields(metadata Metadata, version, traceText, recipientsText string, contentDigest [sha256.Size]byte) []byte {
 	mac := hmac.New(sha256.New, a.key)
-	fmt.Fprintf(mac, "%s\n%s\n%s\n%d\n%d\n%s",
-		signatureVersion, metadata.OriginalFrom, metadata.SentBy,
+	_, _ = fmt.Fprintf(mac, "%s\n%s\n%s\n%d\n%d\n%s",
+		version, metadata.OriginalFrom, metadata.SentBy,
 		metadata.RuleID, metadata.Hop, metadata.MessageID)
-	fmt.Fprintf(mac, "\n%s\n%d", strings.Join(metadata.Recipients, ","), metadata.ExpiresAt)
+	if version == signatureVersion {
+		_, _ = fmt.Fprintf(mac, "\n%s", traceText)
+		_, _ = mac.Write(contentDigest[:])
+	}
+	_, _ = fmt.Fprintf(mac, "\n%s\n%d", recipientsText, metadata.ExpiresAt)
 	return mac.Sum(nil)
 }
 
 func canonicalMetadata(metadata Metadata) (Metadata, error) {
+	metadata.ChainTrusted = false
+	metadata, err := canonicalBaseMetadata(metadata)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if len(metadata.RuleTrace) == 0 || len(metadata.RuleTrace) > maxHop || metadata.Hop != len(metadata.RuleTrace) {
+		return Metadata{}, errors.New("invalid rule trace length")
+	}
+	seenRules := make(map[int64]struct{}, len(metadata.RuleTrace))
+	for _, ruleID := range metadata.RuleTrace {
+		if ruleID <= 0 {
+			return Metadata{}, errors.New("invalid rule trace identity")
+		}
+		if _, exists := seenRules[ruleID]; exists {
+			return Metadata{}, errors.New("duplicate rule trace identity")
+		}
+		seenRules[ruleID] = struct{}{}
+	}
+	if metadata.RuleTrace[len(metadata.RuleTrace)-1] != metadata.RuleID {
+		return Metadata{}, errors.New("rule trace does not end with signing rule")
+	}
+	return metadata, nil
+}
+
+func canonicalBaseMetadata(metadata Metadata) (Metadata, error) {
+	metadata, err := canonicalScalarMetadata(metadata)
+	if err != nil {
+		return Metadata{}, err
+	}
+	canonicalRecipients, err := canonicalizeRecipients(metadata.Recipients)
+	if err != nil {
+		return Metadata{}, err
+	}
+	metadata.Recipients = canonicalRecipients
+	return metadata, nil
+}
+
+func canonicalScalarMetadata(metadata Metadata) (Metadata, error) {
+	metadata.ChainTrusted = false
 	metadata.OriginalFrom = strings.TrimSpace(metadata.OriginalFrom)
 	metadata.SentBy = strings.TrimSpace(metadata.SentBy)
 	metadata.MessageID = strings.TrimSpace(metadata.MessageID)
@@ -172,11 +280,6 @@ func canonicalMetadata(metadata Metadata) (Metadata, error) {
 	if metadata.ExpiresAt <= 0 {
 		return Metadata{}, errors.New("invalid rule metadata expiry")
 	}
-	canonicalRecipients, err := canonicalizeRecipients(metadata.Recipients)
-	if err != nil {
-		return Metadata{}, err
-	}
-	metadata.Recipients = canonicalRecipients
 	return metadata, nil
 }
 
@@ -210,6 +313,128 @@ func CanonicalRecipients(recipients []string) (string, error) {
 	return strings.Join(canonical, ","), nil
 }
 
+func FormatRuleTrace(trace []int64) (string, error) {
+	if len(trace) == 0 || len(trace) > maxHop {
+		return "", errors.New("invalid rule trace length")
+	}
+	seen := make(map[int64]struct{}, len(trace))
+	for _, ruleID := range trace {
+		if ruleID <= 0 {
+			return "", errors.New("invalid rule trace identity")
+		}
+		if _, exists := seen[ruleID]; exists {
+			return "", errors.New("duplicate rule trace identity")
+		}
+		seen[ruleID] = struct{}{}
+	}
+	return formatRuleTrace(trace), nil
+}
+
+func formatRuleTrace(trace []int64) string {
+	values := make([]string, len(trace))
+	for i, ruleID := range trace {
+		values[i] = strconv.FormatInt(ruleID, 10)
+	}
+	return strings.Join(values, ",")
+}
+
+func parseRuleTrace(value string) ([]int64, error) {
+	if value == "" {
+		return nil, errors.New("empty rule trace")
+	}
+	// Count separators before allocating any trace-sized data. The count is
+	// bounded by the same existing metadata limit; parsing below remains
+	// incremental and never materializes a strings.Split result.
+	if strings.Count(value, ",") >= maxHop {
+		return nil, errors.New("rule trace exceeds limit")
+	}
+	trace := make([]int64, 0, 8)
+	seen := make(map[int64]struct{})
+	for {
+		if len(trace) >= maxHop {
+			return nil, errors.New("rule trace exceeds limit")
+		}
+		part := value
+		if separator := strings.IndexByte(value, ','); separator >= 0 {
+			part = value[:separator]
+			value = value[separator+1:]
+			if value == "" {
+				return nil, errors.New("invalid rule trace identity")
+			}
+		} else {
+			value = ""
+		}
+		ruleID, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || ruleID <= 0 {
+			return nil, errors.New("invalid rule trace identity")
+		}
+		if _, exists := seen[ruleID]; exists {
+			return nil, errors.New("duplicate rule trace identity")
+		}
+		seen[ruleID] = struct{}{}
+		trace = append(trace, ruleID)
+		if value == "" {
+			break
+		}
+	}
+	return trace, nil
+}
+
+var contentBoundHeaders = []string{
+	"From", "Reply-To", "To", "Cc", "Bcc", "Subject", "Date",
+	"Auto-Submitted", "MIME-Version", "Content-Type",
+	"Content-Transfer-Encoding", "Content-Disposition", "In-Reply-To", "References",
+}
+
+// messageContentDigest binds the fields that control reply routing, rule
+// matching, MIME interpretation, and the complete MIME body. Transport-added
+// headers such as Received and DKIM-Signature are deliberately excluded.
+func messageContentDigest(raw []byte) (textproto.MIMEHeader, [sha256.Size]byte, bool) {
+	return messageContentDigestWithSignatureRequirement(raw, false)
+}
+
+// verificationContentDigest avoids hashing ordinary messages that carry no
+// rule signature. Signed messages still bind the full selected header set and
+// MIME body before any chain trust is granted.
+func verificationContentDigest(raw []byte) (textproto.MIMEHeader, [sha256.Size]byte, bool) {
+	return messageContentDigestWithSignatureRequirement(raw, true)
+}
+
+func messageContentDigestWithSignatureRequirement(raw []byte, requireSignature bool) (textproto.MIMEHeader, [sha256.Size]byte, bool) {
+	reader := bufio.NewReader(bytes.NewReader(raw))
+	header, err := textproto.NewReader(reader).ReadMIMEHeader()
+	if err != nil {
+		return nil, [sha256.Size]byte{}, false
+	}
+	if requireSignature && len(header.Values(HeaderSignature)) == 0 {
+		return nil, [sha256.Size]byte{}, false
+	}
+	digest := sha256.New()
+	for _, name := range contentBoundHeaders {
+		writeDigestValue(digest, name)
+		values := header.Values(name)
+		var count [8]byte
+		binary.BigEndian.PutUint64(count[:], uint64(len(values)))
+		_, _ = digest.Write(count[:])
+		for _, value := range values {
+			writeDigestValue(digest, strings.TrimSpace(value))
+		}
+	}
+	if _, err := io.Copy(digest, reader); err != nil {
+		return nil, [sha256.Size]byte{}, false
+	}
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return header, result, true
+}
+
+func writeDigestValue(w io.Writer, value string) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = w.Write(size[:])
+	_, _ = io.WriteString(w, value)
+}
+
 func canonicalAddress(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" || len(value) > maxAddressBytes || !strings.Contains(value, "@") || strings.ContainsAny(value, "\r\n\t ,") {
@@ -218,10 +443,16 @@ func canonicalAddress(value string) string {
 	return value
 }
 
-func containsRecipient(recipients []string, expected string) bool {
-	for _, recipient := range recipients {
-		if recipient == expected {
-			return true
+func containsAnyRecipient(recipients, expectedRecipients []string) bool {
+	for _, expected := range expectedRecipients {
+		expected = canonicalAddress(expected)
+		if expected == "" {
+			continue
+		}
+		for _, recipient := range recipients {
+			if recipient == expected {
+				return true
+			}
 		}
 	}
 	return false
@@ -236,13 +467,16 @@ func singleHeader(header textproto.MIMEHeader, name string) (string, bool) {
 	return value, value != ""
 }
 
-func decodeSignature(value string) ([]byte, bool) {
-	prefix := signatureVersion + "."
-	if !strings.HasPrefix(value, prefix) {
-		return nil, false
+func decodeSignature(value string) (string, []byte, bool) {
+	for _, version := range []string{signatureVersion, legacySignatureVersion} {
+		prefix := version + "."
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, prefix))
+		return version, raw, err == nil && len(raw) == sha256.Size
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, prefix))
-	return raw, err == nil && len(raw) == sha256.Size
+	return "", nil, false
 }
 
 func validMessageID(value string) bool {

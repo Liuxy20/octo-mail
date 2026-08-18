@@ -148,8 +148,20 @@ func (c *Chain) Verify(raw []byte, expectedRecipient string, now time.Time) Cont
 // inherits an attacker-controlled count. External automated messages are
 // rejected so they cannot reset an automatic-reply loop.
 func (c *Chain) Next(sourceRaw []byte, outgoingMessageID, currentRecipient, outgoingRecipient string, now time.Time) (Metadata, Context, error) {
+	return c.next(sourceRaw, outgoingMessageID, currentRecipient, outgoingRecipient, now, false)
+}
+
+// NextFromTrustedForward starts or continues an automatic-reply chain for a
+// forwarding-rule message whose separate rulemetadata signature has already
+// been verified by the caller. Ordinary untrusted automated mail must continue
+// to use Next so it cannot reset an automatic-reply loop.
+func (c *Chain) NextFromTrustedForward(sourceRaw []byte, outgoingMessageID, currentRecipient, outgoingRecipient string, now time.Time) (Metadata, Context, error) {
+	return c.next(sourceRaw, outgoingMessageID, currentRecipient, outgoingRecipient, now, true)
+}
+
+func (c *Chain) next(sourceRaw []byte, outgoingMessageID, currentRecipient, outgoingRecipient string, now time.Time, trustedForward bool) (Metadata, Context, error) {
 	context := c.Verify(sourceRaw, currentRecipient, now)
-	if c.BlocksAutomaticReply(context) {
+	if c.BlocksAutomaticReply(context) && !trustedForward {
 		return Metadata{}, context, ErrExternalAutomatedReply
 	}
 	if context.Verification == VerificationValid && context.Count >= c.maxCount {

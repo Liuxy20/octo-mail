@@ -20,10 +20,13 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/text/cases"
 
 	moxmessage "github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/smtp"
@@ -31,7 +34,6 @@ import (
 
 const (
 	defaultMaxForwardMessageSize = 64 << 20
-	maxRuleHop                   = 3
 	executionFinishTimeout       = 5 * time.Second
 )
 
@@ -59,21 +61,33 @@ func (p *Processor) maxMessageSize() int64 {
 
 type rule struct {
 	id             int64
+	matchMode      string
+	conditions     []directory.MailRuleCondition
 	matchFrom      string
 	matchSubject   string
 	forwardTargets []string
 }
 
 type parsedMessage struct {
-	from         smtp.Address
-	fromName     string
-	subject      string
-	bodyText     string
-	bodyHTML     string
-	attachments  []forwardAttachment
-	hop          int
-	sourceRuleID int64
-	automated    bool
+	from             smtp.Address
+	fromName         string
+	recipients       []string
+	subject          string
+	bodyText         string
+	bodyHTML         string
+	foldedFrom       string
+	foldedRecipients []string
+	foldedSubject    string
+	foldedBodyText   string
+	foldedBodyHTML   string
+	matchValuesReady bool
+	attachments      []forwardAttachment
+	hop              int
+	ruleTrace        []int64
+	originalFrom     string
+	trustedMessageID string
+	trustedRule      bool
+	automated        bool
 }
 
 type forwardAttachment struct {
@@ -99,11 +113,11 @@ func (p *Processor) Process(ctx context.Context, accountID, sourceEmailID int64,
 	if accountID <= 0 || sourceEmailID <= 0 || len(raw) == 0 || int64(len(raw)) > maxMessageSize {
 		return errors.New("invalid mail rule input")
 	}
-	tenantID, sender, rules, err := p.loadContext(ctx, accountID)
+	tenantID, sender, accountAddresses, rules, err := p.loadContext(ctx, accountID)
 	if err != nil {
 		return err
 	}
-	parsed, err := parseMessageWithLimit(raw, maxMessageSize, p.RuleMetadata, sender, time.Now())
+	parsed, err := parseMessageWithLimit(raw, maxMessageSize, p.RuleMetadata, accountAddresses, time.Now())
 	if err != nil {
 		return fmt.Errorf("parse stored message: %w", err)
 	}
@@ -117,7 +131,7 @@ func (p *Processor) Process(ctx context.Context, accountID, sourceEmailID int64,
 		if blockedCode != "" {
 			status = "loop_blocked"
 		}
-		executionID, reserved, err := p.reserveExecution(ctx, accountID, candidate.id, sourceEmailID, status, parsed.hop, blockedCode)
+		executionID, reserved, err := p.reserveExecution(ctx, accountID, candidate.id, sourceEmailID, parsed.trustedMessageID, status, parsed.hop, blockedCode)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -173,7 +187,7 @@ func (p *Processor) finishFailedExecution(ctx context.Context, accountID, execut
 	return p.finishExecution(cleanupCtx, accountID, executionID, "failed", nil, errorCode)
 }
 
-func (p *Processor) loadContext(ctx context.Context, accountID int64) (int64, string, []rule, error) {
+func (p *Processor) loadContext(ctx context.Context, accountID int64) (int64, string, []string, []rule, error) {
 	var tenantID int64
 	var sender string
 	err := p.Pool.QueryRow(ctx,
@@ -183,35 +197,70 @@ func (p *Processor) loadContext(ctx context.Context, accountID int64) (int64, st
 		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
 		 WHERE acc.id=$1 AND NOT acc.disabled`, accountID).Scan(&tenantID, &sender)
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("resolve rule mailbox: %w", err)
+		return 0, "", nil, nil, fmt.Errorf("resolve rule mailbox: %w", err)
 	}
+	addressRows, err := p.Pool.Query(ctx,
+		`SELECT addr.localpart || '@' || dom.domain
+		 FROM addresses addr
+		 JOIN accounts acc ON acc.id=addr.account_id AND acc.tenant_id=addr.tenant_id
+		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
+		 WHERE acc.id=$1 AND NOT acc.disabled ORDER BY addr.id`, accountID)
+	if err != nil {
+		return 0, "", nil, nil, fmt.Errorf("load rule mailbox addresses: %w", err)
+	}
+	var accountAddresses []string
+	for addressRows.Next() {
+		var address string
+		if err := addressRows.Scan(&address); err != nil {
+			addressRows.Close()
+			return 0, "", nil, nil, fmt.Errorf("scan rule mailbox address: %w", err)
+		}
+		accountAddresses = append(accountAddresses, address)
+	}
+	if err := addressRows.Err(); err != nil {
+		addressRows.Close()
+		return 0, "", nil, nil, fmt.Errorf("load rule mailbox addresses: %w", err)
+	}
+	addressRows.Close()
 	rows, err := p.Pool.Query(ctx,
-		`SELECT id,match_from,match_subject,forward_targets
+		`SELECT id,match_mode,conditions,match_from,match_subject,forward_targets
 		 FROM mail_rules WHERE account_id=$1 AND enabled ORDER BY priority DESC,id`, accountID)
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("load mail rules: %w", err)
+		return 0, "", nil, nil, fmt.Errorf("load mail rules: %w", err)
 	}
 	defer rows.Close()
 	var rules []rule
 	for rows.Next() {
 		var candidate rule
-		if err := rows.Scan(&candidate.id, &candidate.matchFrom, &candidate.matchSubject, &candidate.forwardTargets); err != nil {
-			return 0, "", nil, fmt.Errorf("scan mail rule: %w", err)
+		var conditions []byte
+		if err := rows.Scan(&candidate.id, &candidate.matchMode, &conditions, &candidate.matchFrom, &candidate.matchSubject, &candidate.forwardTargets); err != nil {
+			return 0, "", nil, nil, fmt.Errorf("scan mail rule: %w", err)
+		}
+		if err := json.Unmarshal(conditions, &candidate.conditions); err != nil {
+			return 0, "", nil, nil, fmt.Errorf("decode mail rule conditions: %w", err)
+		}
+		if len(candidate.conditions) == 0 {
+			if candidate.matchFrom != "" {
+				candidate.conditions = append(candidate.conditions, directory.MailRuleCondition{Field: "from", Operator: "equals", Value: candidate.matchFrom})
+			}
+			if candidate.matchSubject != "" {
+				candidate.conditions = append(candidate.conditions, directory.MailRuleCondition{Field: "subject", Operator: "contains", Value: candidate.matchSubject})
+			}
 		}
 		rules = append(rules, candidate)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, "", nil, fmt.Errorf("load mail rules: %w", err)
+		return 0, "", nil, nil, fmt.Errorf("load mail rules: %w", err)
 	}
-	return tenantID, sender, rules, nil
+	return tenantID, sender, accountAddresses, rules, nil
 }
 
-func (p *Processor) reserveExecution(ctx context.Context, accountID, ruleID, sourceEmailID int64, status string, hop int, errorCode string) (int64, bool, error) {
+func (p *Processor) reserveExecution(ctx context.Context, accountID, ruleID, sourceEmailID int64, sourceMessageID, status string, hop int, errorCode string) (int64, bool, error) {
 	var id int64
 	err := p.Pool.QueryRow(ctx,
 		`INSERT INTO mail_rule_executions
-		 (account_id,rule_id,source_email_id,status,hop_count,error_code,completed_at)
-		 SELECT $1,$2,$3,$4,$5,$6,CASE WHEN $4='loop_blocked' THEN now() ELSE NULL END
+		 (account_id,rule_id,source_email_id,source_message_id,status,hop_count,error_code,completed_at)
+		 SELECT $1,$2,$3,$4,$5,$6,$7,CASE WHEN $5='loop_blocked' THEN now() ELSE NULL END
 		 FROM mail_rules WHERE account_id=$1 AND id=$2 AND enabled
 		 ON CONFLICT (account_id,rule_id,source_email_id) DO UPDATE
 		 SET status=EXCLUDED.status,target_results='[]'::jsonb,
@@ -220,14 +269,28 @@ func (p *Processor) reserveExecution(ctx context.Context, accountID, ruleID, sou
 		 WHERE EXCLUDED.status='matched'
 		   AND mail_rule_executions.status='failed'
 		   AND mail_rule_executions.error_code='submit_failed'
-		 RETURNING id`, accountID, ruleID, sourceEmailID, status, hop, errorCode).Scan(&id)
+		 RETURNING id`, accountID, ruleID, sourceEmailID, sourceMessageID, status, hop, errorCode).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	var pgErr *pgconn.PgError
+	if sourceMessageID != "" && errors.As(err, &pgErr) && pgErr.Code == "23505" && isTrustedMessageReplayConstraint(pgErr.ConstraintName) {
 		return 0, false, nil
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("reserve mail rule execution: %w", err)
 	}
 	return id, true, nil
+}
+
+func isTrustedMessageReplayConstraint(name string) bool {
+	if name == "mail_rule_executions_trusted_message_once" {
+		return true
+	}
+	// PostgreSQL creates one inherited index per hash partition and truncates
+	// its generated name to 63 bytes.
+	return strings.HasPrefix(name, "mail_rule_executions_p") &&
+		strings.HasSuffix(name, "_account_id_rule_id_source_message_i_idx")
 }
 
 func (p *Processor) finishExecution(ctx context.Context, accountID, executionID int64, status string, results []targetResult, errorCode string) error {
@@ -253,10 +316,10 @@ func (p *Processor) finishExecution(ctx context.Context, accountID, executionID 
 }
 
 func parseMessage(raw []byte) (parsedMessage, error) {
-	return parseMessageWithLimit(raw, defaultMaxForwardMessageSize, nil, "", time.Time{})
+	return parseMessageWithLimit(raw, defaultMaxForwardMessageSize, nil, nil, time.Time{})
 }
 
-func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rulemetadata.Authenticator, expectedRecipient string, now time.Time) (parsedMessage, error) {
+func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rulemetadata.Authenticator, expectedRecipients []string, now time.Time) (parsedMessage, error) {
 	reader := bytes.NewReader(raw)
 	part, err := moxmessage.Parse(nil, false, reader)
 	if err != nil {
@@ -277,8 +340,13 @@ func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rule
 		from: from, subject: envelope.Subject,
 		bodyText: text, bodyHTML: html, attachments: attachments,
 	}
-	if part.Envelope != nil && len(part.Envelope.From) > 0 {
-		parsed.fromName = strings.TrimSpace(part.Envelope.From[0].Name)
+	if part.Envelope != nil {
+		if len(part.Envelope.From) > 0 {
+			parsed.fromName = strings.TrimSpace(part.Envelope.From[0].Name)
+		}
+		parsed.recipients = appendEnvelopeAddresses(parsed.recipients, part.Envelope.To)
+		parsed.recipients = appendEnvelopeAddresses(parsed.recipients, part.Envelope.CC)
+		parsed.recipients = appendEnvelopeAddresses(parsed.recipients, part.Envelope.BCC)
 	}
 	for _, value := range header.Values("Auto-Submitted") {
 		value = strings.TrimSpace(value)
@@ -287,11 +355,15 @@ func parseMessageWithLimit(raw []byte, maxMessageSize int64, authenticator *rule
 		}
 	}
 	if authenticator != nil {
-		if metadata, ok := authenticator.VerifyHeader(header, expectedRecipient, now); ok {
+		if metadata, ok := authenticator.VerifyAny(raw, expectedRecipients, now); ok && metadata.ChainTrusted {
 			parsed.hop = metadata.Hop
-			parsed.sourceRuleID = metadata.RuleID
+			parsed.ruleTrace = append([]int64(nil), metadata.RuleTrace...)
+			parsed.originalFrom = metadata.OriginalFrom
+			parsed.trustedMessageID = metadata.MessageID
+			parsed.trustedRule = true
 		}
 	}
+	parsed.prepareMatchValues()
 	return parsed, nil
 }
 
@@ -378,45 +450,133 @@ func forwardContentType(part *moxmessage.Part) string {
 }
 
 func (r rule) matches(message parsedMessage) bool {
-	if r.matchFrom != "" {
-		configured, err := smtp.ParseAddress(r.matchFrom)
-		if err != nil || configured.Localpart.String() != message.from.Localpart.String() ||
-			!strings.EqualFold(configured.Domain.ASCII, message.from.Domain.ASCII) {
+	message.prepareMatchValues()
+	conditions := r.conditions
+	if len(conditions) == 0 {
+		if r.matchFrom != "" {
+			conditions = append(conditions, directory.MailRuleCondition{Field: "from", Operator: "equals", Value: r.matchFrom})
+		}
+		if r.matchSubject != "" {
+			conditions = append(conditions, directory.MailRuleCondition{Field: "subject", Operator: "contains", Value: r.matchSubject})
+		}
+	}
+	if len(conditions) == 0 {
+		return false
+	}
+	matched := r.matchMode != "any"
+	for _, condition := range conditions {
+		conditionMatched := mailRuleConditionMatchesPrepared(condition, message)
+		if r.matchMode == "any" && conditionMatched {
+			return true
+		}
+		if r.matchMode != "any" && !conditionMatched {
 			return false
 		}
 	}
-	if r.matchSubject != "" && !containsFold(message.subject, r.matchSubject) {
-		return false
-	}
-	return true
+	return matched
 }
 
-func containsFold(value, substring string) bool {
-	if substring == "" {
-		return true
-	}
-	valueRunes := []rune(value)
-	substringRunes := []rune(substring)
-	if len(substringRunes) > len(valueRunes) {
+func mailRuleConditionMatches(condition directory.MailRuleCondition, message parsedMessage) bool {
+	message.prepareMatchValues()
+	return mailRuleConditionMatchesPrepared(condition, message)
+}
+
+func mailRuleConditionMatchesPrepared(condition directory.MailRuleCondition, message parsedMessage) bool {
+	switch condition.Operator {
+	case "contains", "not_contains", "equals":
+	default:
 		return false
 	}
-	for start := 0; start+len(substringRunes) <= len(valueRunes); start++ {
-		if strings.EqualFold(string(valueRunes[start:start+len(substringRunes)]), substring) {
+	var values, foldedValues []string
+	switch condition.Field {
+	case "from":
+		values = []string{message.from.String()}
+		foldedValues = []string{message.foldedFrom}
+	case "to":
+		values = message.recipients
+		foldedValues = message.foldedRecipients
+	case "subject":
+		values = []string{message.subject}
+		foldedValues = []string{message.foldedSubject}
+	case "body":
+		values = []string{message.bodyText, message.bodyHTML}
+		foldedValues = []string{message.foldedBodyText, message.foldedBodyHTML}
+	case "subject_or_body":
+		values = []string{message.subject, message.bodyText, message.bodyHTML}
+		foldedValues = []string{message.foldedSubject, message.foldedBodyText, message.foldedBodyHTML}
+	default:
+		return false
+	}
+	contains := false
+	foldedNeedle := cases.Fold().String(condition.Value)
+	for _, value := range foldedValues {
+		if strings.Contains(value, foldedNeedle) {
+			contains = true
+			break
+		}
+	}
+	switch condition.Operator {
+	case "not_contains":
+		return len(values) > 0 && !contains
+	case "contains":
+		return contains
+	case "equals":
+		if condition.Field == "from" {
+			configured, err := smtp.ParseAddress(condition.Value)
+			return err == nil && configured.Localpart.String() == message.from.Localpart.String() &&
+				strings.EqualFold(configured.Domain.ASCII, message.from.Domain.ASCII)
+		}
+		return slicesEqualFold(values, condition.Value)
+	}
+	return false
+}
+
+func slicesEqualFold(values []string, expected string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), expected) {
 			return true
 		}
 	}
 	return false
 }
 
+func appendEnvelopeAddresses(values []string, addresses []moxmessage.Address) []string {
+	for _, address := range addresses {
+		mailbox := strings.TrimSpace(address.User)
+		if address.Host != "" {
+			mailbox += "@" + address.Host
+		}
+		if mailbox != "" {
+			values = append(values, mailbox)
+		}
+	}
+	return values
+}
+
+func (m *parsedMessage) prepareMatchValues() {
+	if m.matchValuesReady {
+		return
+	}
+	folder := cases.Fold()
+	m.foldedFrom = folder.String(m.from.String())
+	m.foldedRecipients = make([]string, len(m.recipients))
+	for i, recipient := range m.recipients {
+		m.foldedRecipients[i] = folder.String(recipient)
+	}
+	m.foldedSubject = folder.String(m.subject)
+	m.foldedBodyText = folder.String(m.bodyText)
+	m.foldedBodyHTML = folder.String(m.bodyHTML)
+	m.matchValuesReady = true
+}
+
 func (r rule) blockedCode(message parsedMessage) string {
-	if message.automated {
+	if message.automated && !message.trustedRule {
 		return "auto_submitted"
 	}
-	if message.hop >= maxRuleHop {
-		return "hop_limit"
-	}
-	if message.sourceRuleID == r.id {
-		return "rule_repeated"
+	for _, ruleID := range message.ruleTrace {
+		if ruleID == r.id {
+			return "rule_repeated"
+		}
 	}
 	return ""
 }
@@ -463,31 +623,39 @@ func composeForwardWithLimit(from string, targets []string, source parsedMessage
 	}
 	composer.Header("Message-ID", messageID)
 	composer.Header("Auto-Submitted", "auto-generated")
+	var metadata *rulemetadata.Metadata
 	if authenticator != nil {
-		metadata := rulemetadata.Metadata{
-			OriginalFrom: source.from.String(),
+		ruleTrace := append(append([]int64(nil), source.ruleTrace...), ruleID)
+		originalFrom := source.from.String()
+		if source.trustedRule && source.originalFrom != "" {
+			originalFrom = source.originalFrom
+		}
+		value := rulemetadata.Metadata{
+			OriginalFrom: originalFrom,
 			SentBy:       fromAddress.String(),
 			RuleID:       ruleID,
-			Hop:          source.hop + 1,
+			Hop:          len(ruleTrace),
+			RuleTrace:    ruleTrace,
 			MessageID:    messageID,
 			Recipients:   targets,
 			ExpiresAt:    rulemetadata.Expiry(time.Now()),
 		}
-		signature, err := authenticator.Sign(metadata)
+		metadata = &value
+		composer.Header(rulemetadata.HeaderOriginalFrom, value.OriginalFrom)
+		composer.Header(rulemetadata.HeaderSentBy, value.SentBy)
+		composer.Header(rulemetadata.HeaderRuleID, strconv.FormatInt(value.RuleID, 10))
+		composer.Header(rulemetadata.HeaderRuleHop, strconv.Itoa(value.Hop))
+		trace, err := rulemetadata.FormatRuleTrace(value.RuleTrace)
 		if err != nil {
-			return nil, fmt.Errorf("sign rule metadata: %w", err)
+			return nil, fmt.Errorf("format rule trace: %w", err)
 		}
-		composer.Header(rulemetadata.HeaderOriginalFrom, metadata.OriginalFrom)
-		composer.Header(rulemetadata.HeaderSentBy, metadata.SentBy)
-		composer.Header(rulemetadata.HeaderRuleID, strconv.FormatInt(metadata.RuleID, 10))
-		composer.Header(rulemetadata.HeaderRuleHop, strconv.Itoa(metadata.Hop))
-		recipients, err := rulemetadata.CanonicalRecipients(metadata.Recipients)
+		composer.Header(rulemetadata.HeaderRuleTrace, trace)
+		recipients, err := rulemetadata.CanonicalRecipients(value.Recipients)
 		if err != nil {
 			return nil, fmt.Errorf("canonicalize rule metadata recipients: %w", err)
 		}
 		composer.Header(rulemetadata.HeaderRecipients, recipients)
-		composer.Header(rulemetadata.HeaderExpires, strconv.FormatInt(metadata.ExpiresAt, 10))
-		composer.Header(rulemetadata.HeaderSignature, signature)
+		composer.Header(rulemetadata.HeaderExpires, strconv.FormatInt(value.ExpiresAt, 10))
 	}
 	composer.Header("MIME-Version", "1.0")
 	composer.Header("Content-Type", mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": multipartWriter.Boundary()}))
@@ -504,7 +672,34 @@ func composeForwardWithLimit(from string, targets []string, source parsedMessage
 		return nil, err
 	}
 	composer.Flush()
-	return buf.Bytes(), nil
+	raw = buf.Bytes()
+	if metadata != nil {
+		signature, err := authenticator.Sign(*metadata, raw)
+		if err != nil {
+			return nil, fmt.Errorf("sign rule metadata: %w", err)
+		}
+		raw, err = insertMessageHeader(raw, rulemetadata.HeaderSignature, signature)
+		if err != nil {
+			return nil, err
+		}
+		if maxMessageSize > 0 && int64(len(raw)) > maxMessageSize {
+			return nil, errors.New("forwarded message exceeds message size limit")
+		}
+	}
+	return raw, nil
+}
+
+func insertMessageHeader(raw []byte, name, value string) ([]byte, error) {
+	separator := bytes.Index(raw, []byte("\r\n\r\n"))
+	if separator < 0 {
+		return nil, errors.New("composed message has no header boundary")
+	}
+	line := []byte(name + ": " + value + "\r\n")
+	result := make([]byte, 0, len(raw)+len(line))
+	result = append(result, raw[:separator+2]...)
+	result = append(result, line...)
+	result = append(result, raw[separator+2:]...)
+	return result, nil
 }
 
 func writeForwardBody(multipartWriter *multipart.Writer, source parsedMessage) error {

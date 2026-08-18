@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS mail_rules (
     name                text NOT NULL,
     enabled             boolean NOT NULL DEFAULT true,
     priority            integer NOT NULL DEFAULT 0,
+    match_mode          text NOT NULL DEFAULT 'all' CHECK (match_mode IN ('all','any')),
+    conditions          jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(conditions) = 'array'),
     match_from          text NOT NULL DEFAULT '',
     match_subject       text NOT NULL DEFAULT '',
     forward_targets     text[] NOT NULL,
@@ -18,9 +20,20 @@ CREATE TABLE IF NOT EXISTS mail_rules (
     updated_at          timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (account_id, id),
     CHECK (length(btrim(name)) BETWEEN 1 AND 100),
-    CHECK (btrim(match_from) <> '' OR btrim(match_subject) <> ''),
+    CHECK (jsonb_array_length(conditions) > 0 OR btrim(match_from) <> '' OR btrim(match_subject) <> ''),
     CHECK (cardinality(forward_targets) BETWEEN 1 AND 5)
 ) PARTITION BY HASH (account_id);
+
+ALTER TABLE mail_rules ADD COLUMN IF NOT EXISTS match_mode text NOT NULL DEFAULT 'all';
+ALTER TABLE mail_rules DROP CONSTRAINT IF EXISTS mail_rules_match_mode_check;
+ALTER TABLE mail_rules ADD CONSTRAINT mail_rules_match_mode_check CHECK (match_mode IN ('all','any'));
+ALTER TABLE mail_rules ADD COLUMN IF NOT EXISTS conditions jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE mail_rules DROP CONSTRAINT IF EXISTS mail_rules_conditions_check;
+ALTER TABLE mail_rules ADD CONSTRAINT mail_rules_conditions_check CHECK (jsonb_typeof(conditions) = 'array');
+ALTER TABLE mail_rules DROP CONSTRAINT IF EXISTS mail_rules_check;
+ALTER TABLE mail_rules ADD CONSTRAINT mail_rules_check CHECK (
+    jsonb_array_length(conditions) > 0 OR btrim(match_from) <> '' OR btrim(match_subject) <> ''
+);
 
 CREATE TABLE IF NOT EXISTS mail_rules_p0 PARTITION OF mail_rules FOR VALUES WITH (MODULUS 4, REMAINDER 0);
 CREATE TABLE IF NOT EXISTS mail_rules_p1 PARTITION OF mail_rules FOR VALUES WITH (MODULUS 4, REMAINDER 1);
@@ -35,10 +48,11 @@ CREATE TABLE IF NOT EXISTS mail_rule_executions (
     id               bigint GENERATED ALWAYS AS IDENTITY,
     rule_id          bigint NOT NULL,
     source_email_id  bigint NOT NULL,
+    source_message_id text NOT NULL DEFAULT '',
     status           text NOT NULL
                      CHECK (status IN ('matched','queued','partially_queued','failed','loop_blocked')),
     target_results   jsonb NOT NULL DEFAULT '[]'::jsonb,
-    hop_count        integer NOT NULL DEFAULT 0 CHECK (hop_count BETWEEN 0 AND 3),
+    hop_count        integer NOT NULL DEFAULT 0 CHECK (hop_count >= 0),
     error_code       text NOT NULL DEFAULT '',
     created_at       timestamptz NOT NULL DEFAULT now(),
     completed_at     timestamptz,
@@ -52,6 +66,30 @@ CREATE TABLE IF NOT EXISTS mail_rule_executions (
 -- that invariant was introduced.
 ALTER TABLE mail_rule_executions
     DROP CONSTRAINT IF EXISTS mail_rule_executions_account_id_rule_id_fkey;
+ALTER TABLE mail_rule_executions
+    ADD COLUMN IF NOT EXISTS source_message_id text NOT NULL DEFAULT '';
+-- Replace the former three-hop check once. Schema files run on every startup,
+-- so do not repeatedly validate the growing partitioned execution table when
+-- the relaxed definition is already installed.
+DO $$
+DECLARE
+    hop_constraint text;
+BEGIN
+    SELECT pg_get_constraintdef(oid)
+      INTO hop_constraint
+      FROM pg_constraint
+     WHERE conrelid = 'mail_rule_executions'::regclass
+       AND conname = 'mail_rule_executions_hop_count_check';
+
+    IF hop_constraint IS NULL OR hop_constraint <> 'CHECK ((hop_count >= 0))' THEN
+        IF hop_constraint IS NOT NULL THEN
+            ALTER TABLE mail_rule_executions
+                DROP CONSTRAINT mail_rule_executions_hop_count_check;
+        END IF;
+        ALTER TABLE mail_rule_executions
+            ADD CONSTRAINT mail_rule_executions_hop_count_check CHECK (hop_count >= 0);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS mail_rule_executions_p0 PARTITION OF mail_rule_executions FOR VALUES WITH (MODULUS 4, REMAINDER 0);
 CREATE TABLE IF NOT EXISTS mail_rule_executions_p1 PARTITION OF mail_rule_executions FOR VALUES WITH (MODULUS 4, REMAINDER 1);
@@ -60,3 +98,9 @@ CREATE TABLE IF NOT EXISTS mail_rule_executions_p3 PARTITION OF mail_rule_execut
 
 CREATE INDEX IF NOT EXISTS mail_rule_executions_recent
     ON mail_rule_executions (account_id, created_at DESC, id DESC);
+
+-- A content-bound trusted forward has a server-generated, signed Message-ID.
+-- Re-delivery must not execute the same rule again under a new storage email id.
+CREATE UNIQUE INDEX IF NOT EXISTS mail_rule_executions_trusted_message_once
+    ON mail_rule_executions (account_id, rule_id, source_message_id)
+    WHERE source_message_id <> '';

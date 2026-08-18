@@ -36,12 +36,28 @@ type outboundPolicyInfo struct {
 	DraftSubject  string                       `json:"draftSubject"`
 }
 
+type outboundPolicyDedupe struct {
+	requestKey     string
+	sourceIdentity string
+}
+
 func (s *Server) enforceAgentOutboundPolicy(
 	ctx context.Context,
 	a authCtx,
 	r *http.Request,
 	intent outboundpolicy.Intent,
 	raw []byte,
+) error {
+	return s.enforceAgentOutboundPolicyWithDedupe(ctx, a, r, intent, raw, outboundPolicyDedupe{})
+}
+
+func (s *Server) enforceAgentOutboundPolicyWithDedupe(
+	ctx context.Context,
+	a authCtx,
+	r *http.Request,
+	intent outboundpolicy.Intent,
+	raw []byte,
+	dedupe outboundPolicyDedupe,
 ) error {
 	if a.agentCredentialID <= 0 || s.OutboundPolicy == nil {
 		return nil
@@ -54,13 +70,19 @@ func (s *Server) enforceAgentOutboundPolicy(
 	case outboundpolicy.OutcomeAllow:
 		return nil
 	case outboundpolicy.OutcomeOwnerReviewRequired:
-		// A model/client value is not authorization. It is only a caller-generated
-		// dedupe token and is salted with the authenticated account below.
+		// A dedupe key is never authorization. Normal requests use the caller key;
+		// trusted redeliveries use their signed server identity. Both are salted
+		// with the authenticated account below.
 		requestKey := strings.TrimSpace(r.Header.Get(outboundIdempotencyHeader))
+		digestIntent := intent
+		if dedupe.requestKey != "" {
+			requestKey = dedupe.requestKey
+			digestIntent.SourceEmailID = dedupe.sourceIdentity
+		}
 		if !validOutboundIdempotencyKey(requestKey) {
 			return errStatus(http.StatusBadRequest, "idempotency_key_required", "an Agent outbound review requires a valid idempotency key")
 		}
-		intentDigest := outboundpolicy.Digest(intent)
+		intentDigest := outboundpolicy.Digest(digestIntent)
 		idempotencyKey := scopedOutboundIdempotencyKey(a.acc.ID(), requestKey)
 		draft, err := saveOutboundPolicyDraft(ctx, a.acc, raw, store.OutboundPolicyDraft{
 			Status:         "pending_confirmation",

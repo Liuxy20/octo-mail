@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/rulemetadata"
 )
 
 type autoReplyContextResponse struct {
@@ -46,7 +47,7 @@ func (s *Server) getAutoReplyContext(ctx context.Context, a authCtx, r *http.Req
 	if chainContext.Verification == autoreplychain.VerificationValid {
 		count = chainContext.Count
 	}
-	blocked := s.AutoReplyChain.BlocksAutomaticReply(chainContext)
+	blocked := s.AutoReplyChain.BlocksAutomaticReply(chainContext) && !s.isTrustedRuleForward(ctx, a, raw)
 	if blocked {
 		count = s.AutoReplyChain.MaxCount()
 		if s.Log != nil {
@@ -86,11 +87,20 @@ func (s *Server) logInvalidAutoReplyChain(ctx context.Context, a authCtx, emailI
 		"account_id", a.acc.ID(), "email_id", emailID)
 }
 
-func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID string, sourceRaw []byte, outgoingMessageID, outgoingRecipient string) (autoreplychain.Metadata, error) {
+func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID string, sourceRaw []byte, outgoingMessageID, outgoingRecipient string, trustedRuleForward bool) (autoreplychain.Metadata, error) {
 	if s.AutoReplyChain == nil {
 		return autoreplychain.Metadata{}, nil
 	}
-	metadata, chainContext, err := s.AutoReplyChain.Next(sourceRaw, outgoingMessageID, a.login, outgoingRecipient, time.Now())
+	var (
+		metadata     autoreplychain.Metadata
+		chainContext autoreplychain.Context
+		err          error
+	)
+	if trustedRuleForward {
+		metadata, chainContext, err = s.AutoReplyChain.NextFromTrustedForward(sourceRaw, outgoingMessageID, a.login, outgoingRecipient, time.Now())
+	} else {
+		metadata, chainContext, err = s.AutoReplyChain.Next(sourceRaw, outgoingMessageID, a.login, outgoingRecipient, time.Now())
+	}
 	s.logInvalidAutoReplyChain(ctx, a, emailID, chainContext)
 	if errors.Is(err, autoreplychain.ErrLimitReached) || errors.Is(err, autoreplychain.ErrExternalAutomatedReply) {
 		if s.Log != nil {
@@ -104,6 +114,33 @@ func (s *Server) nextAutoReplyMetadata(ctx context.Context, a authCtx, emailID s
 		return autoreplychain.Metadata{}, internalErr("auto_reply_chain_failed", err)
 	}
 	return metadata, nil
+}
+
+func (s *Server) isTrustedRuleForward(ctx context.Context, a authCtx, raw []byte) bool {
+	_, ok := s.trustedRuleForwardMetadata(ctx, a, raw)
+	return ok
+}
+
+func (s *Server) trustedRuleForwardMetadata(ctx context.Context, a authCtx, raw []byte) (rulemetadata.Metadata, bool) {
+	if s.RuleMetadata == nil {
+		return rulemetadata.Metadata{}, false
+	}
+	metadata, ok := s.RuleMetadata.VerifyAny(raw, ruleRecipientAddresses(ctx, a), time.Now())
+	return metadata, ok && metadata.ChainTrusted
+}
+
+func ruleRecipientAddresses(ctx context.Context, a authCtx) []string {
+	recipients := []string{a.login}
+	addresses, err := a.scope.AccountAddresses(ctx, a.acc.ID())
+	if err != nil {
+		return recipients
+	}
+	for _, address := range addresses {
+		if value := strings.TrimSpace(address.Address); value != "" {
+			recipients = append(recipients, value)
+		}
+	}
+	return recipients
 }
 
 func isAgentAutomaticReply(a authCtx, r *http.Request) bool {
