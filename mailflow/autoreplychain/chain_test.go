@@ -166,6 +166,22 @@ func TestExternalAutomatedSourceCannotRestartChain(t *testing.T) {
 	}
 }
 
+func TestTrustedForwardCanStartReplyChain(t *testing.T) {
+	chain := mustChain(t, 4)
+	source := message("<forward@example.net>", map[string]string{
+		HeaderSubmitted: "auto-generated",
+	})
+	if _, _, err := next(chain, source, "<blocked@octo.test>"); !errors.Is(err, ErrExternalAutomatedReply) {
+		t.Fatalf("ordinary automated source was not blocked: %v", err)
+	}
+	metadata, context, err := chain.NextFromTrustedForward(
+		source, "<reply@octo.test>", testRecipient, "sender@octo.test", testNow,
+	)
+	if err != nil || metadata.Count != 1 || !context.Automated || context.Verification != VerificationMissing {
+		t.Fatalf("trusted forward = metadata %#v context %#v err %v", metadata, context, err)
+	}
+}
+
 func TestChainContinuesAcrossInstancesWithSameKey(t *testing.T) {
 	key := []byte(strings.Repeat("k", 32))
 	beforeRestart, err := New(key, 4)

@@ -117,7 +117,7 @@ func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (i
 	if err != nil {
 		return 0, nil, err
 	}
-	existingEnvelope := parseEnvelope(existingRaw, nil, "")
+	existingEnvelope := parseEnvelope(existingRaw, nil, nil)
 	inReplyTo := ""
 	if len(existingEnvelope.references) > 0 {
 		inReplyTo = existingEnvelope.references[len(existingEnvelope.references)-1]
@@ -326,7 +326,7 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 		if closeErr != nil {
 			return closeErr
 		}
-		env := parseEnvelope(raw, nil, "")
+		env := parseEnvelope(raw, nil, nil)
 		rcpts = allRecipients(env.to, env.cc, env.bcc)
 		if len(rcpts) == 0 {
 			return errStatus(http.StatusUnprocessableEntity, "no_recipients", "draft has no recipients")

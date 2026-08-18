@@ -193,6 +193,7 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 // GET /webapi/v0/messages/{id}
 func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
 	id := r.PathValue("id")
+	ruleRecipients := ruleRecipientAddresses(ctx, a)
 	var detail messageDetail
 	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
@@ -207,7 +208,7 @@ func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (in
 		data, _ := io.ReadAll(br)
 		br.Close()
 		text, html, cc := parseBodies(data)
-		envelope := parseEnvelope(data, s.RuleMetadata, a.login)
+		envelope := parseEnvelope(data, s.RuleMetadata, ruleRecipients)
 		detail.BodyText, detail.BodyHTML, detail.Cc = text, html, cc
 		detail.Bcc = envelope.bcc
 		detail.OriginalFrom, detail.SentBy = envelope.originalFrom, envelope.sentBy
@@ -372,31 +373,44 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 		return 0, nil, err
 	}
 	automatic := isAgentAutomaticReply(a, r)
-	var automaticIntentDigest []byte
-	if automatic {
-		// Idempotency binds the caller's request, not server-generated transport
-		// metadata or the final-chain notice appended below. A configuration
-		// change must not turn a retry of an accepted request into a conflict.
-		automaticIntentDigest = agentDraftIntentDigest("agent_automatic_reply", r.PathValue("id"), req)
-	}
 	var (
-		to, cc     []string
-		subject    string
-		inReplyTo  string
-		references []string
-		sourceRaw  []byte
+		to, cc                  []string
+		subject                 string
+		inReplyTo               string
+		references              []string
+		sourceRaw               []byte
+		automaticIntentDigest   []byte
+		automaticIdempotencyKey string
 	)
 	sourceRaw, err := readMessageBytes(ctx, a.acc, id)
 	if err != nil {
 		return 0, nil, err
 	}
-	env := parseEnvelope(sourceRaw, nil, "")
+	env := parseEnvelope(sourceRaw, nil, nil)
 	to, cc = replyRecipients(env, a.login, all)
 	subject = ensurePrefix(env.subject, "Re: ")
 	inReplyTo = env.messageID
 	references = append(env.references, env.messageID)
 	if len(to) == 0 {
 		return 0, nil, errStatus(http.StatusUnprocessableEntity, "no_recipients", "original has no reply recipient")
+	}
+	if automatic {
+		automaticIdempotencyKey = strings.TrimSpace(r.Header.Get(outboundIdempotencyHeader))
+		sourceIdentity := id
+		if metadata, ok := s.trustedRuleForwardMetadata(ctx, a, sourceRaw); ok {
+			// A signed forwarding Message-ID identifies the same server-generated
+			// message across repeated SMTP deliveries, while local Email ids do
+			// not. Scope the internal key to the receiving account so one trusted
+			// forward can trigger at most one automatic reply in that mailbox.
+			sourceIdentity = metadata.MessageID
+			automaticIdempotencyKey = scopedOutboundIdempotencyKey(
+				a.acc.ID(), "trusted-rule-forward:"+metadata.MessageID,
+			)
+		}
+		// Idempotency binds the caller's request, not server-generated transport
+		// metadata or the final-chain notice appended below. A configuration
+		// change must not turn a retry of an accepted request into a conflict.
+		automaticIntentDigest = agentDraftIntentDigest("agent_automatic_reply", sourceIdentity, req)
 	}
 	messageID := ""
 	trustedHeaders := map[string]string(nil)
@@ -446,10 +460,9 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	}, raw); err != nil {
 		return 0, nil, err
 	}
-	requestKey := strings.TrimSpace(r.Header.Get(outboundIdempotencyHeader))
 	var automaticIntentClaimed bool
 	if automatic {
-		intent, claimed, err := s.claimAgentSendIntent(ctx, a, requestKey, automaticIntentDigest)
+		intent, claimed, err := s.claimAgentSendIntent(ctx, a, automaticIdempotencyKey, automaticIntentDigest)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -461,7 +474,7 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	sent, err := saveSentCopy(ctx, a.acc, raw)
 	if err != nil {
 		if automaticIntentClaimed {
-			s.abandonAgentSendIntent(ctx, a, requestKey)
+			s.abandonAgentSendIntent(ctx, a, automaticIdempotencyKey)
 		}
 		return 0, nil, internalErr("sent_copy_failed", err)
 	}
@@ -479,12 +492,12 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 		}
 		s.cleanupFailedSubmissionSentCopy(ctx, a.acc, sent.EffectiveEmailID())
 		if automaticIntentClaimed {
-			s.abandonAgentSendIntent(ctx, a, requestKey)
+			s.abandonAgentSendIntent(ctx, a, automaticIdempotencyKey)
 		}
 		return 0, nil, internalErr("submit_failed", err)
 	}
 	if automaticIntentClaimed {
-		s.completeAgentSendIntent(ctx, a, requestKey, sent.EffectiveEmailID(), ids)
+		s.completeAgentSendIntent(ctx, a, automaticIdempotencyKey, sent.EffectiveEmailID(), ids)
 	}
 	return http.StatusAccepted, map[string]any{
 		"outcome": "accepted", "submissionIds": ids, "messageId": emailID(sent),
@@ -520,7 +533,7 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 		br := a.acc.MessageReader(ctx, msgs[0])
 		data, _ := io.ReadAll(br)
 		br.Close()
-		env := parseEnvelope(data, nil, "")
+		env := parseEnvelope(data, nil, nil)
 		text, _, _ := parseBodies(data)
 		subject = ensurePrefix(env.subject, "Fwd: ")
 		originalFrom = env.from
@@ -667,7 +680,7 @@ func summarize(ctx context.Context, acc store.Account, m store.Message, mbNames 
 		br := acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
-		env := parseEnvelope(data, nil, "")
+		env := parseEnvelope(data, nil, nil)
 		subject, from, to, preview = env.subject, env.from, env.to, previewText(data)
 	}
 	sum := messageSummary{
@@ -742,7 +755,7 @@ type envelope struct {
 	sentBy       string
 }
 
-func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator, expectedRecipient string) envelope {
+func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator, expectedRecipients []string) envelope {
 	var e envelope
 	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
 	if err != nil && part.Envelope == nil {
@@ -775,7 +788,7 @@ func parseEnvelope(data []byte, ruleAuthenticator *rulemetadata.Authenticator, e
 			e.references = refs
 		}
 		if ruleAuthenticator != nil {
-			if metadata, ok := ruleAuthenticator.VerifyHeader(h, expectedRecipient, time.Now()); ok {
+			if metadata, ok := ruleAuthenticator.VerifyAny(data, expectedRecipients, time.Now()); ok {
 				e.originalFrom = validAttributionAddress(metadata.OriginalFrom)
 				e.sentBy = validAttributionAddress(metadata.SentBy)
 			}

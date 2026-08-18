@@ -12,33 +12,39 @@ import (
 )
 
 type mailRuleInfo struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Enabled        bool     `json:"enabled"`
-	Priority       int      `json:"priority"`
-	MatchFrom      string   `json:"matchFrom,omitempty"`
-	MatchSubject   string   `json:"matchSubject,omitempty"`
-	ForwardTargets []string `json:"forwardTargets"`
-	CreatedAt      string   `json:"createdAt"`
-	UpdatedAt      string   `json:"updatedAt"`
+	ID             string                        `json:"id"`
+	Name           string                        `json:"name"`
+	Enabled        bool                          `json:"enabled"`
+	Priority       int                           `json:"priority"`
+	MatchMode      string                        `json:"matchMode"`
+	Conditions     []directory.MailRuleCondition `json:"conditions"`
+	MatchFrom      string                        `json:"matchFrom,omitempty"`
+	MatchSubject   string                        `json:"matchSubject,omitempty"`
+	ForwardTargets []string                      `json:"forwardTargets"`
+	CreatedAt      string                        `json:"createdAt"`
+	UpdatedAt      string                        `json:"updatedAt"`
 }
 
 type createMailRuleRequest struct {
-	Name           string   `json:"name"`
-	Enabled        *bool    `json:"enabled"`
-	Priority       int      `json:"priority"`
-	MatchFrom      string   `json:"matchFrom"`
-	MatchSubject   string   `json:"matchSubject"`
-	ForwardTargets []string `json:"forwardTargets"`
+	Name           string                        `json:"name"`
+	Enabled        *bool                         `json:"enabled"`
+	Priority       int                           `json:"priority"`
+	MatchMode      string                        `json:"matchMode"`
+	Conditions     []directory.MailRuleCondition `json:"conditions"`
+	MatchFrom      string                        `json:"matchFrom"`
+	MatchSubject   string                        `json:"matchSubject"`
+	ForwardTargets []string                      `json:"forwardTargets"`
 }
 
 type updateMailRuleRequest struct {
-	Name           *string   `json:"name"`
-	Enabled        *bool     `json:"enabled"`
-	Priority       *int      `json:"priority"`
-	MatchFrom      *string   `json:"matchFrom"`
-	MatchSubject   *string   `json:"matchSubject"`
-	ForwardTargets *[]string `json:"forwardTargets"`
+	Name           *string                        `json:"name"`
+	Enabled        *bool                          `json:"enabled"`
+	Priority       *int                           `json:"priority"`
+	MatchMode      *string                        `json:"matchMode"`
+	Conditions     *[]directory.MailRuleCondition `json:"conditions"`
+	MatchFrom      *string                        `json:"matchFrom"`
+	MatchSubject   *string                        `json:"matchSubject"`
+	ForwardTargets *[]string                      `json:"forwardTargets"`
 }
 
 type mailRuleExecutionInfo struct {
@@ -100,8 +106,9 @@ func (s *Server) createAgentMailRule(ctx context.Context, a authCtx, r *http.Req
 		return 0, nil, err
 	}
 	rule, err := scope.CreateAgentMailRule(ctx, a.principal.ID, mailboxID, directory.MailRuleInput{
-		Name: input.Name, Enabled: enabled, Priority: input.Priority,
-		MatchFrom: input.MatchFrom, MatchSubject: input.MatchSubject,
+		Name: input.Name, Enabled: enabled, Priority: input.Priority, MatchMode: input.MatchMode,
+		Conditions: input.Conditions,
+		MatchFrom:  input.MatchFrom, MatchSubject: input.MatchSubject,
 		ForwardTargets: input.ForwardTargets,
 	})
 	if err != nil {
@@ -129,7 +136,7 @@ func (s *Server) updateAgentMailRule(ctx context.Context, a authCtx, r *http.Req
 	if err := decode(r, &input); err != nil {
 		return 0, nil, err
 	}
-	if input.Name == nil && input.Enabled == nil && input.Priority == nil && input.MatchFrom == nil &&
+	if input.Name == nil && input.Enabled == nil && input.Priority == nil && input.MatchMode == nil && input.Conditions == nil && input.MatchFrom == nil &&
 		input.MatchSubject == nil && input.ForwardTargets == nil {
 		return 0, nil, errStatus(http.StatusBadRequest, "invalid_rule", "at least one rule field is required")
 	}
@@ -138,8 +145,9 @@ func (s *Server) updateAgentMailRule(ctx context.Context, a authCtx, r *http.Req
 		return 0, nil, err
 	}
 	rule, err := scope.UpdateAgentMailRule(ctx, a.principal.ID, mailboxID, ruleID, directory.MailRulePatch{
-		Name: input.Name, Enabled: input.Enabled, Priority: input.Priority,
-		MatchFrom: input.MatchFrom, MatchSubject: input.MatchSubject,
+		Name: input.Name, Enabled: input.Enabled, Priority: input.Priority, MatchMode: input.MatchMode,
+		Conditions: input.Conditions,
+		MatchFrom:  input.MatchFrom, MatchSubject: input.MatchSubject,
 		ForwardTargets: input.ForwardTargets,
 	})
 	if err != nil {
@@ -232,10 +240,24 @@ func parsePositivePathID(r *http.Request, name, code string) (int64, error) {
 func toMailRuleInfo(rule directory.MailRule) mailRuleInfo {
 	return mailRuleInfo{
 		ID: strconv.FormatInt(rule.ID, 10), Name: rule.Name, Enabled: rule.Enabled,
-		Priority: rule.Priority, MatchFrom: rule.MatchFrom, MatchSubject: rule.MatchSubject,
+		Priority: rule.Priority, MatchMode: rule.MatchMode, Conditions: effectiveMailRuleConditions(rule), MatchFrom: rule.MatchFrom, MatchSubject: rule.MatchSubject,
 		ForwardTargets: rule.ForwardTargets, CreatedAt: rule.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt: rule.UpdatedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+func effectiveMailRuleConditions(rule directory.MailRule) []directory.MailRuleCondition {
+	if len(rule.Conditions) > 0 {
+		return rule.Conditions
+	}
+	conditions := make([]directory.MailRuleCondition, 0, 2)
+	if rule.MatchFrom != "" {
+		conditions = append(conditions, directory.MailRuleCondition{Field: "from", Operator: "equals", Value: rule.MatchFrom})
+	}
+	if rule.MatchSubject != "" {
+		conditions = append(conditions, directory.MailRuleCondition{Field: "subject", Operator: "contains", Value: rule.MatchSubject})
+	}
+	return conditions
 }
 
 func mailRuleStatusError(err error) error {

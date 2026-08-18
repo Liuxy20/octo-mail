@@ -185,6 +185,8 @@ type MailRule struct {
 	Name           string
 	Enabled        bool
 	Priority       int
+	MatchMode      string
+	Conditions     []MailRuleCondition
 	MatchFrom      string
 	MatchSubject   string
 	ForwardTargets []string
@@ -196,6 +198,8 @@ type MailRuleInput struct {
 	Name           string
 	Enabled        bool
 	Priority       int
+	MatchMode      string
+	Conditions     []MailRuleCondition
 	MatchFrom      string
 	MatchSubject   string
 	ForwardTargets []string
@@ -205,9 +209,19 @@ type MailRulePatch struct {
 	Name           *string
 	Enabled        *bool
 	Priority       *int
+	MatchMode      *string
+	Conditions     *[]MailRuleCondition
 	MatchFrom      *string
 	MatchSubject   *string
 	ForwardTargets *[]string
+}
+
+// MailRuleCondition is one user-configured predicate evaluated against a
+// stored inbound message. Field and Operator use the stable Web API values.
+type MailRuleCondition struct {
+	Field    string `json:"field"`
+	Operator string `json:"operator"`
+	Value    string `json:"value"`
 }
 
 type MailRuleExecution struct {

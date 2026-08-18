@@ -126,14 +126,22 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 	base := "/webapi/v0/agent-mailboxes/" + strconv.FormatInt(mailboxID, 10) + "/rules"
 	status, created := do(http.MethodPost, base, map[string]any{
 		"name": "Priority customers", "priority": 20,
+		"matchMode": "any",
+		"conditions": []map[string]any{
+			{"field": "from", "operator": "contains", "value": "customer@example.net"},
+			{"field": "body", "operator": "not_contains", "value": "password"},
+		},
 		"matchFrom": "customer@EXAMPLE.NET", "matchSubject": "urgent",
 		"forwardTargets": []string{"triage@example.net", "triage@EXAMPLE.NET", "owner@example.com"},
 	}, ownerAuth)
 	if status != http.StatusCreated {
 		t.Fatalf("create rule = %d %#v", status, created)
 	}
-	if created["enabled"] != true || created["matchFrom"] != "customer@example.net" {
+	if created["enabled"] != true || created["matchMode"] != "any" || created["matchFrom"] != "customer@example.net" {
 		t.Fatalf("created rule normalization = %#v", created)
+	}
+	if conditions, ok := created["conditions"].([]any); !ok || len(conditions) != 2 {
+		t.Fatalf("created conditions = %#v", created["conditions"])
 	}
 	if targets, ok := created["forwardTargets"].([]any); !ok || len(targets) != 2 {
 		t.Fatalf("created targets = %#v", created["forwardTargets"])
@@ -166,11 +174,74 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 	if status != http.StatusOK || updated["enabled"] != false || updated["matchSubject"] != "billing" {
 		t.Fatalf("update rule = %d %#v", status, updated)
 	}
+	updatedConditions, ok := updated["conditions"].([]any)
+	if !ok || len(updatedConditions) != 3 {
+		t.Fatalf("legacy PATCH conditions = %#v", updated["conditions"])
+	}
+	wantConditions := map[string]bool{
+		"from/contains/customer@example.net": false,
+		"body/not_contains/password":         false,
+		"subject/contains/billing":           false,
+	}
+	for _, value := range updatedConditions {
+		condition, ok := value.(map[string]any)
+		if !ok {
+			t.Fatalf("legacy PATCH condition = %#v", value)
+		}
+		key := condition["field"].(string) + "/" + condition["operator"].(string) + "/" + condition["value"].(string)
+		if _, expected := wantConditions[key]; expected {
+			wantConditions[key] = true
+		}
+	}
+	for condition, found := range wantConditions {
+		if !found {
+			t.Fatalf("legacy PATCH dropped condition %q: %#v", condition, updatedConditions)
+		}
+	}
 	status, invalid := do(http.MethodPost, base, map[string]any{
 		"name": "invalid", "forwardTargets": []string{"x@example.net"},
 	}, ownerAuth)
 	if status != http.StatusBadRequest || invalid["error"].(map[string]any)["code"] != "invalid_rule" {
 		t.Fatalf("invalid rule = %d %#v", status, invalid)
+	}
+	status, invalid = do(http.MethodPost, base, map[string]any{
+		"name": "invalid mode", "matchMode": "sometimes", "matchSubject": "x", "forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusBadRequest || invalid["error"].(map[string]any)["code"] != "invalid_rule" {
+		t.Fatalf("invalid match mode = %d %#v", status, invalid)
+	}
+	status, invalid = do(http.MethodPost, base, map[string]any{
+		"name": "invalid condition", "conditions": []map[string]any{{"field": "headers", "operator": "contains", "value": "x"}},
+		"forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusBadRequest || invalid["error"].(map[string]any)["code"] != "invalid_rule" {
+		t.Fatalf("invalid condition = %d %#v", status, invalid)
+	}
+	status, normalizedSenderRule := do(http.MethodPost, base, map[string]any{
+		"name": "normalized sender", "conditions": []map[string]any{{
+			"field": "from", "operator": "equals", "value": "Customer <customer@EXAMPLE.NET>",
+		}},
+		"forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusCreated {
+		t.Fatalf("create normalized sender rule = %d %#v", status, normalizedSenderRule)
+	}
+	normalizedConditions, ok := normalizedSenderRule["conditions"].([]any)
+	if !ok || len(normalizedConditions) != 1 || normalizedConditions[0].(map[string]any)["value"] != "customer@example.net" {
+		t.Fatalf("normalized sender conditions = %#v", normalizedSenderRule["conditions"])
+	}
+	status, invalid = do(http.MethodPost, base, map[string]any{
+		"name": "invalid sender", "conditions": []map[string]any{{
+			"field": "from", "operator": "equals", "value": "not an address",
+		}},
+		"forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusBadRequest || invalid["error"].(map[string]any)["code"] != "invalid_rule" {
+		t.Fatalf("invalid sender equality = %d %#v", status, invalid)
+	}
+	status, _ = do(http.MethodDelete, base+"/"+normalizedSenderRule["id"].(string), nil, ownerAuth)
+	if status != http.StatusNoContent {
+		t.Fatalf("delete normalized sender rule = %d", status)
 	}
 	status, _ = do(http.MethodDelete, base+"/"+ruleID, nil, ownerAuth)
 	if status != http.StatusNoContent {
