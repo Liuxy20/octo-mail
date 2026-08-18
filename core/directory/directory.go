@@ -138,9 +138,10 @@ type MailAddress struct {
 	Primary bool
 }
 
-// AgentMailbox is one independently stored mailbox owned by an authenticated
-// principal. Unlike MailAddress aliases, each AgentMailbox has its own account,
-// message log, folders, quota counters, and credentials.
+// AgentMailbox is one explicitly registered, independently stored mailbox owned
+// by an authenticated principal. Unlike MailAddress aliases and the internal
+// gateway default, each AgentMailbox has its own account, message log, folders,
+// quota counters, and credentials.
 type AgentMailbox struct {
 	ID           int64
 	Address      string

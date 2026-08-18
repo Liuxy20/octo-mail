@@ -502,35 +502,26 @@ func (t *tenantScope) AgentMailboxes(ctx context.Context, principalID int64, spa
 		        COALESCE(binding.bot_id,''),COALESCE(binding.bot_profile,''),
 		        CASE WHEN binding.id IS NULL THEN 'unconnected' ELSE 'connected' END,
 		        COALESCE(binding.outbound_mode,'manual_confirmation'),
-		        NOT EXISTS (
-		          SELECT 1 FROM gateway_identities gateway_default
-		          WHERE gateway_default.default_account_id=acc.id
-		            AND gateway_default.tenant_id=acc.tenant_id
-		            AND gateway_default.owner_principal_id=acc.owner_principal_id
-		            AND NOT gateway_default.disabled
-		        )
+		        true
 		 FROM accounts acc
 		 JOIN principals p ON p.id=acc.owner_principal_id AND p.tenant_id=acc.tenant_id
 		 JOIN addresses addr ON addr.account_id=acc.id AND addr.tenant_id=acc.tenant_id AND NOT addr.is_alias
 		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
+		 JOIN agent_mailbox_registrations registration
+		   ON registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		  AND registration.owner_principal_id=acc.owner_principal_id
+		  AND registration.space_id=$3
 		 LEFT JOIN LATERAL (
 		   SELECT id,bot_id,bot_profile,outbound_mode FROM agent_bindings
 		   WHERE account_id=acc.id AND space_id=$3 AND status='active'
 		   ORDER BY id DESC LIMIT 1
 		 ) binding ON true
 		 WHERE acc.tenant_id=$1 AND p.id=$2 AND NOT acc.disabled
-		   AND (
-		     EXISTS (
-		       SELECT 1 FROM agent_mailbox_registrations registration
-		       WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
-		         AND registration.owner_principal_id=acc.owner_principal_id
-		         AND registration.space_id=$3
-		     ) OR EXISTS (
+		   AND NOT EXISTS (
 		       SELECT 1 FROM gateway_identities gateway
 		       WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
 		         AND gateway.owner_principal_id=acc.owner_principal_id
 		         AND gateway.space_id=$3 AND NOT gateway.disabled
-		     )
 		   )
 		 ORDER BY acc.created_at, acc.id`,
 		t.info.ID, principalID, spaceID)
@@ -563,42 +554,32 @@ func (t *tenantScope) DeleteAgentMailbox(ctx context.Context, principalID, accou
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless Commit succeeds
 
-	var deletable bool
+	var registered bool
 	err = tx.QueryRow(ctx,
-		`SELECT NOT EXISTS (
-		   SELECT 1 FROM gateway_identities gateway
-		   WHERE gateway.default_account_id=acc.id
-		     AND gateway.tenant_id=acc.tenant_id
-		     AND gateway.owner_principal_id=acc.owner_principal_id
-		     AND NOT gateway.disabled
-		 )
+		`SELECT true
 		 FROM accounts acc
 		 WHERE acc.id=$1 AND acc.tenant_id=$2 AND acc.owner_principal_id=$3
 		   AND NOT acc.disabled
-		   AND (
-		     EXISTS (
+		   AND EXISTS (
 		       SELECT 1 FROM agent_mailbox_registrations registration
 		       WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
 		         AND registration.owner_principal_id=acc.owner_principal_id
 		         AND registration.space_id=$4
-		     ) OR EXISTS (
+		   )
+		   AND NOT EXISTS (
 		       SELECT 1 FROM gateway_identities gateway_space
 		       WHERE gateway_space.default_account_id=acc.id
 		         AND gateway_space.tenant_id=acc.tenant_id
 		         AND gateway_space.owner_principal_id=acc.owner_principal_id
 		         AND gateway_space.space_id=$4 AND NOT gateway_space.disabled
-		     )
 		   )
 		 FOR UPDATE OF acc`,
-		accountID, t.info.ID, principalID, spaceID).Scan(&deletable)
+		accountID, t.info.ID, principalID, spaceID).Scan(&registered)
 	if err == pgx.ErrNoRows {
 		return directory.ErrMailboxNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("resolve Agent mailbox deletion: %w", err)
-	}
-	if !deletable {
-		return directory.ErrAgentMailboxNotDeletable
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE agent_binding_credentials SET revoked_at=now()
@@ -692,19 +673,16 @@ func (t *tenantScope) CreateAgentMailbox(ctx context.Context, principalID, sourc
 	if err := tx.QueryRow(ctx,
 		`SELECT count(*)
 		 FROM accounts acc
+		 JOIN agent_mailbox_registrations registration
+		   ON registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		  AND registration.owner_principal_id=acc.owner_principal_id
+		  AND registration.space_id=$3
 		 WHERE acc.tenant_id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled
-		   AND (
-		     EXISTS (
-		       SELECT 1 FROM agent_mailbox_registrations registration
-		       WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
-		         AND registration.owner_principal_id=acc.owner_principal_id
-		         AND registration.space_id=$3
-		     ) OR EXISTS (
+		   AND NOT EXISTS (
 		       SELECT 1 FROM gateway_identities gateway
 		       WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
 		         AND gateway.owner_principal_id=acc.owner_principal_id
 		         AND gateway.space_id=$3 AND NOT gateway.disabled
-		     )
 		   )`,
 		t.info.ID, principalID, spaceID).Scan(&registered); err != nil {
 		return directory.AgentMailbox{}, fmt.Errorf("count Agent mailboxes in Space: %w", err)

@@ -1,0 +1,3 @@
+{"file":".coding/spec/backend/index.md","reason":"Protocol boundaries and tenant isolation."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Idempotent schema and account-scoped persistence rules."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Repository tests and structural isolation constraints."}

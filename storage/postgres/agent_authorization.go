@@ -154,18 +154,17 @@ func (d *Directory) ApproveAgentAuthorization(ctx context.Context, ownerPrincipa
 		   SELECT 1
 		   FROM accounts acc
 		   WHERE acc.id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled
-		     AND (
-		       EXISTS (
+		     AND EXISTS (
 		         SELECT 1 FROM agent_mailbox_registrations registration
 		         WHERE registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
 		           AND registration.owner_principal_id=acc.owner_principal_id
 		           AND registration.space_id=$3
-		       ) OR EXISTS (
+		     )
+		     AND NOT EXISTS (
 		         SELECT 1 FROM gateway_identities gateway
 		         WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
 		           AND gateway.owner_principal_id=acc.owner_principal_id
 		           AND gateway.space_id=$3 AND NOT gateway.disabled
-		       )
 		     )
 		 )`, accountID, ownerPrincipalID, spaceID).Scan(&owned)
 	if err != nil {
@@ -245,8 +244,18 @@ func (d *Directory) ExchangeAgentAuthorization(ctx context.Context, deviceCode, 
 		 FROM accounts acc
 		 JOIN addresses addr ON addr.account_id=acc.id AND addr.tenant_id=acc.tenant_id AND NOT addr.is_alias
 		 JOIN domains dom ON dom.id=addr.domain_id AND dom.tenant_id=addr.tenant_id
-		 WHERE acc.id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled`,
-		*accountID, *ownerPrincipalID).Scan(&tenantID, &address)
+		 JOIN agent_mailbox_registrations registration
+		   ON registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		  AND registration.owner_principal_id=acc.owner_principal_id
+		  AND registration.space_id=$3
+		 WHERE acc.id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled
+		   AND NOT EXISTS (
+		     SELECT 1 FROM gateway_identities gateway
+		     WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
+		       AND gateway.owner_principal_id=acc.owner_principal_id
+		       AND gateway.space_id=$3 AND NOT gateway.disabled
+		   )`,
+		*accountID, *ownerPrincipalID, spaceID).Scan(&tenantID, &address)
 	if err == pgx.ErrNoRows {
 		return directory.AgentAuthorizationCredential{}, directory.ErrMailboxNotFound
 	}
@@ -327,8 +336,21 @@ func (d *Directory) RevokeAgentBinding(ctx context.Context, ownerPrincipalID, ac
 	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless committed
 	var owned bool
 	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND owner_principal_id=$2)`,
-		accountID, ownerPrincipalID).Scan(&owned); err != nil {
+		`SELECT EXISTS(
+		   SELECT 1 FROM accounts acc
+		   JOIN agent_mailbox_registrations registration
+		     ON registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		    AND registration.owner_principal_id=acc.owner_principal_id
+		    AND registration.space_id=$3
+		   WHERE acc.id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled
+		     AND NOT EXISTS (
+		       SELECT 1 FROM gateway_identities gateway
+		       WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
+		         AND gateway.owner_principal_id=acc.owner_principal_id
+		         AND gateway.space_id=$3 AND NOT gateway.disabled
+		     )
+		 )`,
+		accountID, ownerPrincipalID, spaceID).Scan(&owned); err != nil {
 		return err
 	}
 	if !owned {
@@ -371,9 +393,19 @@ func (d *Directory) SetAgentOutboundMode(ctx context.Context, ownerPrincipalID, 
 	var owned bool
 	if err := tx.QueryRow(ctx,
 		`SELECT EXISTS(
-		   SELECT 1 FROM accounts
-		   WHERE id=$1 AND owner_principal_id=$2 AND NOT disabled
-		 )`, accountID, ownerPrincipalID).Scan(&owned); err != nil {
+		   SELECT 1 FROM accounts acc
+		   JOIN agent_mailbox_registrations registration
+		     ON registration.account_id=acc.id AND registration.tenant_id=acc.tenant_id
+		    AND registration.owner_principal_id=acc.owner_principal_id
+		    AND registration.space_id=$3
+		   WHERE acc.id=$1 AND acc.owner_principal_id=$2 AND NOT acc.disabled
+		     AND NOT EXISTS (
+		       SELECT 1 FROM gateway_identities gateway
+		       WHERE gateway.default_account_id=acc.id AND gateway.tenant_id=acc.tenant_id
+		         AND gateway.owner_principal_id=acc.owner_principal_id
+		         AND gateway.space_id=$3 AND NOT gateway.disabled
+		     )
+		 )`, accountID, ownerPrincipalID, spaceID).Scan(&owned); err != nil {
 		return err
 	}
 	if !owned {
@@ -411,18 +443,17 @@ func (d *Directory) AuthenticateAgentCredential(ctx context.Context, token strin
 		 JOIN accounts acc ON acc.id=b.account_id AND acc.tenant_id=b.tenant_id AND NOT acc.disabled
 		 JOIN principals p ON p.id=acc.principal_id AND p.tenant_id=acc.tenant_id
 		 WHERE c.key_prefix=$1 AND c.revoked_at IS NULL AND b.space_id <> ''
-		   AND (
-		     EXISTS (
+		   AND EXISTS (
 		       SELECT 1 FROM agent_mailbox_registrations registration
 		       WHERE registration.account_id=b.account_id AND registration.tenant_id=b.tenant_id
 		         AND registration.owner_principal_id=b.owner_principal_id
 		         AND registration.space_id=b.space_id
-		     ) OR EXISTS (
+		   )
+		   AND NOT EXISTS (
 		       SELECT 1 FROM gateway_identities gateway
 		       WHERE gateway.default_account_id=b.account_id AND gateway.tenant_id=b.tenant_id
 		         AND gateway.owner_principal_id=b.owner_principal_id
 		         AND gateway.space_id=b.space_id AND NOT gateway.disabled
-		     )
 		   )`, prefix).
 		Scan(&credentialID, &bindingID, &tenantID, &accountID, &principalID, &login, &credJSON)
 	if err == pgx.ErrNoRows {
@@ -456,18 +487,17 @@ func (d *Directory) AgentAutomationAllowed(ctx context.Context, credentialID int
 		 FROM agent_binding_credentials c
 		 JOIN agent_bindings b ON b.id=c.binding_id AND b.status='active'
 		 WHERE c.id=$1 AND c.revoked_at IS NULL AND b.space_id <> ''
-		   AND (
-		     EXISTS (
+		   AND EXISTS (
 		       SELECT 1 FROM agent_mailbox_registrations registration
 		       WHERE registration.account_id=b.account_id AND registration.tenant_id=b.tenant_id
 		         AND registration.owner_principal_id=b.owner_principal_id
 		         AND registration.space_id=b.space_id
-		     ) OR EXISTS (
+		   )
+		   AND NOT EXISTS (
 		       SELECT 1 FROM gateway_identities gateway
 		       WHERE gateway.default_account_id=b.account_id AND gateway.tenant_id=b.tenant_id
 		         AND gateway.owner_principal_id=b.owner_principal_id
 		         AND gateway.space_id=b.space_id AND NOT gateway.disabled
-		     )
 		   )`, credentialID).
 		Scan(&outboundMode)
 	if err == pgx.ErrNoRows {

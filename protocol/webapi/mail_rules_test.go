@@ -123,6 +123,14 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 
 	ownerAuth := credentials{gatewaySubject: "octo-owner", spaceID: "space-a"}
 	otherAuth := credentials{gatewaySubject: "octo-other", spaceID: "space-a"}
+	defaultBase := "/webapi/v0/agent-mailboxes/" + strconv.FormatInt(ownerAccountID, 10) + "/rules"
+	status, denied := do(http.MethodPost, defaultBase, map[string]any{
+		"name": "internal default", "matchSubject": "x", "forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusForbidden || denied["error"].(map[string]any)["code"] != "mailbox_not_owned" {
+		t.Fatalf("gateway default rule create = %d %#v", status, denied)
+	}
+
 	base := "/webapi/v0/agent-mailboxes/" + strconv.FormatInt(mailboxID, 10) + "/rules"
 	status, created := do(http.MethodPost, base, map[string]any{
 		"name": "Priority customers", "priority": 20,
@@ -157,7 +165,7 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 		t.Fatalf("list executions = %d %#v", status, executions)
 	}
 
-	status, denied := do(http.MethodPost, base, map[string]any{
+	status, denied = do(http.MethodPost, base, map[string]any{
 		"name": "denied", "matchSubject": "x", "forwardTargets": []string{"x@example.net"},
 	}, otherAuth)
 	if status != http.StatusForbidden || denied["error"].(map[string]any)["code"] != "mailbox_not_owned" {

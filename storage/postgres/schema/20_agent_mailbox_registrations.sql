@@ -69,10 +69,8 @@ JOIN (
 WHERE acc.owner_principal_id IS NOT NULL
   AND NOT acc.disabled
   -- Independently registered Agent mailboxes have their own mailbox-login
-  -- principal. The Space's gateway default is an explicit Agent designation
-  -- recorded in gateway_identities and may reuse the owner principal; this
-  -- backfill only infers additional mailboxes, so same-principal accounts that
-  -- lack that explicit designation must not be inferred as registrations.
+  -- principal. The Space's internal gateway default may reuse the owner
+  -- principal and must not be inferred as an Agent mailbox registration.
   AND acc.principal_id IS NOT NULL
   AND acc.principal_id <> acc.owner_principal_id
   AND NOT EXISTS (

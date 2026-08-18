@@ -212,8 +212,8 @@ func TestAgentAuthorizationBindRebindAndRevoke(t *testing.T) {
 		t.Fatalf("cross-owner approve status = %d, want 403", status)
 	}
 
-	// Sharing an owner is not sufficient. An additional mailbox must be
-	// registered in this Space or explicitly designated as its gateway default.
+	// Sharing an owner is not sufficient. An Agent mailbox must be explicitly
+	// registered in this Space.
 	unlistedDevice := start("bot-unlisted", "unlisted", "unlisted-verifier-with-enough-entropy")
 	status, unlisted := do(http.MethodPost, "/webapi/v0/agent-auth/requests/"+unlistedDevice["userCode"].(string)+"/approve",
 		map[string]any{"mailboxId": strconv.FormatInt(unlistedAccountID, 10)}, ownerAuth)
@@ -221,32 +221,14 @@ func TestAgentAuthorizationBindRebindAndRevoke(t *testing.T) {
 		t.Fatalf("same-owner unlisted mailbox approval = %d %#v, want 403 mailbox_not_owned", status, unlisted)
 	}
 
-	// The active gateway default is the Space's initial Agent mailbox. It is
-	// therefore selectable for Bot authorization even though it has no separate
-	// agent_mailbox_registrations row.
+	// The gateway default is an internal browser account, not an Agent mailbox.
+	// It is neither listed nor selectable for Bot authorization.
 	defaultVerifier := "default-agent-mailbox-verifier-with-enough-entropy"
 	defaultDevice := start("bot-default", "default-agent", defaultVerifier)
 	status, defaultApproved := do(http.MethodPost, "/webapi/v0/agent-auth/requests/"+defaultDevice["userCode"].(string)+"/approve",
 		map[string]any{"mailboxId": strconv.FormatInt(ownerAccountID, 10)}, ownerAuth)
-	if status != http.StatusOK || defaultApproved["approved"] != true {
-		t.Fatalf("default Agent mailbox approval = %d %#v", status, defaultApproved)
-	}
-	status, defaultExchanged := do(http.MethodPost, "/webapi/v0/agent-auth/token", map[string]any{
-		"deviceCode": defaultDevice["deviceCode"], "codeVerifier": defaultVerifier,
-	}, auth{})
-	if status != http.StatusOK || defaultExchanged["mailboxAddress"] != "owner@example.com" {
-		t.Fatalf("default Agent mailbox exchange = %d %#v", status, defaultExchanged)
-	}
-	defaultToken := defaultExchanged["accessToken"].(string)
-	var defaultBindingSpace string
-	if err := s.Pool.QueryRow(ctx,
-		`SELECT space_id FROM agent_bindings WHERE account_id=$1 AND status='active'`, ownerAccountID).
-		Scan(&defaultBindingSpace); err != nil || defaultBindingSpace != "space-a" {
-		t.Fatalf("default binding Space = %q, err=%v", defaultBindingSpace, err)
-	}
-	status, _ = do(http.MethodGet, "/webapi/v0/identity", nil, auth{bearer: defaultToken})
-	if status != http.StatusOK {
-		t.Fatalf("default Agent credential before re-point = %d", status)
+	if status != http.StatusForbidden || defaultApproved["error"].(map[string]any)["code"] != "mailbox_not_owned" {
+		t.Fatalf("gateway default Agent approval = %d %#v", status, defaultApproved)
 	}
 	status, spaceBMailboxes := do(http.MethodGet, "/webapi/v0/agent-mailboxes", nil, wrongSpaceAuth)
 	if status != http.StatusOK {
@@ -254,46 +236,9 @@ func TestAgentAuthorizationBindRebindAndRevoke(t *testing.T) {
 	}
 	for _, item := range spaceBMailboxes["mailboxes"].([]any) {
 		mailbox := item.(map[string]any)
-		if mailbox["id"] == strconv.FormatInt(ownerAccountID, 10) && mailbox["connectState"] != "unconnected" {
-			t.Fatalf("Space A binding leaked into Space B projection: %#v", mailbox)
+		if mailbox["id"] == strconv.FormatInt(ownerAccountID, 10) {
+			t.Fatalf("gateway default exposed in Space B Agent mailbox list: %#v", mailbox)
 		}
-	}
-	status, _ = do(http.MethodDelete, "/webapi/v0/agent-mailboxes/"+strconv.FormatInt(ownerAccountID, 10)+"/binding", nil, wrongSpaceAuth)
-	if status != http.StatusNoContent {
-		t.Fatalf("Space B unbind of its unconnected projection = %d", status)
-	}
-	status, _ = do(http.MethodGet, "/webapi/v0/identity", nil, auth{bearer: defaultToken})
-	if status != http.StatusOK {
-		t.Fatalf("Space B mutation revoked Space A credential = %d", status)
-	}
-	// Re-pointing only Space A must revoke its old default binding even though
-	// the same account remains the valid default Agent mailbox in Space B.
-	if _, err := s.Pool.Exec(ctx,
-		`UPDATE gateway_identities SET default_account_id=$1,updated_at=now()
-		 WHERE issuer='octo-server' AND subject='octo-owner' AND space_id='space-a'`,
-		mailboxAccountID); err != nil {
-		t.Fatal(err)
-	}
-	status, _ = do(http.MethodGet, "/webapi/v0/identity", nil, auth{bearer: defaultToken})
-	if status != http.StatusUnauthorized {
-		t.Fatalf("old default credential after Space re-point = %d, want 401", status)
-	}
-	var revokedBindings, revokedCredentials int
-	if err := s.Pool.QueryRow(ctx,
-		`SELECT count(*) FROM agent_bindings
-		 WHERE account_id=$1 AND space_id='space-a' AND status='revoked'`, ownerAccountID).
-		Scan(&revokedBindings); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Pool.QueryRow(ctx,
-		`SELECT count(*) FROM agent_binding_credentials credential
-		 JOIN agent_bindings binding ON binding.id=credential.binding_id
-		 WHERE binding.account_id=$1 AND binding.space_id='space-a' AND credential.revoked_at IS NOT NULL`, ownerAccountID).
-		Scan(&revokedCredentials); err != nil {
-		t.Fatal(err)
-	}
-	if revokedBindings != 1 || revokedCredentials != 1 {
-		t.Fatalf("re-point revocation persisted bindings=%d credentials=%d, want 1/1", revokedBindings, revokedCredentials)
 	}
 
 	status, approved := do(http.MethodPost, "/webapi/v0/agent-auth/requests/"+userCodeA+"/approve",

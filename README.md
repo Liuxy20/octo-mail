@@ -151,7 +151,7 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_AUTHORIZATION_URL` | Public OCTO browser URL for Agent mailbox device authorization |
 | `OCTO_MAIL_OUTBOUND_REVIEW_TERMS` | Comma-separated terms that route matching Agent sends to an owner-review Draft; empty disables keyword review |
 | `OCTO_MAIL_AUTO_REPLY_MAX_COUNT` | Maximum authenticated Agent automatic replies in one chain; defaults to `4`, `0` disables the limit |
-| `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total Agent mailboxes per owner in one OCTO Space, including the gateway default Agent mailbox; defaults to `2` |
+| `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total explicitly registered Agent mailboxes per owner in one OCTO Space; the internal gateway default does not count; defaults to `2` |
 | `OCTO_MAIL_AUTO_REPLY_CHAIN_KEY` | Deployment-wide HMAC key for automatic-reply chain metadata; at least 32 bytes and required while the limit is enabled |
 
 `OCTO_MAIL_S3_BUCKET` must exist before octo-mail starts. octo-mail does not send
