@@ -10,7 +10,9 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
+	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
+	moxmessage "github.com/mjl-/mox/message"
 )
 
 // GET /webapi/v0/drafts
@@ -110,6 +112,81 @@ type updateDraftRequest struct {
 	DraftVersion *int `json:"draftVersion,omitempty"`
 }
 
+func (s *Server) enforceAgentDraftUpdatePolicy(
+	ctx context.Context,
+	a authCtx,
+	r *http.Request,
+	req updateDraftRequest,
+	raw []byte,
+) error {
+	if a.agentCredentialID <= 0 || s.OutboundPolicy == nil {
+		return nil
+	}
+
+	var agentDraft store.AgentOutboundDraft
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
+		current, _, err := loadDraftMessage(tx, a.acc, r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		claimTx, ok := tx.(store.DraftSendClaimTx)
+		if !ok {
+			return errStatus(http.StatusNotImplemented, "draft_send_claim_unavailable", "durable Draft sending is unavailable")
+		}
+		if _, found, err := claimTx.FindDraftSendClaim(current.EffectiveEmailID()); err != nil {
+			return err
+		} else if found {
+			return errStatus(http.StatusConflict, "draft_send_result_unknown", "this Draft was already submitted or has an unknown submission result; it cannot be edited")
+		}
+
+		hasPolicy := false
+		if policyTx, ok := tx.(store.OutboundPolicyDraftTx); ok {
+			_, hasPolicy, err = policyTx.FindOutboundPolicyDraftByEmailID(current.EffectiveEmailID())
+			if err != nil {
+				return err
+			}
+		}
+		hasAgentDraft := false
+		if agentDraftTx, ok := tx.(store.AgentOutboundDraftTx); ok {
+			agentDraft, hasAgentDraft, err = agentDraftTx.FindAgentOutboundDraftByEmailID(current.EffectiveEmailID())
+			if err != nil {
+				return err
+			}
+		}
+		if hasPolicy && hasAgentDraft {
+			return internalErr("draft_metadata_conflict", fmt.Errorf("draft has both policy and Agent workflow metadata"))
+		}
+		if hasPolicy || !hasAgentDraft {
+			return errStatus(http.StatusForbidden, "owner_required", "only an Agent-prepared draft may be edited with an Agent credential")
+		}
+		if req.DraftVersion == nil || *req.DraftVersion != agentDraft.DraftVersion {
+			return errStatus(http.StatusConflict, "draft_version_conflict", "the draft changed; reload the current version")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	intent := outboundpolicy.Intent{
+		Source: outboundpolicy.SourceOwnerDirect, Operation: "mail.message.send",
+		To: req.To, Cc: req.Cc, Bcc: req.Bcc, Subject: req.Subject,
+		Text: req.Text, HTML: req.HTML, AttachmentCount: len(req.Attachments),
+	}
+	if agentDraft.DraftType == agentDraftTypeReply {
+		intent.Source = outboundpolicy.SourceInboundAutoReply
+		intent.Operation = "mail.message.reply"
+		if agentDraft.SourceEmailID > 0 {
+			intent.SourceEmailID = fmt.Sprintf("E%d", agentDraft.SourceEmailID)
+		}
+	}
+	digest := sha256.Sum256(raw)
+	return s.enforceAgentOutboundPolicyWithDedupe(ctx, a, r, intent, raw, outboundPolicyDedupe{
+		requestKey:     fmt.Sprintf("agent-draft-update-%d-%d-%x", agentDraft.EmailID, agentDraft.DraftVersion, digest),
+		sourceIdentity: fmt.Sprintf("agent-draft:%d:version:%d", agentDraft.EmailID, agentDraft.DraftVersion),
+	})
+}
+
 // PATCH /webapi/v0/drafts/{id} replaces an immutable Draft message with a new
 // append-only version. Policy metadata follows the new Email id atomically.
 func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
@@ -132,6 +209,9 @@ func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (i
 		InReplyTo: inReplyTo, References: existingEnvelope.references,
 	}, a.senderDomain())
 	if err != nil {
+		return 0, nil, err
+	}
+	if err := s.enforceAgentDraftUpdatePolicy(ctx, a, r, req, raw); err != nil {
 		return 0, nil, err
 	}
 	digest := sha256.Sum256(raw)
@@ -182,9 +262,6 @@ func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (i
 			}
 		}
 		if hasAgentDraft {
-			if a.agentCredentialID > 0 {
-				return errStatus(http.StatusForbidden, "owner_required", "an Agent-prepared draft must be edited by its human owner")
-			}
 			if req.DraftVersion == nil || *req.DraftVersion != agentDraft.DraftVersion {
 				return errStatus(http.StatusConflict, "draft_version_conflict", "the draft changed; reload the current version")
 			}
@@ -244,6 +321,75 @@ func (s *Server) updateDraft(ctx context.Context, a authCtx, r *http.Request) (i
 
 type sendDraftRequest struct {
 	DraftVersion *int `json:"draftVersion,omitempty"`
+}
+
+func agentDraftPolicyIntent(raw []byte, draft store.AgentOutboundDraft) (outboundpolicy.Intent, error) {
+	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(raw), int64(len(raw)))
+	if err != nil || part.Envelope == nil {
+		if err == nil {
+			err = fmt.Errorf("message envelope is unavailable")
+		}
+		return outboundpolicy.Intent{}, fmt.Errorf("parse Agent Draft for outbound policy: %w", err)
+	}
+
+	addresses := func(values []moxmessage.Address) []string {
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			out = append(out, value.User+"@"+value.Host)
+		}
+		return out
+	}
+	intent := outboundpolicy.Intent{
+		Source: outboundpolicy.SourceOwnerDirect, Operation: "mail.message.send",
+		To: addresses(part.Envelope.To), Cc: addresses(part.Envelope.CC), Bcc: addresses(part.Envelope.BCC),
+		Subject: part.Envelope.Subject,
+	}
+	if draft.DraftType == agentDraftTypeReply {
+		intent.Source = outboundpolicy.SourceInboundAutoReply
+		intent.Operation = "mail.message.reply"
+		if draft.SourceEmailID > 0 {
+			intent.SourceEmailID = fmt.Sprintf("E%d", draft.SourceEmailID)
+		}
+	}
+
+	var walk func(*moxmessage.Part) error
+	walk = func(current *moxmessage.Part) error {
+		if len(current.Parts) > 0 {
+			for i := range current.Parts {
+				if err := walk(&current.Parts[i]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		disposition, filename, err := current.DispositionFilename()
+		if err != nil {
+			return err
+		}
+		if isAttachmentPart(current, disposition, filename) {
+			intent.AttachmentCount++
+			return nil
+		}
+		if !strings.EqualFold(current.MediaType, "TEXT") && current.MediaType != "" {
+			return nil
+		}
+		body, err := io.ReadAll(current.ReaderUTF8OrBinary())
+		if err != nil {
+			return err
+		}
+		if strings.EqualFold(current.MediaSubType, "HTML") {
+			if intent.HTML == "" {
+				intent.HTML = string(body)
+			}
+		} else if intent.Text == "" {
+			intent.Text = string(body)
+		}
+		return nil
+	}
+	if err := walk(&part); err != nil {
+		return outboundpolicy.Intent{}, fmt.Errorf("read Agent Draft for outbound policy: %w", err)
+	}
+	return intent, nil
 }
 
 // POST /webapi/v0/drafts/{id}/send — submit an existing draft.
@@ -306,9 +452,6 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 			draftVersion = policy.DraftVersion
 		}
 		if hasAgentDraft {
-			if a.agentCredentialID > 0 && !a.ownerConfirmedDraft {
-				return errStatus(http.StatusForbidden, "owner_required", "an Agent-prepared Draft must be sent by its human owner")
-			}
 			if req.DraftVersion == nil || *req.DraftVersion != agentDraft.DraftVersion {
 				return errStatus(http.StatusConflict, "draft_version_conflict", "the draft changed; reload the current version")
 			}
@@ -343,7 +486,6 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 		if !claimed && (claim.DraftVersion != draftVersion || !bytes.Equal(claim.ContentDigest, digest[:])) {
 			return errStatus(http.StatusConflict, "draft_send_conflict", "the Draft send claim does not match the current version")
 		}
-		raw = stripRFCHeader(raw, "Bcc")
 		return nil
 	})
 	if err != nil {
@@ -365,6 +507,21 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 			s.Log.WarnContext(cleanupCtx, "Draft send claim cleanup failed", "draft_id", id, "err", err)
 		}
 	}
+	if hasAgentDraft && a.agentCredentialID > 0 && s.OutboundPolicy != nil {
+		intent, err := agentDraftPolicyIntent(raw, agentDraft)
+		if err != nil {
+			abandonClaim()
+			return 0, nil, internalErr("outbound_policy_draft_invalid", err)
+		}
+		if err := s.enforceAgentOutboundPolicyWithDedupe(ctx, a, r, intent, raw, outboundPolicyDedupe{
+			requestKey:     fmt.Sprintf("agent-draft-send-%d-%d", draftEmailID, draftVersion),
+			sourceIdentity: fmt.Sprintf("agent-draft:%d:version:%d", draftEmailID, draftVersion),
+		}); err != nil {
+			abandonClaim()
+			return 0, nil, err
+		}
+	}
+	raw = stripRFCHeader(raw, "Bcc")
 	sent, err := saveSentCopy(ctx, a.acc, raw)
 	if err != nil {
 		abandonClaim()

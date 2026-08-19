@@ -1,0 +1,3 @@
+{"file":".coding/spec/backend/index.md","reason":"Check protocol boundaries and tenant isolation."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Check required repository gates and scope."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Check persistence invariants and live-infrastructure tests."}

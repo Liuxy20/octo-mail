@@ -1,10 +1,10 @@
 -- Trusted OCTO gateway identities.
 --
 -- A binding is exact to issuer + OCTO subject + Space. It resolves to one
--- human owner principal and that Space's initial/default Agent mailbox account
--- inside one octo-mail tenant. The default account remains non-deletable but is
--- eligible for Bot authorization like additional Agent mailbox registrations.
--- Request authentication still verifies account ownership on every use.
+-- human owner principal and that Space's internal browser-default account inside
+-- one octo-mail tenant. The default account is not an Agent mailbox and is not
+-- eligible for Bot authorization. Request authentication still verifies account
+-- ownership on every use.
 
 CREATE TABLE IF NOT EXISTS gateway_identities (
     id                 bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,

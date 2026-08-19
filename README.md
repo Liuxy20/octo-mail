@@ -151,7 +151,7 @@ config file. The authoritative list lives in
 | `OCTO_MAIL_AUTHORIZATION_URL` | Public OCTO browser URL for Agent mailbox device authorization |
 | `OCTO_MAIL_OUTBOUND_REVIEW_TERMS` | Comma-separated terms that route matching Agent sends to an owner-review Draft; empty disables keyword review |
 | `OCTO_MAIL_AUTO_REPLY_MAX_COUNT` | Maximum authenticated Agent automatic replies in one chain; defaults to `4`, `0` disables the limit |
-| `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total Agent mailboxes per owner in one OCTO Space, including the gateway default Agent mailbox; defaults to `2` |
+| `OCTO_MAIL_MAX_AGENT_MAILBOXES_PER_OWNER_SPACE` | Total explicitly registered Agent mailboxes per owner in one OCTO Space; the internal gateway default does not count; defaults to `2` |
 | `OCTO_MAIL_AUTO_REPLY_CHAIN_KEY` | Deployment-wide HMAC key for automatic-reply chain metadata; at least 32 bytes and required while the limit is enabled |
 
 `OCTO_MAIL_S3_BUCKET` must exist before octo-mail starts. octo-mail does not send
@@ -229,25 +229,18 @@ and addresses (including the configured bounce/VERP domain when enabled).
 Removing the relay variables restores direct MX delivery; on Tencent Cloud that
 path remains unavailable while outbound TCP 25 is blocked.
 
-### Agent Mail owner-confirmation boundary
+### Agent Mail Draft command boundary
 
-In manual-confirmation mode, an `omb_` Agent credential may prepare a versioned
-Agent Draft. The trusted OpenClaw Mail Plugin must verify a direct-session Owner
-turn through OpenClaw `senderIsOwner`, exact confirmation text, session binding,
-expiry, and one-time consumption before it calls the existing versioned
-Draft-send endpoint with `X-Octo-Automation: owner-confirmed-draft`.
+An `omb_` Agent credential may prepare a versioned Agent Draft and explicitly
+update, send, or delete that Draft. Update and send require the current positive
+`draftVersion`; stale versions fail with `draft_version_conflict`. These explicit
+Draft commands do not depend on the mailbox automation mode. Ordinary owner
+Drafts and policy-review Drafts remain owner-only.
 
-octo-mail accepts that marker only for `POST /webapi/v0/drafts/{id}/send`, a
-positive `draftVersion`, and a valid idempotency key. The credential must belong
-to a mailbox in `manual_confirmation` mode, and the Draft must carry matching
-Agent-Draft metadata for that same account. Ordinary and policy Drafts remain
-owner-only.
-
-The automation marker is not a cryptographic proof of a chat message. octo-mail
-therefore relies on the trusted Plugin keeping the mailbox-scoped `omb_`
-credential unavailable to Agent-visible tool inputs, outputs, prompts, and
-logs. A holder of that credential could assert the marker, so deployments must
-preserve this credential boundary.
+The automation mode still controls server-side Agent send intents and background
+automation. Deployments must keep the mailbox-scoped `omb_` credential
+unavailable to Agent-visible tool inputs, outputs, prompts, and logs; possession
+of that credential authorizes the account-scoped Agent Draft operations above.
 
 Browser Gateway assertions remain a separate, single-use identity mechanism.
 They bind the browser user, Space, selected mailbox, HTTP method, request URI,

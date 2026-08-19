@@ -111,6 +111,18 @@ func TestAgentMailboxCreationIsIndependent(t *testing.T) {
 		return resp.StatusCode, result
 	}
 
+	status, initiallyListed := do(http.MethodGet, "/webapi/v0/agent-mailboxes", "", "")
+	initialMailboxes, _ := initiallyListed["mailboxes"].([]any)
+	if status != http.StatusOK || len(initialMailboxes) != 0 || initiallyListed["registeredCount"] != float64(0) {
+		t.Fatalf("gateway default exposed as Agent mailbox = %d %#v", status, initiallyListed)
+	}
+	status, defaultAutomation := do(http.MethodPatch,
+		"/webapi/v0/agent-mailboxes/"+strconv.FormatInt(accountID, 10)+"/automation",
+		`{"outboundMode":"automatic_send"}`, "")
+	if status != http.StatusForbidden || defaultAutomation["error"].(map[string]any)["code"] != "mailbox_not_owned" {
+		t.Fatalf("gateway default automation = %d %#v", status, defaultAutomation)
+	}
+
 	status, created := do(http.MethodPost, "/webapi/v0/agent-mailboxes", `{"localpart":"support"}`, "")
 	if status != http.StatusCreated || created["address"] != "support@mail.imocto.cn" {
 		t.Fatalf("create agent mailbox = %d %#v", status, created)
@@ -231,18 +243,13 @@ func TestAgentMailboxCreationIsIndependent(t *testing.T) {
 	}
 	status, listed := do(http.MethodGet, "/webapi/v0/agent-mailboxes", "", "")
 	mailboxes, _ := listed["mailboxes"].([]any)
-	if status != http.StatusOK || len(mailboxes) != 3 || listed["registeredCount"] != float64(3) || listed["addressDomain"] != "mail.imocto.cn" {
+	if status != http.StatusOK || len(mailboxes) != 2 || listed["registeredCount"] != float64(2) || listed["addressDomain"] != "mail.imocto.cn" {
 		t.Fatalf("list agent mailboxes = %d %#v", status, listed)
 	}
-	foundDefault := false
 	for _, item := range mailboxes {
 		if item.(map[string]any)["id"] == strconv.FormatInt(accountID, 10) {
-			foundDefault = item.(map[string]any)["deletable"] == false &&
-				item.(map[string]any)["address"] == "owner@example.com"
+			t.Fatalf("gateway default exposed as Agent mailbox: %#v", listed)
 		}
-	}
-	if !foundDefault {
-		t.Fatalf("Space default Agent mailbox missing or deletable: %#v", listed)
 	}
 
 	address, _ := smtp.ParseAddress("support@mail.imocto.cn")
@@ -268,6 +275,45 @@ func TestAgentMailboxCreationIsIndependent(t *testing.T) {
 	status, supportMessages := do(http.MethodGet, "/webapi/v0/messages", "", supportKey)
 	if status != http.StatusOK || supportMessages["total"] != float64(1) {
 		t.Fatalf("support mailbox messages = %d %#v", status, supportMessages)
+	}
+	// Account deletion is tenant-wide. A registration in this Space must not
+	// disable the same account while another Space still uses it as its active
+	// gateway default.
+	if _, err := s.Pool.Exec(ctx,
+		`INSERT INTO gateway_identities
+		 (issuer,subject,space_id,tenant_id,owner_principal_id,default_account_id)
+		 VALUES ('octo-server','octo-owner-other-space','space-other',$1,$2,$3)`,
+		tenantID, principalID, createdID); err != nil {
+		t.Fatal(err)
+	}
+	status, sharedDefaultList := do(http.MethodGet, "/webapi/v0/agent-mailboxes", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("list shared-default Agent mailbox = %d %#v", status, sharedDefaultList)
+	}
+	sharedDefaultFound := false
+	for _, item := range sharedDefaultList["mailboxes"].([]any) {
+		mailbox := item.(map[string]any)
+		if mailbox["id"] == strconv.FormatInt(createdID, 10) {
+			sharedDefaultFound = true
+			if mailbox["deletable"] != false {
+				t.Fatalf("shared gateway default is deletable: %#v", mailbox)
+			}
+		}
+	}
+	if !sharedDefaultFound {
+		t.Fatalf("registered Agent mailbox missing from its Space: %#v", sharedDefaultList)
+	}
+	status, sharedDefaultDelete := do(http.MethodDelete, "/webapi/v0/agent-mailboxes/"+strconv.FormatInt(createdID, 10), "", "")
+	if status != http.StatusConflict || sharedDefaultDelete["error"].(map[string]any)["code"] != "default_mailbox_not_deletable" {
+		t.Fatalf("delete cross-Space gateway default = %d %#v", status, sharedDefaultDelete)
+	}
+	if _, _, _, _, err := agentDir.AuthenticateAgentCredential(ctx, credential.AccessToken); err != nil {
+		t.Fatalf("failed delete revoked Agent credential: %v", err)
+	}
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE gateway_identities SET disabled=true,updated_at=now()
+		 WHERE issuer='octo-server' AND subject='octo-owner-other-space' AND space_id='space-other'`); err != nil {
+		t.Fatal(err)
 	}
 	status, _ = do(http.MethodDelete, "/webapi/v0/agent-mailboxes/"+strconv.FormatInt(createdID, 10), "", "")
 	if status != http.StatusNoContent {
@@ -436,7 +482,7 @@ func TestAgentMailboxRegistrationLimitIsPerOwnerAndSpace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != http.StatusConflict || defaultDelete["error"].(map[string]any)["code"] != "default_mailbox_not_deletable" {
+	if status != http.StatusNotFound || defaultDelete["error"].(map[string]any)["code"] != "mailbox_not_found" {
 		t.Fatalf("default mailbox delete = %d %#v", status, defaultDelete)
 	}
 
@@ -445,9 +491,13 @@ func TestAgentMailboxRegistrationLimitIsPerOwnerAndSpace(t *testing.T) {
 		body := firstSpaceAMailbox
 		t.Fatalf("create first mailbox in Space A = %d %#v", status, body)
 	}
-	status, blocked := create(ownerA.subject, "space-a", "a-two")
+	status, secondSpaceAMailbox := create(ownerA.subject, "space-a", "a-two")
+	if status != http.StatusCreated {
+		t.Fatalf("create second mailbox in Space A = %d %#v", status, secondSpaceAMailbox)
+	}
+	status, blocked := create(ownerA.subject, "space-a", "a-three")
 	if status != http.StatusConflict || blocked["error"].(map[string]any)["code"] != "agent_mailbox_limit_reached" {
-		t.Fatalf("second additional mailbox = %d %#v", status, blocked)
+		t.Fatalf("third Agent mailbox = %d %#v", status, blocked)
 	}
 	firstSpaceAID := firstSpaceAMailbox["id"].(string)
 	status, crossSpaceDelete, err := request(ownerA.subject, "space-b", http.MethodDelete, "/webapi/v0/agent-mailboxes/"+firstSpaceAID, "")
@@ -471,14 +521,20 @@ func TestAgentMailboxRegistrationLimitIsPerOwnerAndSpace(t *testing.T) {
 	if status, body := create(ownerA.subject, "space-b", "a-b-one"); status != http.StatusCreated {
 		t.Fatalf("create first mailbox in Space B = %d %#v", status, body)
 	}
-	if status, body := create(ownerA.subject, "space-b", "a-b-two"); status != http.StatusConflict || body["error"].(map[string]any)["code"] != "agent_mailbox_limit_reached" {
-		t.Fatalf("second additional mailbox in Space B = %d %#v", status, body)
+	if status, body := create(ownerA.subject, "space-b", "a-b-two"); status != http.StatusCreated {
+		t.Fatalf("create second mailbox in Space B = %d %#v", status, body)
+	}
+	if status, body := create(ownerA.subject, "space-b", "a-b-three"); status != http.StatusConflict || body["error"].(map[string]any)["code"] != "agent_mailbox_limit_reached" {
+		t.Fatalf("third mailbox in Space B = %d %#v", status, body)
 	}
 	if status, body := create(ownerB.subject, "space-a", "b-one"); status != http.StatusCreated {
 		t.Fatalf("create first mailbox for owner B = %d %#v", status, body)
 	}
-	if status, body := create(ownerB.subject, "space-a", "b-two"); status != http.StatusConflict || body["error"].(map[string]any)["code"] != "agent_mailbox_limit_reached" {
-		t.Fatalf("second additional mailbox for owner B = %d %#v", status, body)
+	if status, body := create(ownerB.subject, "space-a", "b-two"); status != http.StatusCreated {
+		t.Fatalf("create second mailbox for owner B = %d %#v", status, body)
+	}
+	if status, body := create(ownerB.subject, "space-a", "b-three"); status != http.StatusConflict || body["error"].(map[string]any)["code"] != "agent_mailbox_limit_reached" {
+		t.Fatalf("third mailbox for owner B = %d %#v", status, body)
 	}
 
 	for _, test := range []struct {
@@ -518,8 +574,8 @@ func TestAgentMailboxRegistrationLimitIsPerOwnerAndSpace(t *testing.T) {
 			t.Fatalf("concurrent create status = %d", status)
 		}
 	}
-	if created != 1 {
-		t.Fatalf("concurrent creates succeeded = %d, want 1", created)
+	if created != 2 {
+		t.Fatalf("concurrent creates succeeded = %d, want 2", created)
 	}
 
 	// Direct human credentials have no verified OCTO Space and cannot bypass

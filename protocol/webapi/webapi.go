@@ -77,10 +77,11 @@ type Server struct {
 	// RuleMetadata verifies server-generated forwarding attribution before it is
 	// exposed to clients. Nil fails closed and treats all such headers as external.
 	RuleMetadata *rulemetadata.Authenticator
-	// MaxAgentMailboxesPerOwnerSpace is the total per-owner, per-Space Agent
-	// mailbox limit, including the gateway default Agent mailbox. The directory
-	// enforces it transactionally when another mailbox is registered. Zero keeps
-	// the safe product default of two for embedders/tests that omit the field.
+	// MaxAgentMailboxesPerOwnerSpace is the total per-owner, per-Space registered
+	// Agent mailbox limit. The internal gateway default does not count. The
+	// directory enforces the limit transactionally when another mailbox is
+	// registered. Zero keeps the safe product default of two for embedders/tests
+	// that omit the field.
 	MaxAgentMailboxesPerOwnerSpace int
 	// AgentMailboxDomain, when configured, is the tenant-owned address domain
 	// used for newly registered Agent mailboxes and advertised to the owner UI.
@@ -141,8 +142,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /webapi/v0/agent-drafts", s.h(s.createAgentDraft))
 	mux.HandleFunc("POST /webapi/v0/drafts", s.h(s.createDraft))
 	mux.HandleFunc("PATCH /webapi/v0/drafts/{id}", s.h(s.updateDraft))
-	mux.HandleFunc("POST /webapi/v0/drafts/{id}/send", s.hAgentConfirmed("mail.draft.send", s.sendDraft))
-	mux.HandleFunc("DELETE /webapi/v0/drafts/{id}", s.hAgentConfirmed("mail.draft.delete", s.deleteDraft))
+	mux.HandleFunc("POST /webapi/v0/drafts/{id}/send", s.h(s.sendDraft))
+	mux.HandleFunc("DELETE /webapi/v0/drafts/{id}", s.h(s.deleteDraft))
 	// Mailboxes.
 	mux.HandleFunc("GET /webapi/v0/mailboxes", s.h(s.listMailboxes))
 	mux.HandleFunc("GET /webapi/v0/identity", s.h(s.getIdentity))
