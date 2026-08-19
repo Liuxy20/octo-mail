@@ -232,15 +232,18 @@ path remains unavailable while outbound TCP 25 is blocked.
 ### Agent Mail Draft command boundary
 
 An `omb_` Agent credential may prepare a versioned Agent Draft and explicitly
-update, send, or delete that Draft. Update and send require the current positive
-`draftVersion`; stale versions fail with `draft_version_conflict`. These explicit
-Draft commands do not depend on the mailbox automation mode. Ordinary owner
-Drafts and policy-review Drafts remain owner-only.
+update, send, or delete that Draft. Update and send of an Agent-prepared Draft
+require the current positive `draftVersion`; stale versions fail with
+`draft_version_conflict`. The credential may also send an ordinary human-authored
+Draft that the caller explicitly selected, using its immutable Email id without
+`draftVersion`. Every Agent-credential Draft send re-evaluates the current
+outbound policy. These explicit Draft commands do not depend on the mailbox
+automation mode; policy-review Drafts remain owner-only.
 
 The automation mode still controls server-side Agent send intents and background
 automation. Deployments must keep the mailbox-scoped `omb_` credential
 unavailable to Agent-visible tool inputs, outputs, prompts, and logs; possession
-of that credential authorizes the account-scoped Agent Draft operations above.
+of that credential authorizes the account-scoped Draft operations above.
 
 Browser Gateway assertions remain a separate, single-use identity mechanism.
 They bind the browser user, Space, selected mailbox, HTTP method, request URI,

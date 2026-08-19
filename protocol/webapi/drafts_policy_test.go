@@ -23,9 +23,10 @@ func TestAgentDraftPolicyIntentIncludesCompleteDraft(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	intent, err := agentDraftPolicyIntent(raw, store.AgentOutboundDraft{
+	replyDraft := &store.AgentOutboundDraft{
 		DraftType: agentDraftTypeReply, SourceEmailID: 42,
-	})
+	}
+	intent, err := agentDraftPolicyIntent(raw, replyDraft)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,5 +37,16 @@ func TestAgentDraftPolicyIntentIncludesCompleteDraft(t *testing.T) {
 	}
 	if !reflect.DeepEqual(intent, want) {
 		t.Fatalf("policy intent = %#v, want %#v", intent, want)
+	}
+
+	humanDraftIntent, err := agentDraftPolicyIntent(raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want.Source = outboundpolicy.SourceOwnerDirect
+	want.Operation = "mail.message.send"
+	want.SourceEmailID = ""
+	if !reflect.DeepEqual(humanDraftIntent, want) {
+		t.Fatalf("human Draft policy intent = %#v, want %#v", humanDraftIntent, want)
 	}
 }

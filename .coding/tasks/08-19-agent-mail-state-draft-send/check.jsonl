@@ -1,0 +1,1 @@
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Verify protocol boundaries, tenant isolation, formatting, vet, tests, and lint."}

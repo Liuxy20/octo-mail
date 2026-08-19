@@ -323,7 +323,7 @@ type sendDraftRequest struct {
 	DraftVersion *int `json:"draftVersion,omitempty"`
 }
 
-func agentDraftPolicyIntent(raw []byte, draft store.AgentOutboundDraft) (outboundpolicy.Intent, error) {
+func agentDraftPolicyIntent(raw []byte, draft *store.AgentOutboundDraft) (outboundpolicy.Intent, error) {
 	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(raw), int64(len(raw)))
 	if err != nil || part.Envelope == nil {
 		if err == nil {
@@ -344,7 +344,7 @@ func agentDraftPolicyIntent(raw []byte, draft store.AgentOutboundDraft) (outboun
 		To: addresses(part.Envelope.To), Cc: addresses(part.Envelope.CC), Bcc: addresses(part.Envelope.BCC),
 		Subject: part.Envelope.Subject,
 	}
-	if draft.DraftType == agentDraftTypeReply {
+	if draft != nil && draft.DraftType == agentDraftTypeReply {
 		intent.Source = outboundpolicy.SourceInboundAutoReply
 		intent.Operation = "mail.message.reply"
 		if draft.SourceEmailID > 0 {
@@ -457,9 +457,6 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 			}
 			draftVersion = agentDraft.DraftVersion
 		}
-		if a.agentCredentialID > 0 && !hasAgentDraft {
-			return errStatus(http.StatusForbidden, "owner_required", "an Agent credential cannot send Drafts directly; the human owner gateway must complete delivery")
-		}
 		br := a.acc.MessageReader(ctx, message)
 		raw, e = io.ReadAll(br)
 		closeErr := br.Close()
@@ -507,8 +504,12 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 			s.Log.WarnContext(cleanupCtx, "Draft send claim cleanup failed", "draft_id", id, "err", err)
 		}
 	}
-	if hasAgentDraft && a.agentCredentialID > 0 && s.OutboundPolicy != nil {
-		intent, err := agentDraftPolicyIntent(raw, agentDraft)
+	if a.agentCredentialID > 0 && s.OutboundPolicy != nil {
+		var workflowDraft *store.AgentOutboundDraft
+		if hasAgentDraft {
+			workflowDraft = &agentDraft
+		}
+		intent, err := agentDraftPolicyIntent(raw, workflowDraft)
 		if err != nil {
 			abandonClaim()
 			return 0, nil, internalErr("outbound_policy_draft_invalid", err)

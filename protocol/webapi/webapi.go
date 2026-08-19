@@ -146,6 +146,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /webapi/v0/drafts/{id}", s.h(s.deleteDraft))
 	// Mailboxes.
 	mux.HandleFunc("GET /webapi/v0/mailboxes", s.h(s.listMailboxes))
+	mux.HandleFunc("GET /webapi/v0/state", noStore(s.h(s.getState)))
 	mux.HandleFunc("GET /webapi/v0/identity", s.h(s.getIdentity))
 	// Account addresses.
 	mux.HandleFunc("GET /webapi/v0/addresses", s.h(s.listAddresses))
@@ -179,6 +180,13 @@ func (s *Server) Handler() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func noStore(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+	}
 }
 
 func (s *Server) deviceFlowLimited(next http.HandlerFunc) http.HandlerFunc {
