@@ -352,6 +352,13 @@ func agentDraftPolicyIntent(raw []byte, draft *store.AgentOutboundDraft) (outbou
 		}
 	}
 
+	var textBody, htmlBody strings.Builder
+	appendBody := func(dst *strings.Builder, body []byte) {
+		if dst.Len() > 0 {
+			dst.WriteByte('\n')
+		}
+		_, _ = dst.Write(body)
+	}
 	var walk func(*moxmessage.Part) error
 	walk = func(current *moxmessage.Part) error {
 		if len(current.Parts) > 0 {
@@ -378,17 +385,17 @@ func agentDraftPolicyIntent(raw []byte, draft *store.AgentOutboundDraft) (outbou
 			return err
 		}
 		if strings.EqualFold(current.MediaSubType, "HTML") {
-			if intent.HTML == "" {
-				intent.HTML = string(body)
-			}
-		} else if intent.Text == "" {
-			intent.Text = string(body)
+			appendBody(&htmlBody, body)
+		} else {
+			appendBody(&textBody, body)
 		}
 		return nil
 	}
 	if err := walk(&part); err != nil {
 		return outboundpolicy.Intent{}, fmt.Errorf("read Agent Draft for outbound policy: %w", err)
 	}
+	intent.Text = textBody.String()
+	intent.HTML = htmlBody.String()
 	return intent, nil
 }
 

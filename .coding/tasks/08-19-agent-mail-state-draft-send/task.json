@@ -2,7 +2,7 @@
   "id": "agent-mail-state-draft-send",
   "name": "agent-mail-state-draft-send",
   "title": "Complete Agent Mail state and draft sending",
-  "description": "Expose lightweight account state and enforce current outbound policy for confirmed Agent Draft sends.",
+  "description": "Expose lightweight account state and enforce current outbound policy for explicitly selected Draft sends.",
   "status": "completed",
   "dev_type": null,
   "scope": "protocol/webapi",

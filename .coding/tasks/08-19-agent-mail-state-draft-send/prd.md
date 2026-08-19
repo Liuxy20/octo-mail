@@ -2,7 +2,7 @@
 
 ## Goal
 
-Expose lightweight account state and enforce current outbound policy for confirmed Agent Draft sends.
+Expose lightweight account state and enforce current outbound policy for explicitly selected Draft sends.
 
 ## Requirements
 
@@ -10,6 +10,8 @@ Expose lightweight account state and enforce current outbound policy for confirm
   non-cacheable WebAPI state endpoint.
 - Allow Agent credentials to send an ordinary human-authored Draft after the
   caller has explicitly selected that Draft for sending.
+- Keep explicit selection in the caller/CLI workflow; no separate confirmation
+  artifact crosses the WebAPI boundary.
 - Re-evaluate the current outbound policy before every Agent Draft send,
   including recipients, subject, text, HTML, and attachment count.
 - When the current policy requires review, keep the message out of Sent and the
