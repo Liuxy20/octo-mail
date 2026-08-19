@@ -1,0 +1,3 @@
+{"file":".coding/spec/backend/index.md","reason":"Verify protocol and tenant boundaries."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Verify migration idempotency and persistence safety."}
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Verify tests, build, and scope."}

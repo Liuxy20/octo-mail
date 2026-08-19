@@ -47,6 +47,25 @@ Rules (see `core/directory/directory.go`):
 
 ---
 
+## Gateway defaults and Agent mailboxes are separate capabilities
+
+`gateway_identities.default_account_id` is the internal browser fallback created
+by gateway provisioning. It keeps the browser mail path usable when no account is
+selected, but it is not Agent-mailbox ownership evidence.
+
+- Only an exact `agent_mailbox_registrations` owner + Space row establishes an
+  Agent mailbox.
+- An active gateway default is excluded from Agent listing, limits, management,
+  Bot authorization, credential authentication, and automation even if legacy
+  data also contains a registration for that account.
+- `AuthenticateGatewayIdentity` remains the exception: no selected account uses
+  the gateway default, while an explicit selection may use that default or an
+  Agent mailbox registered in the authenticated Space.
+- Repointing an account to become an active gateway default must revoke any Agent
+  binding and credential for the same owner + Space without deleting mail data.
+
+---
+
 ## Committed frontend JS — edit `.ts`, run `make frontend`
 
 `webui/assets/*.ts` is source; the committed `*.js` is `go:embed`-ed into the binary.

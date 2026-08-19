@@ -238,6 +238,14 @@ func TestAgentOutboundPolicyCreatesOneDurableDraft(t *testing.T) {
 	if status != http.StatusForbidden || agentEdit["error"].(map[string]any)["code"] != "owner_required" {
 		t.Fatalf("Agent policy Draft edit = %d %#v", status, agentEdit)
 	}
+	status, agentSend := do(http.MethodPost, "/webapi/v0/drafts/"+draftID+"/send", map[string]any{"draftVersion": 1}, requestAuth{bearer: agentToken})
+	if status != http.StatusForbidden || agentSend["error"].(map[string]any)["code"] != "owner_required" {
+		t.Fatalf("Agent policy Draft send = %d %#v", status, agentSend)
+	}
+	status, agentDelete := do(http.MethodDelete, "/webapi/v0/drafts/"+draftID, nil, requestAuth{bearer: agentToken})
+	if status != http.StatusForbidden || agentDelete["error"].(map[string]any)["code"] != "owner_required" {
+		t.Fatalf("Agent policy Draft delete = %d %#v", status, agentDelete)
+	}
 	status, edited := do(http.MethodPatch, "/webapi/v0/drafts/"+draftID, map[string]any{
 		"draftVersion": 1, "to": []string{"recipient@example.net"},
 		"bcc":     []string{"audit@example.net"},

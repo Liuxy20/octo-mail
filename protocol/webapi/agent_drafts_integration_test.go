@@ -26,7 +26,7 @@ import (
 	"github.com/mjl-/mox/smtp"
 )
 
-func TestAgentPreparedDraftManualConfirmationFlow(t *testing.T) {
+func TestAgentPreparedDraftExplicitOperationsFlow(t *testing.T) {
 	ctx := context.Background()
 	bs, err := blob.NewFS(t.TempDir())
 	if err != nil {
@@ -304,12 +304,8 @@ func TestAgentPreparedDraftManualConfirmationFlow(t *testing.T) {
 	}
 	deletableAgentDraftID := deletableAgentDraft["draftId"].(string)
 	status, agentDraftDelete := do(http.MethodDelete, "/webapi/v0/drafts/"+deletableAgentDraftID, nil, agentAuth)
-	if status != http.StatusForbidden || agentDraftDelete["error"].(map[string]any)["code"] != "owner_required" {
+	if status != http.StatusNoContent || len(agentDraftDelete) != 0 {
 		t.Fatalf("Agent Draft deletion = %d %#v", status, agentDraftDelete)
-	}
-	status, _ = do(http.MethodDelete, "/webapi/v0/drafts/"+deletableAgentDraftID, nil, mailboxOwnerAuth)
-	if status != http.StatusNoContent {
-		t.Fatalf("confirmed Agent Draft deletion = %d", status)
 	}
 
 	address, _ := smtp.ParseAddress("support@example.com")
@@ -384,31 +380,167 @@ func TestAgentPreparedDraftManualConfirmationFlow(t *testing.T) {
 		t.Fatalf("prepared side effects drafts=%d metadata=%d sent=%d queue=%d, want 3/2/0/0", draftMessages, metadataRows, sentMessages, queueRows)
 	}
 
-	status, denied := do(http.MethodPost, "/webapi/v0/drafts/"+preparedID+"/send", map[string]any{"draftVersion": 1}, agentAuth)
-	if status != http.StatusForbidden || denied["error"].(map[string]any)["code"] != "owner_required" {
-		t.Fatalf("Agent Draft send = %d %#v", status, denied)
+	// Sending an Agent-prepared Draft must evaluate the policy that is active at
+	// send time. A Draft that was valid when it was created cannot bypass a
+	// policy that the operator enabled before delivery.
+	server.OutboundPolicy = nil
+	status, policyChangedDraft := do(http.MethodPost, "/webapi/v0/agent-drafts", map[string]any{
+		"to":      []string{"recipient@example.net"},
+		"cc":      []string{"copy@example.net"},
+		"bcc":     []string{"blind@example.net"},
+		"subject": "Policy changed after creation",
+		"text":    "ordinary text body",
+		"html":    "<p>policy-block-phrase</p>",
+		"attachments": []map[string]any{{
+			"filename": "evidence.txt", "contentType": "text/plain",
+			"content": base64.StdEncoding.EncodeToString([]byte("attachment body")),
+		}},
+	}, requestAuth{bearer: agentToken, idempotencyKey: "policy-change-create-001"})
+	if status != http.StatusCreated {
+		t.Fatalf("create Draft before policy change = %d %#v", status, policyChangedDraft)
 	}
-	status, sent := do(http.MethodPost, "/webapi/v0/drafts/"+preparedID+"/send", map[string]any{"draftVersion": 1}, requestAuth{
-		bearer: agentToken, automation: "owner-confirmed-draft", idempotencyKey: "owner-confirmed-draft-001",
-	})
-	if status != http.StatusAccepted || sent["messageId"] == "" || sent["senderAddress"] != "support@example.com" {
-		t.Fatalf("Plugin-confirmed prepared Draft = %d %#v", status, sent)
+	policyChangedDraftID := policyChangedDraft["draftId"].(string)
+	policyChangedEmailID, err := strconv.ParseInt(strings.TrimPrefix(policyChangedDraftID, "E"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.OutboundPolicy = outboundpolicy.NewKeywordEvaluator([]string{"policy-block-phrase"})
+
+	status, blockedSend := do(http.MethodPost, "/webapi/v0/drafts/"+policyChangedDraftID+"/send", map[string]any{
+		"draftVersion": 1,
+	}, agentAuth)
+	if status != http.StatusConflict || blockedSend["error"].(map[string]any)["code"] != "outbound_review_required" {
+		t.Fatalf("Draft send after policy change = %d %#v", status, blockedSend)
+	}
+	blockedSendPolicyID := blockedSend["policy"].(map[string]any)["draftId"]
+	blockedSendPolicyEmailID, err := strconv.ParseInt(strings.TrimPrefix(blockedSendPolicyID.(string), "E"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, repeatedBlockedSend := do(http.MethodPost, "/webapi/v0/drafts/"+policyChangedDraftID+"/send", map[string]any{
+		"draftVersion": 1,
+	}, agentAuth)
+	if status != http.StatusConflict || repeatedBlockedSend["error"].(map[string]any)["code"] != "outbound_review_required" ||
+		repeatedBlockedSend["policy"].(map[string]any)["draftId"] != blockedSendPolicyID {
+		t.Fatalf("repeated Draft send after policy change = %d %#v, want same policy Draft %v", status, repeatedBlockedSend, blockedSendPolicyID)
+	}
+	var policyChangedAgentRows, policyChangedReviewRows, policyChangedClaims int
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_outbound_drafts WHERE account_id=$1 AND email_id=$2`,
+		mailAccountID, policyChangedEmailID).Scan(&policyChangedAgentRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbound_policy_drafts WHERE account_id=$1 AND email_id=$2`,
+		mailAccountID, blockedSendPolicyEmailID).Scan(&policyChangedReviewRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM draft_send_claims WHERE account_id=$1 AND email_id=$2`,
+		mailAccountID, policyChangedEmailID).Scan(&policyChangedClaims); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id
+		 WHERE m.account_id=$1 AND NOT m.expunged AND mb.su_sent`, mailAccountID).Scan(&sentMessages); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM queue WHERE account_id=$1`, mailAccountID).Scan(&queueRows); err != nil {
+		t.Fatal(err)
+	}
+	if policyChangedAgentRows != 1 || policyChangedReviewRows != 1 || policyChangedClaims != 0 || sentMessages != 0 || queueRows != 0 {
+		t.Fatalf("blocked send side effects agent=%d policy=%d claims=%d sent=%d queue=%d, want 1/1/0/0/0",
+			policyChangedAgentRows, policyChangedReviewRows, policyChangedClaims, sentMessages, queueRows)
 	}
 
-	// Editing preserves the original reply thread and increments the version.
+	// An Agent edit is a new Agent-originated outbound intent. Re-evaluate the
+	// replacement bytes so a clean Draft cannot be rewritten into content that
+	// the owner-review policy would have blocked at creation time.
+	status, editable := do(http.MethodPost, "/webapi/v0/agent-drafts", map[string]any{
+		"to": []string{"recipient@example.net"}, "subject": "Safe update", "text": "ordinary content",
+	}, requestAuth{bearer: agentToken, idempotencyKey: "policy-edit-safe-001"})
+	if status != http.StatusCreated {
+		t.Fatalf("create editable Agent Draft = %d %#v", status, editable)
+	}
+	editableID := editable["draftId"].(string)
+	status, blockedEdit := do(http.MethodPatch, "/webapi/v0/drafts/"+editableID, map[string]any{
+		"draftVersion": 1, "to": []string{"changed@example.net"},
+		"subject": "Needs review", "text": "policy-block-phrase",
+	}, agentAuth)
+	if status != http.StatusConflict || blockedEdit["error"].(map[string]any)["code"] != "outbound_review_required" {
+		t.Fatalf("blocked Agent Draft edit = %d %#v", status, blockedEdit)
+	}
+	policyDraft := blockedEdit["policy"].(map[string]any)
+	policyDraftID := policyDraft["draftId"].(string)
+	status, blockedPolicySend := do(http.MethodPost, "/webapi/v0/drafts/"+policyDraftID+"/send", map[string]any{
+		"draftVersion": 1,
+	}, agentAuth)
+	if status != http.StatusForbidden || blockedPolicySend["error"].(map[string]any)["code"] != "owner_required" {
+		t.Fatalf("Agent send of policy Draft = %d %#v", status, blockedPolicySend)
+	}
+	editableEmailID, err := strconv.ParseInt(strings.TrimPrefix(editableID, "E"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyEmailID, err := strconv.ParseInt(strings.TrimPrefix(policyDraftID, "E"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var editableRows, reviewRows int
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_outbound_drafts WHERE account_id=$1 AND email_id=$2`,
+		mailAccountID, editableEmailID).Scan(&editableRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbound_policy_drafts WHERE account_id=$1 AND email_id=$2`,
+		mailAccountID, policyEmailID).Scan(&reviewRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id
+		 WHERE m.account_id=$1 AND NOT m.expunged AND mb.su_sent`, mailAccountID).Scan(&sentMessages); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM queue WHERE account_id=$1`, mailAccountID).Scan(&queueRows); err != nil {
+		t.Fatal(err)
+	}
+	if editableRows != 1 || reviewRows != 1 || sentMessages != 0 || queueRows != 0 {
+		t.Fatalf("blocked Agent edit side effects agent=%d policy=%d sent=%d queue=%d, want 1/1/0/0",
+			editableRows, reviewRows, sentMessages, queueRows)
+	}
+
+	status, missingVersion := do(http.MethodPost, "/webapi/v0/drafts/"+preparedID+"/send", map[string]any{}, agentAuth)
+	if status != http.StatusConflict || missingVersion["error"].(map[string]any)["code"] != "draft_version_conflict" {
+		t.Fatalf("unversioned Agent Draft send = %d %#v", status, missingVersion)
+	}
+	status, sent := do(http.MethodPost, "/webapi/v0/drafts/"+preparedID+"/send", map[string]any{"draftVersion": 1}, agentAuth)
+	if status != http.StatusAccepted || sent["messageId"] == "" || sent["senderAddress"] != "support@example.com" {
+		t.Fatalf("Agent Draft send = %d %#v", status, sent)
+	}
+
+	// Explicit Agent editing preserves the original reply thread and increments
+	// the version. Stale update and send attempts remain conflict-safe.
 	status, edited := do(http.MethodPatch, "/webapi/v0/drafts/"+replyDraftID, map[string]any{
 		"draftVersion": 1, "to": []string{"customer@example.net"},
-		"subject": "Re: Need help", "text": "Owner edited this response.",
-	}, requestAuth{basicUser: "support@example.com", basicPassword: "support-owner-pw"})
+		"subject": "Re: Need help", "text": "Agent edited this response.",
+	}, agentAuth)
 	if status != http.StatusOK || edited["draftVersion"] != float64(2) {
-		t.Fatalf("edit reply Draft = %d %#v", status, edited)
+		t.Fatalf("Agent edit reply Draft = %d %#v", status, edited)
 	}
 	editedID := edited["id"].(string)
 	status, editedDetail := do(http.MethodGet, "/webapi/v0/messages/"+editedID, nil, agentAuth)
 	if status != http.StatusOK || editedDetail["threadId"] != replyDraft["threadId"] {
 		t.Fatalf("edited reply Draft thread = %d %#v", status, editedDetail)
 	}
-	status, stale := do(http.MethodPost, "/webapi/v0/drafts/"+editedID+"/send", map[string]any{"draftVersion": 1}, requestAuth{basicUser: "support@example.com", basicPassword: "support-owner-pw"})
+	status, staleEdit := do(http.MethodPatch, "/webapi/v0/drafts/"+editedID, map[string]any{
+		"draftVersion": 1, "to": []string{"customer@example.net"},
+		"subject": "Re: Need help", "text": "Stale Agent edit.",
+	}, agentAuth)
+	if status != http.StatusConflict || staleEdit["error"].(map[string]any)["code"] != "draft_version_conflict" {
+		t.Fatalf("stale Agent Draft edit = %d %#v", status, staleEdit)
+	}
+	status, stale := do(http.MethodPost, "/webapi/v0/drafts/"+editedID+"/send", map[string]any{"draftVersion": 1}, agentAuth)
 	if status != http.StatusConflict || stale["error"].(map[string]any)["code"] != "draft_version_conflict" {
 		t.Fatalf("stale reply Draft send = %d %#v", status, stale)
 	}
