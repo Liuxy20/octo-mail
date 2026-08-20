@@ -189,7 +189,7 @@ func (s *Server) createAgentMailbox(ctx context.Context, a authCtx, r *http.Requ
 		s.maxAgentMailboxesPerOwnerSpace(),
 	)
 	if errors.Is(err, directory.ErrInvalidLocalpart) {
-		return 0, nil, errStatus(http.StatusBadRequest, "invalid_localpart", "use lowercase letters, numbers, dots, hyphens, or underscores")
+		return 0, nil, errStatus(http.StatusBadRequest, "invalid_localpart", "use 5 to 64 lowercase letters, numbers, dots, hyphens, or underscores, and avoid reserved system names")
 	}
 	if errors.Is(err, directory.ErrAddressExists) {
 		return 0, nil, errStatus(http.StatusConflict, "address_exists", "mailbox address already exists")

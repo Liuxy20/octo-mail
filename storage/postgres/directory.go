@@ -21,6 +21,31 @@ import (
 
 var aliasLocalpartPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`)
 
+const agentMailboxLocalpartMinLength = 5
+
+var reservedAgentMailboxLocalparts = map[string]struct{}{
+	"abuse":         {},
+	"admin":         {},
+	"administrator": {},
+	"hostmaster":    {},
+	"mailer-daemon": {},
+	"noc":           {},
+	"postmaster":    {},
+	"root":          {},
+	"security":      {},
+	"webmaster":     {},
+}
+
+func validAgentMailboxLocalpart(localpart string) bool {
+	if len(localpart) < agentMailboxLocalpartMinLength ||
+		!aliasLocalpartPattern.MatchString(localpart) ||
+		strings.Contains(localpart, "..") {
+		return false
+	}
+	_, reserved := reservedAgentMailboxLocalparts[localpart]
+	return !reserved
+}
+
 // Compile-time assertions that the Postgres impls satisfy the kernel interfaces.
 var (
 	_ store.Account           = (*account)(nil)
@@ -625,7 +650,7 @@ func (t *tenantScope) DeleteAgentMailbox(ctx context.Context, principalID, accou
 
 func (t *tenantScope) CreateAgentMailbox(ctx context.Context, principalID, sourceAccountID int64, spaceID, localpart, configuredDomain string, maxPerOwnerSpace int) (directory.AgentMailbox, error) {
 	localpart = strings.ToLower(strings.TrimSpace(localpart))
-	if !aliasLocalpartPattern.MatchString(localpart) || strings.Contains(localpart, "..") {
+	if !validAgentMailboxLocalpart(localpart) {
 		return directory.AgentMailbox{}, directory.ErrInvalidLocalpart
 	}
 	spaceID = strings.TrimSpace(spaceID)

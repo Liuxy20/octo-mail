@@ -122,6 +122,12 @@ func TestAgentMailboxCreationIsIndependent(t *testing.T) {
 	if status != http.StatusForbidden || defaultAutomation["error"].(map[string]any)["code"] != "mailbox_not_owned" {
 		t.Fatalf("gateway default automation = %d %#v", status, defaultAutomation)
 	}
+	for _, localpart := range []string{"bot1", "admin", "POSTMASTER"} {
+		status, rejected := do(http.MethodPost, "/webapi/v0/agent-mailboxes", `{"localpart":"`+localpart+`"}`, "")
+		if status != http.StatusBadRequest || rejected["error"].(map[string]any)["code"] != "invalid_localpart" {
+			t.Fatalf("create invalid agent mailbox %q = %d %#v", localpart, status, rejected)
+		}
+	}
 
 	status, created := do(http.MethodPost, "/webapi/v0/agent-mailboxes", `{"localpart":"support"}`, "")
 	if status != http.StatusCreated || created["address"] != "support@mail.imocto.cn" {
@@ -556,7 +562,7 @@ func TestAgentMailboxRegistrationLimitIsPerOwnerAndSpace(t *testing.T) {
 	statuses := make(chan int, 8)
 	for i := 0; i < cap(statuses); i++ {
 		go func(i int) {
-			status, _, err := request(ownerC.subject, "space-a", http.MethodPost, "/webapi/v0/agent-mailboxes", fmt.Sprintf(`{"localpart":"c-%d"}`, i))
+			status, _, err := request(ownerC.subject, "space-a", http.MethodPost, "/webapi/v0/agent-mailboxes", fmt.Sprintf(`{"localpart":"agent-c-%d"}`, i))
 			if err != nil {
 				statuses <- 0
 				return
