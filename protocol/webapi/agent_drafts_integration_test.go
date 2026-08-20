@@ -256,9 +256,9 @@ func TestAgentPreparedDraftExplicitOperationsFlow(t *testing.T) {
 		t.Fatalf("owner suppression deletion = %d", status)
 	}
 
-	// Generic Draft endpoints are human composition APIs. An Agent cannot use
-	// them to manufacture or mutate an unmarked Draft and then replay the normal
-	// operation confirmation to bypass the Agent workflow.
+	// Generic Draft creation, editing, and deletion remain human composition
+	// APIs. Sending an existing human-authored Draft is covered below and still
+	// passes through the current outbound policy.
 	plainDraftBody := map[string]any{
 		"to": []string{"recipient@example.net"}, "subject": "Owner Draft", "text": "Owner-only draft.",
 	}
@@ -276,16 +276,6 @@ func TestAgentPreparedDraftExplicitOperationsFlow(t *testing.T) {
 	}, agentAuth)
 	if status != http.StatusForbidden || agentPlainEdit["error"].(map[string]any)["code"] != "owner_required" {
 		t.Fatalf("Agent generic Draft edit = %d %#v", status, agentPlainEdit)
-	}
-	status, agentPlainSend := do(http.MethodPost, "/webapi/v0/drafts/"+plainDraftID+"/send", nil, agentAuth)
-	if status != http.StatusForbidden || agentPlainSend["error"].(map[string]any)["code"] != "owner_required" {
-		t.Fatalf("Agent generic Draft send = %d %#v", status, agentPlainSend)
-	}
-	status, scopedPlainSend := do(http.MethodPost, "/webapi/v0/drafts/"+plainDraftID+"/send", map[string]any{"draftVersion": 1}, requestAuth{
-		bearer: agentToken, automation: "owner-confirmed-draft", idempotencyKey: "owner-confirmed-plain-001",
-	})
-	if status != http.StatusForbidden || scopedPlainSend["error"].(map[string]any)["code"] != "owner_required" {
-		t.Fatalf("scoped Agent generic Draft send = %d %#v", status, scopedPlainSend)
 	}
 	status, agentPlainDelete := do(http.MethodDelete, "/webapi/v0/drafts/"+plainDraftID, nil, agentAuth)
 	if status != http.StatusForbidden || agentPlainDelete["error"].(map[string]any)["code"] != "owner_required" {
@@ -621,5 +611,83 @@ func TestAgentPreparedDraftExplicitOperationsFlow(t *testing.T) {
 	}
 	if sentAfterUnknown != sentBeforeUnknown+1 || processingIntentRows != 1 {
 		t.Fatalf("unknown automatic evidence sent=%d→%d processing=%d, want +1/1", sentBeforeUnknown, sentAfterUnknown, processingIntentRows)
+	}
+
+	// After the caller explicitly selects the exact Draft, an Agent may submit an
+	// ordinary human-authored Draft. Its immutable Email id is the concurrency
+	// boundary; Agent-prepared Drafts continue to require their explicit version.
+	server.OutboundPolicy = outboundpolicy.NewKeywordEvaluator([]string{"human-draft-review"})
+	status, humanDraft := do(http.MethodPost, "/webapi/v0/drafts", map[string]any{
+		"to": []string{"human-draft@example.net"}, "subject": "Human-authored Draft", "text": "Approved content.",
+	}, mailboxOwnerAuth)
+	if status != http.StatusCreated {
+		t.Fatalf("create human Draft = %d %#v", status, humanDraft)
+	}
+	humanDraftID := humanDraft["id"].(string)
+	status, humanDraftSent := do(http.MethodPost, "/webapi/v0/drafts/"+humanDraftID+"/send", nil, agentAuth)
+	if status != http.StatusAccepted || humanDraftSent["outcome"] != "accepted" || humanDraftSent["messageId"] == "" {
+		t.Fatalf("Agent send human Draft = %d %#v", status, humanDraftSent)
+	}
+	var humanDraftQueueRows int
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM queue WHERE account_id=$1 AND rcpt_to='human-draft@example.net'`,
+		mailAccountID).Scan(&humanDraftQueueRows); err != nil {
+		t.Fatal(err)
+	}
+	if humanDraftQueueRows != 1 {
+		t.Fatalf("human Draft queue rows = %d, want 1", humanDraftQueueRows)
+	}
+
+	// The same path must evaluate the policy active at send time. A blocked
+	// human Draft remains unsent and produces the normal owner-review Draft.
+	status, blockedHumanDraft := do(http.MethodPost, "/webapi/v0/drafts", map[string]any{
+		"to": []string{"blocked-human-draft@example.net"}, "subject": "Human Draft", "text": "human-draft-review",
+	}, mailboxOwnerAuth)
+	if status != http.StatusCreated {
+		t.Fatalf("create blocked human Draft = %d %#v", status, blockedHumanDraft)
+	}
+	blockedHumanDraftID := blockedHumanDraft["id"].(string)
+	var sentBeforeBlockedHuman int
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id
+		 WHERE m.account_id=$1 AND NOT m.expunged AND mb.su_sent`,
+		mailAccountID).Scan(&sentBeforeBlockedHuman); err != nil {
+		t.Fatal(err)
+	}
+	status, blockedHumanSend := do(http.MethodPost, "/webapi/v0/drafts/"+blockedHumanDraftID+"/send", nil, agentAuth)
+	if status != http.StatusConflict || blockedHumanSend["error"].(map[string]any)["code"] != "outbound_review_required" {
+		t.Fatalf("blocked human Draft send = %d %#v", status, blockedHumanSend)
+	}
+	blockedHumanPolicyID := blockedHumanSend["policy"].(map[string]any)["draftId"].(string)
+	status, repeatedBlockedHumanSend := do(http.MethodPost, "/webapi/v0/drafts/"+blockedHumanDraftID+"/send", nil, agentAuth)
+	if status != http.StatusConflict || repeatedBlockedHumanSend["error"].(map[string]any)["code"] != "outbound_review_required" ||
+		repeatedBlockedHumanSend["policy"].(map[string]any)["draftId"] != blockedHumanPolicyID {
+		t.Fatalf("repeated blocked human Draft send = %d %#v, want same policy Draft %v",
+			status, repeatedBlockedHumanSend, blockedHumanPolicyID)
+	}
+	blockedHumanPolicyEmailID, err := strconv.ParseInt(strings.TrimPrefix(blockedHumanPolicyID, "E"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sentAfterBlockedHuman, blockedHumanQueueRows, blockedHumanReviewRows int
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id
+		 WHERE m.account_id=$1 AND NOT m.expunged AND mb.su_sent`,
+		mailAccountID).Scan(&sentAfterBlockedHuman); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM queue WHERE account_id=$1 AND rcpt_to='blocked-human-draft@example.net'`,
+		mailAccountID).Scan(&blockedHumanQueueRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbound_policy_drafts WHERE account_id=$1 AND email_id=$2`,
+		mailAccountID, blockedHumanPolicyEmailID).Scan(&blockedHumanReviewRows); err != nil {
+		t.Fatal(err)
+	}
+	if sentAfterBlockedHuman != sentBeforeBlockedHuman || blockedHumanQueueRows != 0 || blockedHumanReviewRows != 1 {
+		t.Fatalf("blocked human Draft side effects sent=%d→%d queue=%d review=%d, want unchanged/0/1",
+			sentBeforeBlockedHuman, sentAfterBlockedHuman, blockedHumanQueueRows, blockedHumanReviewRows)
 	}
 }

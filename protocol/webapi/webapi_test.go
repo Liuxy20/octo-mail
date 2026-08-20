@@ -150,12 +150,46 @@ func TestRESTAPI(t *testing.T) {
 	}
 
 	// --- auth: no credentials → 401. ---
-	{
-		resp, _ := http.Get(hs.URL + "/webapi/v0/mailboxes")
+	for _, path := range []string{"/webapi/v0/mailboxes", "/webapi/v0/state"} {
+		resp, _ := http.Get(hs.URL + path)
 		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unauthenticated request status = %d, want 401", resp.StatusCode)
+			_ = resp.Body.Close()
+			t.Fatalf("unauthenticated %s status = %d, want 401", path, resp.StatusCode)
 		}
-		resp.Body.Close()
+		if path == "/webapi/v0/state" && resp.Header.Get("Cache-Control") != "no-store" {
+			_ = resp.Body.Close()
+			t.Fatalf("unauthenticated state Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
+		}
+		_ = resp.Body.Close()
+	}
+
+	// --- state: stable, account-scoped change-log token. ---
+	stateReq, err := http.NewRequest(http.MethodGet, hs.URL+"/webapi/v0/state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateReq.SetBasicAuth("u1@example.com", "pw")
+	stateResp, err := http.DefaultClient.Do(stateReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateResp.Header.Get("Cache-Control") != "no-store" {
+		_ = stateResp.Body.Close()
+		t.Fatalf("authenticated state Cache-Control = %q, want no-store", stateResp.Header.Get("Cache-Control"))
+	}
+	_ = stateResp.Body.Close()
+
+	st, state := do("GET", "/webapi/v0/state", "")
+	if st != http.StatusOK {
+		t.Fatalf("GET state status = %d, want 200", st)
+	}
+	initialState, ok := state["state"].(string)
+	if !ok || initialState == "" {
+		t.Fatalf("state = %v, want non-empty string", state["state"])
+	}
+	_, sameState := do("GET", "/webapi/v0/state", "")
+	if sameState["state"] != initialState {
+		t.Fatalf("unchanged state = %v, want %q", sameState["state"], initialState)
 	}
 
 	// --- mailboxes: Inbox present. ---
@@ -653,6 +687,12 @@ func TestRESTAPI(t *testing.T) {
 	_, unreadList = do("GET", "/webapi/v0/messages?mailbox=Inbox&unread=true", "")
 	if unreadList["total"] != float64(0) || len(unreadList["messages"].([]any)) != 0 {
 		t.Fatalf("unread Inbox list after \\Seen = %v, want no messages", unreadList)
+	}
+	_, changedState := do("GET", "/webapi/v0/state", "")
+	before, beforeErr := strconv.ParseInt(initialState, 10, 64)
+	after, afterErr := strconv.ParseInt(changedState["state"].(string), 10, 64)
+	if beforeErr != nil || afterErr != nil || after <= before {
+		t.Fatalf("state after mutations = %v, want numeric state greater than %q", changedState["state"], initialState)
 	}
 
 	// --- thread get: the message belongs to a thread. ---
