@@ -10,6 +10,7 @@ require (
 	github.com/mjl-/mox v0.0.16-0.20260607211447-1a47ba33893e
 	github.com/prometheus/client_golang v1.18.0
 	golang.org/x/crypto v0.51.0
+	golang.org/x/net v0.55.0
 	golang.org/x/text v0.37.0
 )
 
@@ -25,7 +26,6 @@ require (
 	github.com/prometheus/common v0.45.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
 	go.etcd.io/bbolt v1.3.12 // indirect
-	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect

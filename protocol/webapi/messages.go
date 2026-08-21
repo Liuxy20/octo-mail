@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-mail/core/mailcontent"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
@@ -51,6 +52,7 @@ type messageDetail struct {
 	Bcc                  []string             `json:"bcc,omitempty"`
 	BodyText             string               `json:"bodyText,omitempty"`
 	BodyHTML             string               `json:"bodyHtml,omitempty"`
+	BodyTruncated        bool                 `json:"bodyTruncated,omitempty"`
 	OriginalFrom         string               `json:"originalFrom,omitempty"`
 	SentBy               string               `json:"sentBy,omitempty"`
 	Attachments          []receivedAttachment `json:"attachments"`
@@ -207,9 +209,10 @@ func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (in
 		br := a.acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
-		text, html, cc := parseBodies(data)
+		text, html, cc, bodyTruncated := parseBodiesWithTruncation(data)
 		envelope := parseEnvelope(data, s.RuleMetadata, ruleRecipients)
 		detail.BodyText, detail.BodyHTML, detail.Cc = text, html, cc
+		detail.BodyTruncated = bodyTruncated
 		detail.Bcc = envelope.bcc
 		detail.OriginalFrom, detail.SentBy = envelope.originalFrom, envelope.sentBy
 		detail.Attachments, detail.AttachmentsTruncated = parseAttachments(data)
@@ -819,76 +822,72 @@ func validAttributionAddress(value string) string {
 	return address.String()
 }
 
+const (
+	maxRenderableHTMLBytes = 128 * 1024
+)
+
 // parseBodies returns (text, html, cc) parsed from the raw message.
 func parseBodies(data []byte) (text, html string, cc []string) {
+	text, html, cc, _ = parseBodiesWithTruncation(data)
+	return text, html, cc
+}
+
+// parseBodiesWithTruncation returns HTML inline only when the message has one
+// eligible HTML body within the render limit. Multiple or oversized HTML
+// bodies are omitted, while their text/plain alternative remains available and
+// callers can offer the raw-message download.
+func parseBodiesWithTruncation(data []byte) (text, html string, cc []string, bodyTruncated bool) {
 	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
 	if err != nil && part.Envelope == nil {
-		return "", "", nil
+		return "", "", nil, false
 	}
 	if part.Envelope != nil {
 		for _, a := range part.Envelope.CC {
 			cc = append(cc, a.User+"@"+a.Host)
 		}
 	}
-	var walk func(p *moxmessage.Part)
-	walk = func(p *moxmessage.Part) {
+	var htmlParts []*moxmessage.Part
+	var walk func(p *moxmessage.Part, root bool)
+	walk = func(p *moxmessage.Part, root bool) {
+		if !root && mailcontent.IsExplicitAttachment(p) {
+			return
+		}
 		if len(p.Parts) > 0 {
 			for i := range p.Parts {
-				walk(&p.Parts[i])
+				walk(&p.Parts[i], false)
 			}
 			return
 		}
 		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
 			return
 		}
-		rd := p.Reader()
-		if rd == nil {
-			return
-		}
-		b, _ := io.ReadAll(rd)
 		if strings.EqualFold(p.MediaSubType, "HTML") {
-			if html == "" {
-				html = string(b)
-			}
+			htmlParts = append(htmlParts, p)
 		} else if text == "" {
+			b, _ := io.ReadAll(mailcontent.ReaderUTF8(p))
 			text = string(b)
 		}
 	}
-	walk(&part)
-	return text, html, cc
+	walk(&part, true)
+	if len(htmlParts) > 1 {
+		return text, "", cc, true
+	}
+	if len(htmlParts) == 1 {
+		b, _ := io.ReadAll(io.LimitReader(mailcontent.ReaderUTF8(htmlParts[0]), maxRenderableHTMLBytes+1))
+		if len(b) > maxRenderableHTMLBytes {
+			return text, "", cc, true
+		}
+		html = string(b)
+	}
+	return text, html, cc, bodyTruncated
 }
 
 func previewText(data []byte) string {
-	text, html, _ := parseBodies(data)
-	s := text
-	if s == "" {
-		s = stripTags(html)
+	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
+	if err != nil && part.Envelope == nil {
+		return ""
 	}
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > 140 {
-		s = s[:140]
-	}
-	return s
-}
-
-func stripTags(s string) string {
-	var b strings.Builder
-	depth := 0
-	for _, r := range s {
-		switch r {
-		case '<':
-			depth++
-		case '>':
-			if depth > 0 {
-				depth--
-			}
-		default:
-			if depth == 0 {
-				b.WriteRune(r)
-			}
-		}
-	}
-	return b.String()
+	return mailcontent.Preview(&part)
 }
 
 func replyRecipients(env envelope, self string, all bool) (to, cc []string) {
