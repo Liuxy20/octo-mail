@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-mail/core/mailcontent"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
@@ -830,65 +831,40 @@ func parseBodies(data []byte) (text, html string, cc []string) {
 			cc = append(cc, a.User+"@"+a.Host)
 		}
 	}
-	var walk func(p *moxmessage.Part)
-	walk = func(p *moxmessage.Part) {
+	var walk func(p *moxmessage.Part, root bool)
+	walk = func(p *moxmessage.Part, root bool) {
+		if !root && mailcontent.IsExplicitAttachment(p) {
+			return
+		}
 		if len(p.Parts) > 0 {
 			for i := range p.Parts {
-				walk(&p.Parts[i])
+				walk(&p.Parts[i], false)
 			}
 			return
 		}
 		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
 			return
 		}
-		rd := p.Reader()
-		if rd == nil {
-			return
-		}
-		b, _ := io.ReadAll(rd)
 		if strings.EqualFold(p.MediaSubType, "HTML") {
 			if html == "" {
+				b, _ := io.ReadAll(mailcontent.ReaderUTF8(p))
 				html = string(b)
 			}
 		} else if text == "" {
+			b, _ := io.ReadAll(mailcontent.ReaderUTF8(p))
 			text = string(b)
 		}
 	}
-	walk(&part)
+	walk(&part, true)
 	return text, html, cc
 }
 
 func previewText(data []byte) string {
-	text, html, _ := parseBodies(data)
-	s := text
-	if s == "" {
-		s = stripTags(html)
+	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
+	if err != nil && part.Envelope == nil {
+		return ""
 	}
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > 140 {
-		s = s[:140]
-	}
-	return s
-}
-
-func stripTags(s string) string {
-	var b strings.Builder
-	depth := 0
-	for _, r := range s {
-		switch r {
-		case '<':
-			depth++
-		case '>':
-			if depth > 0 {
-				depth--
-			}
-		default:
-			if depth == 0 {
-				b.WriteRune(r)
-			}
-		}
-	}
-	return b.String()
+	return mailcontent.Preview(&part)
 }
 
 func replyRecipients(env envelope, self string, all bool) (to, cc []string) {
