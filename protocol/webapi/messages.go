@@ -8,7 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-mail/core/mailcontent"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/autoreplychain"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/outboundpolicy"
@@ -841,17 +843,13 @@ func parseBodies(data []byte) (text, html string, cc []string) {
 		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
 			return
 		}
-		rd := p.Reader()
-		if rd == nil {
-			return
-		}
-		b, _ := io.ReadAll(rd)
+		body := mailcontent.ReadUTF8(p)
 		if strings.EqualFold(p.MediaSubType, "HTML") {
 			if html == "" {
-				html = string(b)
+				html = body
 			}
 		} else if text == "" {
-			text = string(b)
+			text = body
 		}
 	}
 	walk(&part)
@@ -864,9 +862,13 @@ func previewText(data []byte) string {
 	if s == "" {
 		s = stripTags(html)
 	}
+	s = strings.ToValidUTF8(s, "")
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > 140 {
 		s = s[:140]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
 	}
 	return s
 }

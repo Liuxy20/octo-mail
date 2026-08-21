@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Mininglamp-OSS/octo-mail/core/mailcontent"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	moxmessage "github.com/mjl-/mox/message"
 )
@@ -385,17 +386,13 @@ func previewOf(part *moxmessage.Part) string {
 		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
 			return
 		}
-		rd := p.Reader()
-		if rd == nil {
-			return
-		}
-		b, _ := io.ReadAll(rd)
+		body := mailcontent.ReadUTF8(p)
 		if strings.EqualFold(p.MediaSubType, "HTML") {
 			if html == "" {
-				html = string(b)
+				html = body
 			}
 		} else if text == "" {
-			text = string(b)
+			text = body
 		}
 	}
 	walk(part)
