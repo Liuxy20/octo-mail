@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/mailcontent"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
@@ -831,40 +832,65 @@ func parseBodies(data []byte) (text, html string, cc []string) {
 			cc = append(cc, a.User+"@"+a.Host)
 		}
 	}
-	var walk func(p *moxmessage.Part, root bool)
-	walk = func(p *moxmessage.Part, root bool) {
-		if !root && mailcontent.IsExplicitAttachment(p) {
-			return
-		}
+	var walk func(p *moxmessage.Part)
+	walk = func(p *moxmessage.Part) {
 		if len(p.Parts) > 0 {
 			for i := range p.Parts {
-				walk(&p.Parts[i], false)
+				walk(&p.Parts[i])
 			}
 			return
 		}
 		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
 			return
 		}
+		body := mailcontent.ReadUTF8(p)
 		if strings.EqualFold(p.MediaSubType, "HTML") {
 			if html == "" {
-				b, _ := io.ReadAll(mailcontent.ReaderUTF8(p))
-				html = string(b)
+				html = body
 			}
 		} else if text == "" {
-			b, _ := io.ReadAll(mailcontent.ReaderUTF8(p))
-			text = string(b)
+			text = body
 		}
 	}
-	walk(&part, true)
+	walk(&part)
 	return text, html, cc
 }
 
 func previewText(data []byte) string {
-	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
-	if err != nil && part.Envelope == nil {
-		return ""
+	text, html, _ := parseBodies(data)
+	s := text
+	if s == "" {
+		s = stripTags(html)
 	}
-	return mailcontent.Preview(&part)
+	s = strings.ToValidUTF8(s, "")
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 140 {
+		s = s[:140]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
+
+func stripTags(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
 }
 
 func replyRecipients(env envelope, self string, all bool) (to, cc []string) {

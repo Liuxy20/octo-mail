@@ -371,10 +371,45 @@ func toValidUTF8(s string) string {
 	return s
 }
 
-// previewOf returns the first ~140 bytes of the selected MIME body,
-// whitespace-collapsed — the list-view preview snippet.
+// previewOf returns the first ~140 chars of a message's text body (falling back
+// to stripped HTML), whitespace-collapsed — the list-view preview snippet.
 func previewOf(part *moxmessage.Part) string {
-	return mailcontent.Preview(part)
+	var text, html string
+	var walk func(p *moxmessage.Part)
+	walk = func(p *moxmessage.Part) {
+		if len(p.Parts) > 0 {
+			for i := range p.Parts {
+				walk(&p.Parts[i])
+			}
+			return
+		}
+		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
+			return
+		}
+		body := mailcontent.ReadUTF8(p)
+		if strings.EqualFold(p.MediaSubType, "HTML") {
+			if html == "" {
+				html = body
+			}
+		} else if text == "" {
+			text = body
+		}
+	}
+	walk(part)
+	s := text
+	if s == "" {
+		s = stripHTMLTags(html)
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	// Truncate on a rune boundary (not a byte offset): a mid-rune byte slice would
+	// yield invalid UTF-8, which a Postgres text column rejects.
+	if len(s) > 140 {
+		s = s[:140]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
 }
 
 // stripHTMLTags removes tags for a text preview of an HTML-only body.
