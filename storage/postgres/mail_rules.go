@@ -115,12 +115,18 @@ func (t *tenantScope) UpdateAgentMailRule(ctx context.Context, ownerPrincipalID,
 		input.Conditions = *patch.Conditions
 	}
 	if patch.MatchFrom != nil {
+		if patch.Conditions == nil && hasMultipleMailRuleConditions(input.Conditions, "from") {
+			return directory.MailRule{}, directory.ErrMailRuleInvalid
+		}
 		input.MatchFrom = *patch.MatchFrom
 		if patch.Conditions == nil {
 			input.Conditions = replaceLegacyMailRuleCondition(input.Conditions, "from", "equals", *patch.MatchFrom)
 		}
 	}
 	if patch.MatchSubject != nil {
+		if patch.Conditions == nil && hasMultipleMailRuleConditions(input.Conditions, "subject") {
+			return directory.MailRule{}, directory.ErrMailRuleInvalid
+		}
 		input.MatchSubject = *patch.MatchSubject
 		if patch.Conditions == nil {
 			input.Conditions = replaceLegacyMailRuleCondition(input.Conditions, "subject", "contains", *patch.MatchSubject)
@@ -282,7 +288,6 @@ func normalizeMailRuleInput(input directory.MailRuleInput) (directory.MailRuleIn
 	if len(input.Conditions) == 0 || len(input.Conditions) > 5 {
 		return directory.MailRuleInput{}, directory.ErrMailRuleInvalid
 	}
-	seenConditions := make(map[string]struct{}, len(input.Conditions))
 	for i := range input.Conditions {
 		condition := &input.Conditions[i]
 		condition.Field = strings.TrimSpace(condition.Field)
@@ -298,10 +303,6 @@ func normalizeMailRuleInput(input directory.MailRuleInput) (directory.MailRuleIn
 			}
 			condition.Value = address.Pack(false)
 		}
-		if _, exists := seenConditions[condition.Field]; exists {
-			return directory.MailRuleInput{}, directory.ErrMailRuleInvalid
-		}
-		seenConditions[condition.Field] = struct{}{}
 	}
 	if len(input.MatchSubject) > 500 {
 		return directory.MailRuleInput{}, directory.ErrMailRuleInvalid
@@ -362,6 +363,20 @@ func legacyMailRuleConditions(matchFrom, matchSubject string) []directory.MailRu
 		conditions = append(conditions, directory.MailRuleCondition{Field: "subject", Operator: "contains", Value: matchSubject})
 	}
 	return conditions
+}
+
+func hasMultipleMailRuleConditions(conditions []directory.MailRuleCondition, field string) bool {
+	found := false
+	for _, condition := range conditions {
+		if condition.Field != field {
+			continue
+		}
+		if found {
+			return true
+		}
+		found = true
+	}
+	return false
 }
 
 func replaceLegacyMailRuleCondition(conditions []directory.MailRuleCondition, field, operator, value string) []directory.MailRuleCondition {
