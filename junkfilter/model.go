@@ -24,9 +24,8 @@ const (
 	defaultModelPath = "models/shared-junk-v1.csv.gz"
 )
 
-// modelFiles contains the private release input when the model package is
-// present in the build context. Source checkouts carry only models/README.md;
-// the aggregate model itself is deliberately not committed to the public repo.
+// modelFiles contains the versioned default shared model distributed with the
+// server. It contains aggregate hashed feature counters, not raw messages.
 //
 //go:embed models
 var modelFiles embed.FS

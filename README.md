@@ -103,8 +103,8 @@ KEY=$(docker compose exec -T octo-mail octo-mail apikey create alice@acme.test c
 curl -H "Authorization: Bearer $KEY" http://localhost:8090/webapi/v0/mailboxes
 
 # Offline model preparation only. Normal production startup does not train from
-# raw messages: an internal release build embeds the reviewed aggregate package
-# and imports it automatically when the shared model is empty.
+# raw messages: the release binary embeds the reviewed aggregate package and
+# imports it automatically when the shared model is empty.
 docker compose cp ./corpus octo-mail:/tmp/junk-corpus
 docker compose exec -T octo-mail octo-mail junk train-global ham /tmp/junk-corpus/ham
 docker compose exec -T octo-mail octo-mail junk train-global spam /tmp/junk-corpus/spam
@@ -118,9 +118,9 @@ docker compose exec -T octo-mail octo-mail junk evaluate-global \
   /tmp/junk-corpus/eval/ham /tmp/junk-corpus/eval/spam \
   --json /tmp/junk-evaluation.json --csv /tmp/junk-evaluation.csv
 
-# After review, export aggregate counters for the internal release build.
+# After review, export aggregate counters for a model release.
 docker compose exec -T octo-mail octo-mail junk export-global \
-  2026-08-25-v1 /tmp/shared-junk-v1.csv.gz
+  <version> /tmp/shared-junk-v1.csv.gz
 ```
 
 When the holdout uses `ham/{zh,en,mixed}` and `spam/{zh,en,mixed}`, the report
@@ -128,10 +128,11 @@ also groups results by language. It reports per-message probability, Ham false
 positives, Spam recall, and a candidate zero-Ham-error threshold. A model with
 fewer than 200 samples in either class remains inactive.
 
-The package contains SHA-256 feature identifiers and aggregate Ham/Spam counts,
-not raw messages. Place the internal release input at
-`junkfilter/models/shared-junk-v1.csv.gz` before building the image. A fresh
-database imports it once; an existing shared model is never overwritten.
+The repository includes a versioned default package at
+`junkfilter/models/shared-junk-v1.csv.gz`. It contains SHA-256 feature
+identifiers and aggregate Ham/Spam counts, not raw messages. The package is
+embedded during normal builds. A fresh database imports it once; an existing
+shared model is never overwritten.
 
 `OCTO_MAIL_SHARED_JUNK_THRESHOLD` defaults to `0.9999`. Shared content and
 sender-reputation signals may route accepted mail into Junk, but never reject or
