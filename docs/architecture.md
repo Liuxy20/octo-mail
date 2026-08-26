@@ -24,7 +24,7 @@ protocol/       【消费者层】每协议一包,只绑定 core 接口
   imapd/ jmapd/ smtpd/ webapi/
 
 mailflow/       【邮件流】邮件进出的流水线
-  inbound/        鉴别(SPF/DKIM/DMARC/iprev/DNSBL) + 决策(信誉/greylist/subjectpass/ruleset/自适应阈值/forwarded)
+  inbound/        鉴别(SPF/DKIM/DMARC/iprev/DNSBL) + 决策(信誉/greylist/ruleset/共享垃圾检测/forwarded)
   submit/         提交入队 + deliverer + dialer(多出口源IP绑定) + DSN
   queue/          出站队列:append-only queue_log(尝试历史)+ queue 调度投影(due-scan)+ 租约投递(FOR UPDATE SKIP LOCKED,投递受租约超时约束以避免重复发送)
   autoreply/      度假自动回复
@@ -43,7 +43,7 @@ ops/            【运维】
   mailboxops/     mbox 导入导出
 
 webui/          浏览器 webmail (严格 TS → committed JS → go:embed)
-junkfilter/     贝叶斯垃圾过滤 (贝叶斯库包装,per-account)
+junkfilter/     贝叶斯垃圾过滤 (Mox 分词,部署级共享模型 + 单邮箱发件人白名单)
 
 docs/           架构文档 + GAP 清单
 ```

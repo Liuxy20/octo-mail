@@ -1,0 +1,5 @@
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Preserve the Mox reuse boundary, tenant isolation, and project quality gates."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Apply PostgreSQL schema and transaction rules to new training state."}
+{"file":".coding/spec/backend/directory-structure.md","reason":"Preserve dependency direction across protocol, core, and storage layers."}
+{"file":".coding/tasks/08-24-shared-personalized-junk-filter/research/rspamd.md","reason":"Limit the design to relevant shared/personal/deduplication/action principles."}
+{"file":".coding/tasks/08-24-shared-personalized-junk-filter/research/corpus.md","reason":"Keep corpus provenance, leakage controls, language mix, and evaluation gates explicit."}

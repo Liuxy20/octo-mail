@@ -91,8 +91,14 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "junk":
+			if err := cmdJunk(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "octo-mail junk:", err)
+				os.Exit(1)
+			}
+			return
 		default:
-			fmt.Fprintf(os.Stderr, "octo-mail: unknown subcommand %q (use: serve | passwd | gendkim | apikey | export | import)\n", os.Args[1])
+			fmt.Fprintf(os.Stderr, "octo-mail: unknown subcommand %q (use: serve | passwd | gendkim | apikey | export | import | junk)\n", os.Args[1])
 			os.Exit(2)
 		}
 	}
@@ -147,6 +153,21 @@ func run() error {
 	}
 	defer s.Close()
 	log.Info("store opened; schema applied", "dsn", redactDSN(cfg.dsn))
+
+	// Import the offline-built default before starting background coordinators or
+	// opening listeners. A malformed release package then fails startup cleanly
+	// without leaving a coordinator waiting on the pool during deferred Close.
+	junkMgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams)
+	junkMgr.SharedThreshold = cfg.sharedJunkThreshold
+	defer junkMgr.Close()
+	imported, modelInfo, err := junkMgr.BootstrapDefaultModel(ctx)
+	if err != nil {
+		return fmt.Errorf("bootstrap default junk model: %w", err)
+	}
+	if imported {
+		log.Info("default shared junk model imported", "version", modelInfo.Version,
+			"ham", modelInfo.Hams, "spam", modelInfo.Spams, "words", modelInfo.Words)
+	}
 
 	if err := s.StartCoordinator(ctx); err != nil {
 		return fmt.Errorf("start coordinator: %w", err)
@@ -249,14 +270,10 @@ func run() error {
 	// Inbound authenticator (SPF/DKIM/DMARC/iprev/DNSBL) for the MX listener.
 	authenticator := &inbound.Authenticator{Resolver: dns.StrictResolver{Pkg: "octo-mail"}, DNSBLZones: cfg.dnsblZones}
 	decider := &inbound.Decider{
-		Pool:              s.Pool,
-		GreylistEnabled:   cfg.greylist,
-		GreylistDelay:     cfg.greylistDelay,
-		JunkThreshold:     cfg.junkThreshold,
-		RejectThreshold:   cfg.rejectThreshold,
-		TrustedHamCount:   cfg.trustedHamCount,
-		SubjectPassKey:    cfg.subjectPassKey,
-		SubjectPassPeriod: cfg.subjectPassPeriod,
+		Pool:            s.Pool,
+		GreylistEnabled: cfg.greylist,
+		GreylistDelay:   cfg.greylistDelay,
+		TrustedHamCount: cfg.trustedHamCount,
 	}
 	reports := &reportdb.Store{Pool: s.Pool}
 
@@ -267,20 +284,11 @@ func run() error {
 	if !cfg.rejectDMARC {
 		log.Warn("DMARC enforcement OFF: messages failing a domain's DMARC p=reject policy are accepted (spoofing risk). Set OCTO_MAIL_REJECT_DMARC=1 to enforce.")
 	}
-	if len(cfg.subjectPassKey) == 0 {
-		log.Info("subjectpass disabled (no OCTO_MAIL_SUBJECTPASS_KEY); content-rejected senders get no challenge-retry path")
-	}
-
-	// Per-account junk filter (bayesian), routing spam to the Junk mailbox. State
-	// lives in Postgres (shared across nodes), not per-node files.
-	junkMgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams, cfg.junkThreshold)
-	defer junkMgr.Close()
-
 	// SMTP receive (MX, :25).
 	if cfg.smtpAddr != "" {
 		vacation := &autoreply.Responder{Lookup: s.LookupAccountByID, Submitter: submitter}
 		ruleProcessor := &mailrules.Processor{Pool: s.Pool, Submitter: submitter, RuleMetadata: ruleMetadata, MaxMessageSize: cfg.maxSize}
-		mx := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, TLSConfig: nil, Auth: authenticator, RejectDMARCFail: cfg.rejectDMARC, MaxHops: cfg.maxHops, Junk: junkMgr, Decider: decider,
+		mx := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, TLSConfig: nil, Auth: authenticator, RejectDMARCFail: cfg.rejectDMARC, MaxHops: cfg.maxHops, Junk: junkMgr, JunkAllowlist: junkMgr, Decider: decider,
 			DMARCRecorder: func(ctx context.Context, fromDomain, rua, sourceIP, spf, dkim, disposition string) {
 				_ = reports.RecordDMARCAgg(ctx, fromDomain, rua, sourceIP, spf, dkim, disposition)
 			},
@@ -375,7 +383,7 @@ func run() error {
 
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
-		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize, LoginLimiter: loginLimiter}
+		imap := &imapd.Server{Dir: dir, TLSConfig: acmeTLS, MaxSize: cfg.maxSize, LoginLimiter: loginLimiter}
 		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, drain, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).

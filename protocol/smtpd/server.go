@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/inbound"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	"github.com/Mininglamp-OSS/octo-mail/ops/obs"
+	"github.com/mjl-/mox/dmarc"
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/scram"
@@ -77,9 +78,14 @@ type Server struct {
 	MaxHops int
 
 	// Junk, when set, classifies each accepted message per recipient account; a
-	// message classified as spam is delivered to the account's "Junk" mailbox
-	// instead of "Inbox". Injected as an interface to avoid an import cycle.
+	// message classified by the deployment model is delivered to the account's
+	// "Junk" mailbox instead of "Inbox". Injected as an interface to avoid an
+	// import cycle.
 	Junk JunkClassifier
+	// JunkAllowlist checks exact sender addresses explicitly trusted by the
+	// recipient owner. A match is only consulted for a DMARC-authenticated From
+	// identity and bypasses content/reputation Junk routing, not protocol checks.
+	JunkAllowlist JunkSenderAllowlist
 
 	// Decider, when set, makes the inbound accept/defer/reject decision
 	// (greylist + reputation + bayesian content) after DATA — the the analyze
@@ -139,6 +145,10 @@ type Server struct {
 // JunkClassifier classifies a raw message for an account as spam or not.
 type JunkClassifier interface {
 	Classify(ctx context.Context, accountID int64, raw []byte) (prob float64, significant, isJunk bool, err error)
+}
+
+type JunkSenderAllowlist interface {
+	SenderAllowed(ctx context.Context, accountID int64, sender string) (bool, error)
 }
 
 // defaultMaxRcpt is the RCPT-per-message cap used when Server.MaxRcpt is unset.
@@ -1175,6 +1185,8 @@ func (c *conn) processData(data []byte) error {
 	repAuthed := authenticated && authRes.SPF == spf.StatusPass &&
 		senderDomain != "" && strings.EqualFold(authRes.SPFDomain.ASCII, senderDomain)
 
+	visibleSender, visibleSenderOK := fromHeaderAddress(data)
+	allowlistAuthenticated := authenticated && authRes.DMARC.Status == dmarc.StatusPass
 	rulesProcessed := make(map[int64]struct{})
 	for i, target := range c.rcpts {
 		m := &store.Message{}
@@ -1187,21 +1199,23 @@ func (c *conn) processData(data []byte) error {
 		// fall back to plain junk classification (route spam to Junk).
 		mailbox := "Inbox"
 		if c.srv.Decider != nil {
+			senderAllowed := false
+			if allowlistAuthenticated && visibleSenderOK && c.srv.JunkAllowlist != nil {
+				allowed, err := c.srv.JunkAllowlist.SenderAllowed(c.ctx, target.AccountID(), visibleSender)
+				if err == nil {
+					senderAllowed = allowed
+				}
+			}
 			var classify inbound.ClassifyFunc
 			if c.srv.Junk != nil {
 				classify = c.srv.Junk.Classify
 			}
-			dec := c.srv.Decider.Decide(c.ctx, target.AccountID(), senderDomain, c.remoteIP(), data, repAuthed, classify)
+			dec := c.srv.Decider.Decide(c.ctx, target.AccountID(), senderDomain, c.remoteIP(), data, repAuthed, senderAllowed, classify)
 			switch dec.Verdict {
 			case inbound.Defer:
 				rcpt := c.rcptAddrs[i]
 				c.reset()
 				obs.InboundRejected.WithLabelValues("greylist").Inc()
-				// A subjectpass challenge (if present) tells a legitimate sender how
-				// to retry past a content rejection.
-				if dec.Challenge != "" {
-					return c.writef("451 4.7.1 message held; to pass, include %q in the Subject and resend", dec.Challenge)
-				}
 				return c.writef("451 4.7.1 greylisted, please retry later (%s)", rcpt)
 			case inbound.Reject:
 				c.reset()
@@ -1298,6 +1312,14 @@ func fromHeaderDomain(raw []byte) (string, bool) {
 		return "", false
 	}
 	return strings.ToLower(addr.Domain.ASCII), true
+}
+
+func fromHeaderAddress(raw []byte) (string, bool) {
+	address, _, _, err := message.From(nil, false, byteReaderAt(raw), nil)
+	if err != nil || address.Localpart == "" || address.Domain.ASCII == "" {
+		return "", false
+	}
+	return strings.ToLower(address.String()), true
 }
 
 type byteReaderAt []byte

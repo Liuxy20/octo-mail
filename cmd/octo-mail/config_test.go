@@ -115,6 +115,18 @@ func TestS3ForcePathStyleConfig(t *testing.T) {
 	}
 }
 
+func TestSharedJunkThresholdConfig(t *testing.T) {
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", "")
+	if got := loadConfig().sharedJunkThreshold; got != 0.9999 {
+		t.Fatalf("default shared junk threshold = %v, want 0.9999", got)
+	}
+
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", "0.9995")
+	if got := loadConfig().sharedJunkThreshold; got != 0.9995 {
+		t.Fatalf("configured shared junk threshold = %v, want 0.9995", got)
+	}
+}
+
 func TestOutboundRelayConfig(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tests := []struct {

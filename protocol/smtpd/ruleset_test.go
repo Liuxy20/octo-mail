@@ -15,11 +15,9 @@ import (
 	"github.com/mjl-/mox/smtpclient"
 )
 
-// TestRulesetAndSubjectpass proves two inbound heuristics: (1) a per-account
-// ruleset forces a header-matched message into a named mailbox (bypassing junk
-// routing); (2) subjectpass turns a would-be reject into a challenge (451), and a
-// resend carrying the token in the Subject is accepted. Driven by the smtpclient.
-func TestRulesetAndSubjectpass(t *testing.T) {
+// TestRulesetAndJunkRouting proves that a per-account ruleset can force a
+// mailbox, while known-bad reputation remains reversible Junk routing.
+func TestRulesetAndJunkRouting(t *testing.T) {
 	ctx := context.Background()
 	bs, _ := blob.NewFS(t.TempDir())
 	s, err := postgres.Open(ctx, testDSN, bs)
@@ -71,54 +69,23 @@ func TestRulesetAndSubjectpass(t *testing.T) {
 		t.Fatalf("ruleset did not file into Lists: got %d", listCount)
 	}
 
-	// === Part 2: subjectpass. Seed a known-bad sender so content would reject;
-	// with SubjectPassKey set, the first attempt is challenged (451), and a
-	// resend with the token in the Subject is accepted. ===
+	// === Part 2: known-bad reputation is filed into Junk without rejecting or
+	// challenging the sender. ===
 	if _, err := s.Pool.Exec(ctx, `INSERT INTO inbound_reputation (account_id, sender_domain, junk_count) VALUES ($1,'stranger.example',5)`, accID); err != nil {
 		t.Fatal(err)
 	}
-	spDecider := &inbound.Decider{Pool: s.Pool, SubjectPassKey: []byte("test-subjectpass-key")}
+	spDecider := &inbound.Decider{Pool: s.Pool}
 	spMX := &smtpd.Server{Dir: dir, Hostname: "mx.example.com", Decider: spDecider}
 
-	// First attempt: rejected-turned-challenge → 451 with a token.
 	raw2 := "From: cold@stranger.example\r\nTo: u1@example.com\r\nSubject: please read\r\n\r\nlet me in\r\n"
-	err = deliver(spMX, "cold@stranger.example", raw2)
-	if err == nil {
-		t.Fatalf("subjectpass first attempt was accepted; expected 451 challenge")
+	if err := deliver(spMX, "cold@stranger.example", raw2); err != nil {
+		t.Fatalf("known-bad sender was challenged/rejected instead of accepted into Junk: %v", err)
 	}
-	if !strings.Contains(err.Error(), "451") {
-		t.Fatalf("subjectpass challenge error = %v, want 451", err)
-	}
-	// Extract the token the server told the sender to include.
-	token := extractPassToken(err.Error())
-	if token == "" {
-		t.Fatalf("no subjectpass token in challenge: %v", err)
+	var junk int
+	s.Pool.QueryRow(ctx, `SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id WHERE m.account_id=$1 AND mb.name='Junk' AND NOT m.expunged`, accID).Scan(&junk)
+	if junk != 1 {
+		t.Fatalf("known-bad message count in Junk = %d, want 1", junk)
 	}
 
-	// Resend with the token in the Subject → accepted into Inbox.
-	raw3 := "From: cold@stranger.example\r\nTo: u1@example.com\r\nSubject: " + token + "\r\n\r\nlet me in\r\n"
-	if err := deliver(spMX, "cold@stranger.example", raw3); err != nil {
-		t.Fatalf("subjectpass resend with token failed: %v", err)
-	}
-	var inbox int
-	s.Pool.QueryRow(ctx, `SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id WHERE m.account_id=$1 AND mb.name='Inbox' AND NOT m.expunged`, accID).Scan(&inbox)
-	if inbox != 1 {
-		t.Fatalf("subjectpass-accepted message not in Inbox: got %d", inbox)
-	}
-
-	t.Logf("OK: ruleset filed List-Id mail into Lists; subjectpass challenged a bad sender (451) then accepted the token resend")
-}
-
-// extractPassToken pulls the quoted token out of the 451 challenge text
-// (`... include "TOKEN" in the Subject ...`).
-func extractPassToken(s string) string {
-	i := strings.IndexByte(s, '"')
-	if i < 0 {
-		return ""
-	}
-	j := strings.IndexByte(s[i+1:], '"')
-	if j < 0 {
-		return ""
-	}
-	return s[i+1 : i+1+j]
+	t.Logf("OK: ruleset filed List-Id mail into Lists; known-bad reputation filed mail into Junk")
 }

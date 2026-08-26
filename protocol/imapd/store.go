@@ -1,7 +1,6 @@
 package imapd
 
 import (
-	"io"
 	"strconv"
 	"strings"
 
@@ -51,14 +50,6 @@ func (c *conn) cmdStore(tag, args string, byUID bool) {
 	flags := parseFlagList(flagTok)
 	var modified []uint32 // UIDs rejected by UNCHANGEDSINCE
 
-	// Collect junk-training actions (messageID, ham?) for messages whose \Junk
-	// flag changed, to run after the tx commits.
-	type trainAction struct {
-		m   store.Message
-		ham bool
-	}
-	var trains []trainAction
-
 	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
 		msgs, err := tx.QueryMessage().FilterMailbox(c.selected.ID).SortUID().List()
 		if err != nil {
@@ -90,14 +81,9 @@ func (c *conn) cmdStore(tag, args string, byUID bool) {
 				modified = append(modified, uint32(m.UID))
 				continue
 			}
-			wasJunk := m.Junk
 			applyFlags(&m, op, flags)
 			if err := tx.Update(&m); err != nil {
 				return err
-			}
-			// \Junk transition → schedule retrain (spam when gained, ham when lost).
-			if c.srv.Junk != nil && m.Junk != wasJunk {
-				trains = append(trains, trainAction{m: m, ham: !m.Junk})
 			}
 			if !silent {
 				c.writeFetch(seq, m, fetchReq{flags: true}, byUID)
@@ -108,15 +94,6 @@ func (c *conn) cmdStore(tag, args string, byUID bool) {
 	if err != nil {
 		c.no(tag, err.Error())
 		return
-	}
-	// Retrain the junk filter outside the tx (reads the body from the blob).
-	for _, ta := range trains {
-		br := c.acc.MessageReader(c.ctx, ta.m)
-		data, rerr := io.ReadAll(br)
-		br.Close()
-		if rerr == nil {
-			_ = c.srv.Junk.Train(c.ctx, c.acc.ID(), ta.ham, data)
-		}
 	}
 	if len(modified) > 0 {
 		var ids []string

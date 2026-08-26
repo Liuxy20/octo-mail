@@ -16,10 +16,9 @@ import (
 	"github.com/mjl-/mox/smtpclient"
 )
 
-// TestJunkRoutingOnDelivery proves WF-B end to end: with a per-account junk
-// filter trained on spam/ham, a real SMTP delivery of a spammy message is routed
-// to the account's Junk mailbox, while a hammy message goes to Inbox. Uses an
-// unmodified smtpclient over a pipe.
+// TestJunkRoutingOnDelivery proves end to end that a shared model routes a
+// spammy message to Junk while a hammy message goes to Inbox. Uses an unmodified
+// smtpclient over a pipe.
 func TestJunkRoutingOnDelivery(t *testing.T) {
 	ctx := context.Background()
 	bs, _ := blob.NewFS(t.TempDir())
@@ -28,7 +27,7 @@ func TestJunkRoutingOnDelivery(t *testing.T) {
 		t.Skipf("postgres not available (%v)", err)
 	}
 	defer s.Close()
-	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, junk_words, junk_totals RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, junk_words, junk_totals, junk_global_words, junk_global_totals, junk_global_learns RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	var tenantID, accID, domID int64
@@ -38,16 +37,16 @@ func TestJunkRoutingOnDelivery(t *testing.T) {
 	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
 	dir := s.NewDirectory()
 
-	// Train the account's junk filter (>=50 ham to be significant).
-	mgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams, 0.95)
+	// Train the deployment-wide model to its activation floor.
+	mgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams)
 	defer mgr.Close()
-	for i := 0; i < 60; i++ {
+	for i := 0; i < 200; i++ {
 		spam := []byte(fmt.Sprintf("Subject: WIN cheap viagra pills\r\n\r\nfree prize cheap meds cheap loans act now winner %d\r\n", i))
 		ham := []byte(fmt.Sprintf("Subject: sync notes\r\n\r\nteam here are today's engineering meeting notes and migration plan item %d\r\n", i))
-		if err := mgr.Train(ctx, accID, false, spam); err != nil {
+		if _, err := mgr.TrainGlobalSample(ctx, fmt.Sprintf("spam-%d", i), false, spam); err != nil {
 			t.Fatal(err)
 		}
-		if err := mgr.Train(ctx, accID, true, ham); err != nil {
+		if _, err := mgr.TrainGlobalSample(ctx, fmt.Sprintf("ham-%d", i), true, ham); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -90,5 +89,5 @@ func TestJunkRoutingOnDelivery(t *testing.T) {
 	if in := count("Inbox"); in != 1 {
 		t.Fatalf("Inbox has %d messages, want 1 (ham misrouted)", in)
 	}
-	t.Logf("OK: spam → Junk mailbox, ham → Inbox (per-account bayesian routing on real SMTP delivery)")
+	t.Logf("OK: spam → Junk mailbox, ham → Inbox (shared model routing on real SMTP delivery)")
 }
