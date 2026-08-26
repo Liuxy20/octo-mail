@@ -16,9 +16,9 @@ import (
 )
 
 // TestInboundDecision proves P0-1: the inbound decision engine greylists a
-// first-seen sender (451), accepts on retry after the delay, rejects a
-// known-bad sender by reputation (550), and lets a trusted sender through — all
-// at SMTP time, driven by an unmodified smtpclient.
+// first-seen sender (451), accepts on retry after the delay, files a known-bad
+// sender into Junk without rejecting it, and does not trust an unauthenticated
+// sender domain — all at SMTP time, driven by an unmodified smtpclient.
 func TestInboundDecision(t *testing.T) {
 	ctx := context.Background()
 	bs, _ := blob.NewFS(t.TempDir())
@@ -76,20 +76,21 @@ func TestInboundDecision(t *testing.T) {
 		t.Fatalf("after greylist pass: inbox has %d, want 1", inbox)
 	}
 
-	// --- Known-bad sender: seed junk reputation, expect 550 reject. ---
+	// --- Known-bad sender: seed junk reputation, expect accepted Junk delivery. ---
 	if _, err := s.Pool.Exec(ctx, `INSERT INTO inbound_reputation (account_id, sender_domain, junk_count) VALUES ($1,'spam.example',5)`, accID); err != nil {
 		t.Fatal(err)
 	}
-	// Pre-pass greylist for spam.example so the reputation reject (not greylist) fires.
+	// Pre-pass greylist for spam.example so reputation routing is isolated here.
 	if _, err := s.Pool.Exec(ctx, `INSERT INTO greylist (account_id, sender_domain, client_subnet, allowed_at) VALUES ($1,'spam.example','198.51.100.0/24', now())`, accID); err != nil {
 		t.Fatal(err)
 	}
-	err = deliver("evil@spam.example")
-	if err == nil {
-		t.Fatalf("known-bad sender was accepted; expected 550 reject")
+	if err := deliver("evil@spam.example"); err != nil {
+		t.Fatalf("known-bad sender was rejected instead of filed into Junk: %v", err)
 	}
-	if !strings.Contains(err.Error(), "550") {
-		t.Fatalf("known-bad sender error = %v, want 550", err)
+	var junk int
+	s.Pool.QueryRow(ctx, `SELECT count(*) FROM messages m JOIN mailboxes mb ON mb.id=m.mailbox_id WHERE m.account_id=$1 AND mb.name='Junk' AND NOT m.expunged`, accID).Scan(&junk)
+	if junk != 1 {
+		t.Fatalf("known-bad sender messages in Junk = %d, want 1", junk)
 	}
 
 	// --- Trusted reputation WITHOUT authentication does NOT fast-track (H10). ---
@@ -105,5 +106,5 @@ func TestInboundDecision(t *testing.T) {
 		t.Fatalf("unauthenticated trusted-reputation sender: err=%v, want 451 greylist (no trust fast-path without auth)", err)
 	}
 
-	t.Logf("OK: first-contact greylisted(451)→retry accepted; known-bad reputation rejected(550); unauthenticated trusted-reputation still greylisted (H10 gate)")
+	t.Logf("OK: first-contact greylisted(451)→retry accepted; known-bad reputation→Junk; unauthenticated trusted-reputation still greylisted")
 }

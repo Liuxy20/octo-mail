@@ -15,5 +15,9 @@
 .DS_Store
 /octo-mail
 
+# Private release input: aggregate shared-junk model generated offline. The
+# build embeds it when present, but the model is not published with source.
+/junkfilter/models/*.csv.gz
+
 # Local secrets
 /.env

@@ -326,6 +326,16 @@ type Tx interface {
 	QueryMailbox() MailboxQuery
 }
 
+// JunkSenderAllowlistTx is an optional account-scoped capability for exact
+// sender addresses the owner has explicitly trusted. Implementations must use
+// the account attached to the surrounding transaction; callers never supply an
+// account ID.
+type JunkSenderAllowlistTx interface {
+	JunkAllowedSenders() ([]string, error)
+	AddJunkAllowedSender(address string) error
+	RemoveJunkAllowedSender(address string) error
+}
+
 // MessageQuery is the bounded query surface the protocol code needs: FETCH by
 // UID range, CONDSTORE CHANGEDSINCE, flag filters, and full-text SEARCH. This is
 // the single seam that replaces the bstore.QueryTx[Message] generic.

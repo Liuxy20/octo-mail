@@ -13,8 +13,7 @@ import (
 // reputation shortcut only applies to an authenticated (DMARC-aligned) sender
 // domain, and RecordOutcome only credits reputation for authenticated mail — so
 // a spoofable MAIL FROM domain can neither leverage nor build a "trusted"
-// reputation. The known-bad reject is intentionally NOT gated on auth (rejecting
-// mail that claims a known-bad domain is safe regardless).
+// reputation. Known-bad reputation remains reversible and files mail into Junk.
 func TestReputationRequiresAuth(t *testing.T) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, decDSN)
@@ -50,11 +49,11 @@ func TestReputationRequiresAuth(t *testing.T) {
 	}
 
 	// Authenticated → trusted-sender shortcut fires (Accept, no greylist/content).
-	if dec := d.Decide(ctx, acc, "trusted.example", ip, msg, true, nil); dec.Reason != "trusted-sender" {
+	if dec := d.Decide(ctx, acc, "trusted.example", ip, msg, true, false, nil); dec.Reason != "trusted-sender" {
 		t.Fatalf("authed trusted domain: reason=%q verdict=%v, want trusted-sender", dec.Reason, dec.Verdict)
 	}
 	// Unauthenticated → shortcut suppressed (must NOT be trusted-sender).
-	if dec := d.Decide(ctx, acc, "trusted.example", ip, msg, false, nil); dec.Reason == "trusted-sender" {
+	if dec := d.Decide(ctx, acc, "trusted.example", ip, msg, false, false, nil); dec.Reason == "trusted-sender" {
 		t.Fatalf("unauthenticated domain got the trusted-sender fast-path — spoof bypass")
 	}
 
@@ -78,28 +77,26 @@ func TestReputationRequiresAuth(t *testing.T) {
 		t.Fatalf("authenticated RecordOutcome ham_count=%d, want 1", ham)
 	}
 
-	// Adaptive junk threshold must not use a spoofable domain's history: a
-	// ham-heavy domain, when UNauthenticated, gets the neutral base threshold, so
-	// a borderline-junk message is filed Junk rather than accepted-lenient.
-	// hammy.example has strong ham history; classify returns a borderline prob
-	// (0.90) that a lenient (authed) threshold would accept but the base rejects.
+	// A ham-heavy domain only gets its trusted fast-path when authenticated. This
+	// classifier result is below the deployment model's action threshold.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO inbound_reputation (account_id, sender_domain, ham_count, junk_count) VALUES ($1,'hammy.example',90,10)
 		 ON CONFLICT (account_id, sender_domain) DO UPDATE SET ham_count=90, junk_count=10`, acc); err != nil {
 		t.Fatal(err)
 	}
 	classify := func(ctx context.Context, accountID int64, raw []byte) (float64, bool, bool, error) {
-		return 0.97, true, true, nil
+		return 0.97, true, false, nil
 	}
 	hammyMsg := []byte("From: x@hammy.example\r\nTo: u@acme.test\r\nSubject: hi\r\n\r\nbody\r\n")
-	// Authenticated → lenient threshold (~0.998 for 90/10 history) → 0.97 accepted.
-	if dec := d.Decide(ctx, acc, "hammy.example", ip, hammyMsg, true, classify); dec.Verdict != inbound.Accept {
+	// Authenticated mixed reputation is not fully trusted, so normal content
+	// classification still runs and accepts the below-threshold result.
+	if dec := d.Decide(ctx, acc, "hammy.example", ip, hammyMsg, true, false, classify); dec.Verdict != inbound.Accept {
 		t.Fatalf("authed hammy 0.97 → %v (%s), want Accept (lenient)", dec.Verdict, dec.Reason)
 	}
-	// Unauthenticated → neutral base threshold (0.95) → 0.97 filed Junk (no borrowed leniency).
-	if dec := d.Decide(ctx, acc, "hammy.example", ip, hammyMsg, false, classify); dec.Verdict != inbound.AcceptJunk {
-		t.Fatalf("unauthenticated hammy 0.97 → %v (%s), want AcceptJunk (no lenient threshold)", dec.Verdict, dec.Reason)
+	// Unauthenticated mail gets the same content result and no reputation bypass.
+	if dec := d.Decide(ctx, acc, "hammy.example", ip, hammyMsg, false, false, classify); dec.Verdict != inbound.Accept {
+		t.Fatalf("unauthenticated hammy 0.97 → %v (%s), want conservative Accept", dec.Verdict, dec.Reason)
 	}
 
-	t.Logf("OK: trusted shortcut + reputation credit + adaptive leniency all gated on authentication; known-bad reject ungated")
+	t.Logf("OK: trusted shortcut and reputation credit are authentication-gated; content routing remains reversible")
 }

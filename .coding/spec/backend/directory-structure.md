@@ -35,7 +35,7 @@ mailflow/        mail in/out pipeline
 security/        cross-cutting: auth/ (argon2id + SCRAM), acme/, privsep/
 ops/             obs/ (metrics) ha/ reportdb/ webadmin/ mailboxops/
 webui/           browser webmail (TS → committed JS → go:embed)
-junkfilter/      per-account Bayesian filter (wraps a bayesian lib)
+junkfilter/      deployment-wide Bayesian baseline + sender allowlist (Mox tokenization)
 ```
 
 ---

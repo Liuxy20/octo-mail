@@ -2,22 +2,19 @@
 // reputation, and bayesian junk scoring into a single inbound verdict — the
 // octo-mail equivalent of the smtpserver/analyze.go + reputation.go, implemented
 // on the Postgres substrate rather than bstore. The verdict is computed AFTER
-// DATA (content available) so a spammy first contact can be rejected at SMTP
-// time (5xx) or greylisted (4xx) instead of always being accepted and filed.
+// DATA (content available). Content and reputation can only route accepted mail
+// into Junk; protocol/security checks remain responsible for SMTP rejection.
 package inbound
 
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mjl-/mox/smtp"
-	"github.com/mjl-/mox/subjectpass"
 )
 
 // Verdict is the inbound decision for one message.
@@ -51,10 +48,6 @@ type Decision struct {
 	// Mailbox, when non-empty, overrides the destination mailbox (a ruleset match
 	// forcing delivery to e.g. "Lists"). Empty means the default (Inbox/Junk).
 	Mailbox string
-	// Challenge, when non-empty on a Defer verdict, is a subjectpass phrase the
-	// caller should include in the 4xx so a legitimate sender can retry with it in
-	// the Subject and pass.
-	Challenge string
 }
 
 // Decider makes inbound accept/defer/reject decisions. It is safe to leave any
@@ -68,28 +61,13 @@ type Decider struct {
 	// adds delivery latency for first contacts.
 	GreylistEnabled bool
 
-	// JunkThreshold: probability >= this is spam (default 0.95).
-	JunkThreshold float64
-	// RejectThreshold: probability >= this is rejected outright (default 0.999,
-	// i.e. only near-certain spam is 5xx'd; the rest goes to Junk).
-	RejectThreshold float64
-
 	// TrustedHamCount: a sender domain with at least this many accepted (ham)
-	// messages and no junk skips content-based rejection (default 3).
+	// messages and no junk skips content-based Junk routing (default 3).
 	TrustedHamCount int64
-
-	// SubjectPassKey, when non-empty, enables subjectpass (subjectpass): a
-	// message that would be rejected on content is instead deferred with a
-	// challenge — the sender may retry with a signed token in the Subject, which
-	// is then accepted. Bypasses reputation/content rejection for legitimate
-	// senders willing to reply. Empty = disabled.
-	SubjectPassKey []byte
-	// SubjectPassPeriod is how long a subjectpass token is valid (default 12h).
-	SubjectPassPeriod time.Duration
 }
 
-// ClassifyFunc returns the bayesian spam probability and significance for a
-// message body, for the recipient account. Wired to junkfilter.Manager.Classify.
+// ClassifyFunc returns the shared Bayesian result for a recipient. Content
+// classification is only allowed to route accepted mail into Junk.
 type ClassifyFunc func(ctx context.Context, accountID int64, raw []byte) (prob float64, significant, isJunk bool, err error)
 
 func (d *Decider) greylistDelay() time.Duration {
@@ -97,41 +75,6 @@ func (d *Decider) greylistDelay() time.Duration {
 		return d.GreylistDelay
 	}
 	return 5 * time.Minute
-}
-func (d *Decider) junkThreshold() float64 {
-	if d.JunkThreshold > 0 {
-		return d.JunkThreshold
-	}
-	return 0.95
-}
-func (d *Decider) rejectThreshold() float64 {
-	if d.RejectThreshold > 0 {
-		return d.RejectThreshold
-	}
-	return 0.999
-}
-
-// adaptiveJunkThreshold adjusts the base junk threshold by the sender domain's
-// history: a domain with more ham than junk earns a higher (more lenient)
-// threshold; a mostly-junk domain a lower (stricter) one. The result is clamped
-// to (0.5, rejectThreshold) so it never becomes trivial or crosses into reject.
-func (d *Decider) adaptiveJunkThreshold(ham, junk int64) float64 {
-	base := d.junkThreshold()
-	total := ham + junk
-	if total < 5 {
-		return base // not enough history to adapt
-	}
-	hamRatio := float64(ham) / float64(total)
-	// Shift up to ±0.1 around base: hamRatio 1.0 → +0.1 (lenient), 0.0 → -0.1.
-	adj := (hamRatio - 0.5) * 0.2
-	thr := base + adj
-	if lo := 0.5; thr < lo {
-		thr = lo
-	}
-	if hi := d.rejectThreshold() - 0.001; thr > hi {
-		thr = hi
-	}
-	return thr
 }
 func (d *Decider) trustedHam() int64 {
 	if d.TrustedHamCount > 0 {
@@ -143,11 +86,12 @@ func (d *Decider) trustedHam() int64 {
 // Decide computes the inbound verdict for a message to accountID from
 // senderDomain/clientIP, given the auth result and a junk classifier. Order:
 //  1. authentication-based hard reject (DMARC handled by caller earlier);
-//  2. reputation: enough ham + no junk → Accept (trusted, skip content checks);
-//     enough junk + no ham → Reject (known-bad sender);
-//  3. greylist first-seen triplet → Defer;
-//  4. content (bayesian): near-certain spam → Reject, spam → AcceptJunk;
-//  5. otherwise Accept.
+//  2. an authenticated explicit sender allowlist match → Accept;
+//  3. reputation: enough ham + no junk → Accept (trusted, skip content checks);
+//     enough junk + no ham → AcceptJunk;
+//  4. greylist first-seen triplets → Defer;
+//  5. content (bayesian): spam → AcceptJunk;
+//  6. otherwise Accept.
 //
 // authed reports whether senderDomain (the reputation key) is itself
 // authenticated for this message — i.e. the caller verified the exact
@@ -157,11 +101,11 @@ func (d *Decider) trustedHam() int64 {
 // letting it earn or leverage reputation would let an attacker bypass
 // greylist+content by forging a trusted domain (and let benign first-contacts
 // poison an unknown domain). When authed is false, unauthenticated mail still
-// flows through greylist + content scoring, but gets neither the trusted-sender
-// fast-path nor the reputation-tuned (lenient) junk threshold — only the neutral
-// base threshold. The known-bad REJECT is intentionally not auth-gated (see
-// decideCore): rejecting mail that claims a known-bad identity is always safe.
-func (d *Decider) Decide(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, authed bool, classify ClassifyFunc) Decision {
+// flows through greylist + content scoring but gets no trusted-sender fast-path.
+// senderAllowed is computed only after the visible From
+// identity passes DMARC alignment; callers must not set it for unauthenticated
+// mail.
+func (d *Decider) Decide(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, authed, senderAllowed bool, classify ClassifyFunc) Decision {
 	// 1. Rulesets: a per-account header match can force a destination mailbox and
 	//    (by default) accept unconditionally, bypassing reputation/content checks.
 	if rs, ok := d.matchRuleset(ctx, accountID, raw); ok {
@@ -178,89 +122,53 @@ func (d *Decider) Decide(ctx context.Context, accountID int64, senderDomain stri
 		// Non-force ruleset: run the checks once; on accept, route to the
 		// ruleset's mailbox. Return the single result either way — never re-run
 		// decideCore (it mutates greylist state and re-classifies).
-		dec := d.decideCore(ctx, accountID, senderDomain, clientIP, raw, authed, classify)
+		dec := d.decideCore(ctx, accountID, senderDomain, clientIP, raw, authed, senderAllowed, classify)
 		if dec.Verdict == Accept || dec.Verdict == AcceptJunk {
 			dec.Mailbox = rs.mailbox
 		}
 		return dec
 	}
-	return d.decideCore(ctx, accountID, senderDomain, clientIP, raw, authed, classify)
+	return d.decideCore(ctx, accountID, senderDomain, clientIP, raw, authed, senderAllowed, classify)
 }
 
-// decideCore is the reputation + greylist + content pipeline, with subjectpass
-// applied to would-be content rejections.
-func (d *Decider) decideCore(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, authed bool, classify ClassifyFunc) Decision {
-	// 2. Reputation shortcuts. The ACCEPT (trusted-sender) shortcut is gated on
+// decideCore is the explicit allowlist + reputation + greylist + content
+// pipeline. Content and reputation may file mail into Junk but never reject it.
+func (d *Decider) decideCore(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, authed, senderAllowed bool, classify ClassifyFunc) Decision {
+	// 2. Explicit allowlist, already gated by caller-side DMARC alignment.
+	if senderAllowed {
+		return Decision{Verdict: Accept, Reason: "allowlisted-sender"}
+	}
+
+	// 3. Reputation shortcuts. The ACCEPT (trusted-sender) shortcut is gated on
 	//    authentication: an unauthenticated (spoofable) MAIL FROM domain must not
 	//    earn or leverage a "trusted" reputation, or an attacker could forge a
-	//    domain the recipient trusts to bypass greylist+content. The REJECT
-	//    (known-bad) shortcut is NOT gated: rejecting mail that claims a
-	//    known-bad domain is safe regardless of authentication (a spoofer picking
-	//    a known-bad identity only hurts itself), and keeps spam defense intact.
+	//    domain the recipient trusts to bypass greylist+content. Known-bad
+	//    reputation is reversible and therefore routes to Junk instead of
+	//    permanently rejecting the message.
 	ham, junk := d.reputation(ctx, accountID, senderDomain)
 	if authed && ham >= d.trustedHam() && junk == 0 {
 		return Decision{Verdict: Accept, Reason: "trusted-sender"}
 	}
 	if junk >= 3 && ham == 0 {
-		return d.maybeSubjectPass(raw, Decision{Verdict: Reject, Reason: "known-bad-sender"})
+		return Decision{Verdict: AcceptJunk, Reason: "known-bad-sender"}
 	}
 
-	// 3. Greylist first-seen triplets (only for not-yet-trusted senders).
+	// 4. Greylist first-seen triplets (only for not-yet-trusted senders).
 	if d.GreylistEnabled {
 		if deferred := d.greylist(ctx, accountID, senderDomain, clientIP); deferred {
 			return Decision{Verdict: Defer, Reason: "greylisted"}
 		}
 	}
 
-	// 4. Content-based bayesian scoring, with a per-domain adaptive junk threshold:
-	//    a domain with a strong ham history gets a more lenient threshold (harder
-	//    to file as junk), a mostly-junk domain a stricter one. Bounded so it never
-	//    crosses the reject threshold or drops below 0.5. The history that tunes
-	//    the threshold is only used for an AUTHENTICATED sender domain — otherwise
-	//    a spoofer of a ham-heavy domain would inherit its leniency. Unauthenticated
-	//    mail gets the neutral base threshold.
-	repHam, repJunk := int64(0), int64(0)
-	if authed {
-		repHam, repJunk = ham, junk
-	}
+	// 5. Shared content scoring. The shared threshold is deliberately
+	// conservative and the action is always reversible Junk delivery.
 	if classify != nil {
-		prob, significant, _, err := classify(ctx, accountID, raw)
-		if err == nil && significant {
-			junkThr := d.adaptiveJunkThreshold(repHam, repJunk)
-			if prob >= d.rejectThreshold() {
-				return d.maybeSubjectPass(raw, Decision{Verdict: Reject, Reason: "junk-content-strict"})
-			}
-			if prob >= junkThr {
-				return Decision{Verdict: AcceptJunk, Reason: "junk-content"}
-			}
+		_, significant, isJunk, err := classify(ctx, accountID, raw)
+		if err == nil && significant && isJunk {
+			return Decision{Verdict: AcceptJunk, Reason: "junk-content"}
 		}
 	}
 	return Decision{Verdict: Accept, Reason: "clean"}
-}
-
-// maybeSubjectPass converts a Reject into either an Accept (when the message
-// carries a valid subjectpass token in its Subject) or a Defer carrying a
-// challenge phrase (so a legitimate sender can retry). If subjectpass is
-// disabled, the original reject stands.
-func (d *Decider) maybeSubjectPass(raw []byte, reject Decision) Decision {
-	if len(d.SubjectPassKey) == 0 {
-		return reject
-	}
-	// A valid token already present → accept.
-	if err := subjectpass.Verify(nil, bytesReaderAt(raw), d.SubjectPassKey, d.subjectPassPeriod()); err == nil {
-		return Decision{Verdict: Accept, Reason: "subjectpass-verified"}
-	}
-	// Otherwise issue a challenge the sender can echo in the Subject.
-	from := subjectPassFrom(raw)
-	token := subjectpass.Generate(nil, from, d.SubjectPassKey, timeNow())
-	return Decision{Verdict: Defer, Reason: "subjectpass-challenge", Challenge: token}
-}
-
-func (d *Decider) subjectPassPeriod() time.Duration {
-	if d.SubjectPassPeriod > 0 {
-		return d.SubjectPassPeriod
-	}
-	return 12 * time.Hour
 }
 
 // reputation returns (ham, junk) counts for (account, senderDomain).
@@ -413,38 +321,3 @@ func parseHeaders(raw []byte) map[string]string {
 	}
 	return out
 }
-
-// subjectPassFrom extracts a smtp.Address from the message From header for the
-// subjectpass token (best-effort; zero address if unparseable).
-func subjectPassFrom(raw []byte) smtp.Address {
-	hdrs := parseHeaders(raw)
-	from := hdrs["from"]
-	if i := strings.LastIndexByte(from, '<'); i >= 0 {
-		from = from[i+1:]
-		from = strings.TrimSuffix(from, ">")
-	}
-	from = strings.TrimSpace(from)
-	if addr, err := smtp.ParseAddress(from); err == nil {
-		return addr
-	}
-	return smtp.Address{}
-}
-
-// bytesReaderAt adapts a byte slice to io.ReaderAt for subjectpass.Verify.
-type bytesReaderAtT []byte
-
-func (b bytesReaderAtT) ReadAt(p []byte, off int64) (int, error) {
-	if off >= int64(len(b)) {
-		return 0, io.EOF
-	}
-	n := copy(p, b[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
-func bytesReaderAt(b []byte) bytesReaderAtT { return bytesReaderAtT(b) }
-
-// timeNow is a package var for test substitution of the subjectpass timestamp.
-var timeNow = time.Now

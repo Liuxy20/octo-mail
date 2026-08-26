@@ -1,0 +1,4 @@
+{"file":".coding/spec/backend/quality-guidelines.md","reason":"Verify Mox reuse, tenant isolation, and complete quality gates."}
+{"file":".coding/spec/backend/database-guidelines.md","reason":"Verify idempotent DDL, transactional counters, and live database tests."}
+{"file":".coding/tasks/08-24-shared-personalized-junk-filter/research/rspamd.md","reason":"Verify the implementation stays lightweight and keeps conservative actions."}
+{"file":".coding/tasks/08-24-shared-personalized-junk-filter/research/corpus.md","reason":"Verify the shared classifier cannot be declared production-ready from old or leakage-prone data."}

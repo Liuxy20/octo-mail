@@ -125,6 +125,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /webapi/v0/messages", s.hAgentConfirmed("mail.message.send", s.sendMessage))
 	mux.HandleFunc("GET /webapi/v0/messages/{id}", s.h(s.getMessage))
 	mux.HandleFunc("PATCH /webapi/v0/messages/{id}", s.h(s.patchMessage))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/not-junk", s.h(s.restoreNotJunk))
 	mux.HandleFunc("DELETE /webapi/v0/messages/{id}", s.hAgentConfirmed("mail.message.delete", s.deleteMessage))
 	mux.HandleFunc("GET /webapi/v0/messages/{id}/raw", s.hRaw(s.rawMessage))
 	mux.HandleFunc("GET /webapi/v0/messages/{id}/attachments/{partId}", s.downloadAttachment)
@@ -148,6 +149,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /webapi/v0/mailboxes", s.h(s.listMailboxes))
 	mux.HandleFunc("GET /webapi/v0/state", noStore(s.h(s.getState)))
 	mux.HandleFunc("GET /webapi/v0/identity", s.h(s.getIdentity))
+	// Current-account sender allowlist.
+	mux.HandleFunc("GET /webapi/v0/junk-allowlist", s.h(s.listJunkAllowedSenders))
+	mux.HandleFunc("DELETE /webapi/v0/junk-allowlist/{address}", s.h(s.removeJunkAllowedSender))
 	// Account addresses.
 	mux.HandleFunc("GET /webapi/v0/addresses", s.h(s.listAddresses))
 	mux.HandleFunc("POST /webapi/v0/addresses", s.h(s.createAddress))

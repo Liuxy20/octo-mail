@@ -48,22 +48,11 @@ type Server struct {
 	// rolls). Nil = no limiting.
 	LoginLimiter *ratelimit.Limiter
 
-	// Junk, when set, is retrained when a message's \Junk flag changes or it is
-	// moved into/out of the Junk mailbox: gaining \Junk (or entering Junk) trains
-	// spam; losing it (or leaving Junk) trains ham. This is the feedback loop that
-	// makes the bayesian filter learn from the user's corrections.
-	Junk JunkTrainer
-
 	// MaxSize bounds an accepted literal (APPEND/REPLACE/CATENATE/SETMETADATA), in
 	// bytes, and is advertised as APPENDLIMIT. A literal declaring a larger size is
 	// rejected before allocation, so a client can't force a multi-GB allocation per
 	// connection. 0 = unlimited (dev/tests). Mirrors smtpd.Server.MaxSize.
 	MaxSize int64
-}
-
-// JunkTrainer trains an account's junk filter on a message body.
-type JunkTrainer interface {
-	Train(ctx context.Context, accountID int64, ham bool, raw []byte) error
 }
 
 // Serve handles a single connection until logout/close. Blocking; callers run it

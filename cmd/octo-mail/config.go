@@ -11,6 +11,7 @@ import (
 
 	"github.com/mjl-/mox/dns"
 
+	"github.com/Mininglamp-OSS/octo-mail/junkfilter"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 )
 
@@ -190,7 +191,7 @@ func validate(cfg config, log *slog.Logger) error {
 		"OCTO_MAIL_DRAIN_TIMEOUT", "OCTO_MAIL_REPORT_INTERVAL", "OCTO_MAIL_QUEUE_INTERVAL",
 		"OCTO_MAIL_PROJECTION_INTERVAL", "OCTO_MAIL_QUEUE_BACKOFF", "OCTO_MAIL_QUEUE_MAX_BACKOFF",
 		"OCTO_MAIL_QUEUE_MAX_LIFETIME", "OCTO_MAIL_QUEUE_RETIRED_KEEP", "OCTO_MAIL_GREYLIST_DELAY",
-		"OCTO_MAIL_SUBJECTPASS_PERIOD", "OCTO_MAIL_SEND_RATE_WINDOW",
+		"OCTO_MAIL_SEND_RATE_WINDOW",
 	} {
 		if v := os.Getenv(k); v != "" {
 			if _, err := time.ParseDuration(v); err != nil {
@@ -198,7 +199,7 @@ func validate(cfg config, log *slog.Logger) error {
 			}
 		}
 	}
-	for _, k := range []string{"OCTO_MAIL_JUNK_THRESHOLD", "OCTO_MAIL_REJECT_THRESHOLD"} {
+	for _, k := range []string{"OCTO_MAIL_SHARED_JUNK_THRESHOLD"} {
 		if v := os.Getenv(k); v != "" {
 			if _, err := strconv.ParseFloat(v, 64); err != nil {
 				log.Warn("ignoring unparseable float env value; using default", "env", k, "value", v)
@@ -318,14 +319,11 @@ type config struct {
 	maxHops     int // inbound Received-header loop limit (0 = smtpd default)
 	greylist    bool
 
-	junkThreshold float64
+	sharedJunkThreshold float64
 
 	// Inbound decision-engine tuning (all optional; zero uses Decider defaults).
-	greylistDelay     time.Duration
-	rejectThreshold   float64
-	trustedHamCount   int64
-	subjectPassKey    []byte
-	subjectPassPeriod time.Duration
+	greylistDelay   time.Duration
+	trustedHamCount int64
 
 	webhookURL string
 	// webhookSecret, when set, HMAC-SHA256-signs outbound webhook payloads
@@ -421,13 +419,10 @@ func loadConfig() config {
 		maxHops:     int(envInt64("OCTO_MAIL_MAX_HOPS", 50)),
 		greylist:    os.Getenv("OCTO_MAIL_GREYLIST") == "1",
 
-		junkThreshold: envFloat("OCTO_MAIL_JUNK_THRESHOLD", 0.95),
+		sharedJunkThreshold: envFloat("OCTO_MAIL_SHARED_JUNK_THRESHOLD", junkfilter.DefaultSharedThreshold),
 
-		greylistDelay:     envDuration("OCTO_MAIL_GREYLIST_DELAY", 0),
-		rejectThreshold:   envFloat("OCTO_MAIL_REJECT_THRESHOLD", 0),
-		trustedHamCount:   envInt64("OCTO_MAIL_TRUSTED_HAM_COUNT", 0),
-		subjectPassKey:    []byte(os.Getenv("OCTO_MAIL_SUBJECTPASS_KEY")),
-		subjectPassPeriod: envDuration("OCTO_MAIL_SUBJECTPASS_PERIOD", 0),
+		greylistDelay:   envDuration("OCTO_MAIL_GREYLIST_DELAY", 0),
+		trustedHamCount: envInt64("OCTO_MAIL_TRUSTED_HAM_COUNT", 0),
 
 		webhookURL:    os.Getenv("OCTO_MAIL_WEBHOOK_URL"),
 		webhookSecret: []byte(os.Getenv("OCTO_MAIL_WEBHOOK_SECRET")),
