@@ -115,12 +115,18 @@ func (t *tenantScope) UpdateAgentMailRule(ctx context.Context, ownerPrincipalID,
 		input.Conditions = *patch.Conditions
 	}
 	if patch.MatchFrom != nil {
+		if patch.Conditions == nil && hasMultipleMailRuleConditions(input.Conditions, "from") {
+			return directory.MailRule{}, directory.ErrMailRuleInvalid
+		}
 		input.MatchFrom = *patch.MatchFrom
 		if patch.Conditions == nil {
 			input.Conditions = replaceLegacyMailRuleCondition(input.Conditions, "from", "equals", *patch.MatchFrom)
 		}
 	}
 	if patch.MatchSubject != nil {
+		if patch.Conditions == nil && hasMultipleMailRuleConditions(input.Conditions, "subject") {
+			return directory.MailRule{}, directory.ErrMailRuleInvalid
+		}
 		input.MatchSubject = *patch.MatchSubject
 		if patch.Conditions == nil {
 			input.Conditions = replaceLegacyMailRuleCondition(input.Conditions, "subject", "contains", *patch.MatchSubject)
@@ -357,6 +363,20 @@ func legacyMailRuleConditions(matchFrom, matchSubject string) []directory.MailRu
 		conditions = append(conditions, directory.MailRuleCondition{Field: "subject", Operator: "contains", Value: matchSubject})
 	}
 	return conditions
+}
+
+func hasMultipleMailRuleConditions(conditions []directory.MailRuleCondition, field string) bool {
+	found := false
+	for _, condition := range conditions {
+		if condition.Field != field {
+			continue
+		}
+		if found {
+			return true
+		}
+		found = true
+	}
+	return false
 }
 
 func replaceLegacyMailRuleCondition(conditions []directory.MailRuleCondition, field, operator, value string) []directory.MailRuleCondition {

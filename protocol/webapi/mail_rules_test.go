@@ -271,6 +271,60 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 		t.Fatalf("updated repeated conditions = %#v", repeatedRule["conditions"])
 	}
 	repeatedRuleID := repeatedRule["id"].(string)
+	repeatedLegacyConditions := []map[string]any{
+		{"field": "subject", "operator": "contains", "value": "invoice"},
+		{"field": "subject", "operator": "not_contains", "value": "draft"},
+		{"field": "from", "operator": "contains", "value": "vendor-a@example.net"},
+		{"field": "from", "operator": "not_contains", "value": "blocked@example.net"},
+	}
+	status, repeatedLegacyRule := do(http.MethodPost, base, map[string]any{
+		"name": "repeated legacy fields", "matchMode": "all",
+		"conditions": repeatedLegacyConditions, "forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusCreated {
+		t.Fatalf("create repeated legacy-field rule = %d %#v", status, repeatedLegacyRule)
+	}
+	repeatedLegacyRuleID := repeatedLegacyRule["id"].(string)
+	for _, patch := range []map[string]any{
+		{"matchSubject": "urgent"},
+		{"matchFrom": "replacement@example.net"},
+	} {
+		status, invalid = do(http.MethodPatch, base+"/"+repeatedLegacyRuleID, patch, ownerAuth)
+		if status != http.StatusBadRequest || invalid["error"].(map[string]any)["code"] != "invalid_rule" {
+			t.Fatalf("ambiguous legacy PATCH = %d %#v", status, invalid)
+		}
+	}
+	status, listed = do(http.MethodGet, base, nil, ownerAuth)
+	if status != http.StatusOK {
+		t.Fatalf("list after rejected legacy PATCH = %d %#v", status, listed)
+	}
+	var persistedRepeatedLegacyRule map[string]any
+	for _, value := range listed["rules"].([]any) {
+		rule := value.(map[string]any)
+		if rule["id"] == repeatedLegacyRuleID {
+			persistedRepeatedLegacyRule = rule
+			break
+		}
+	}
+	if persistedRepeatedLegacyRule == nil {
+		t.Fatalf("repeated legacy-field rule missing after rejected PATCH: %#v", listed)
+	}
+	persistedConditions, ok := persistedRepeatedLegacyRule["conditions"].([]any)
+	if !ok || len(persistedConditions) != len(repeatedLegacyConditions) {
+		t.Fatalf("rejected legacy PATCH changed conditions = %#v", persistedRepeatedLegacyRule["conditions"])
+	}
+	for i, expected := range repeatedLegacyConditions {
+		condition, ok := persistedConditions[i].(map[string]any)
+		if !ok || condition["field"] != expected["field"] || condition["operator"] != expected["operator"] || condition["value"] != expected["value"] {
+			t.Fatalf("rejected legacy PATCH changed condition %d = %#v", i, persistedConditions[i])
+		}
+	}
+	if _, exists := persistedRepeatedLegacyRule["matchFrom"]; exists {
+		t.Fatalf("rejected legacy PATCH changed matchFrom = %#v", persistedRepeatedLegacyRule["matchFrom"])
+	}
+	if _, exists := persistedRepeatedLegacyRule["matchSubject"]; exists {
+		t.Fatalf("rejected legacy PATCH changed matchSubject = %#v", persistedRepeatedLegacyRule["matchSubject"])
+	}
 	tooManyConditions := append([]map[string]any{}, repeatedBodyConditions...)
 	tooManyConditions = append(tooManyConditions, map[string]any{
 		"field": "body", "operator": "contains", "value": "zeta",
@@ -298,6 +352,10 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 	status, _ = do(http.MethodDelete, base+"/"+repeatedRuleID, nil, ownerAuth)
 	if status != http.StatusNoContent {
 		t.Fatalf("delete repeated-condition rule = %d", status)
+	}
+	status, _ = do(http.MethodDelete, base+"/"+repeatedLegacyRuleID, nil, ownerAuth)
+	if status != http.StatusNoContent {
+		t.Fatalf("delete repeated legacy-field rule = %d", status)
 	}
 	status, _ = do(http.MethodDelete, base+"/"+ruleID, nil, ownerAuth)
 	if status != http.StatusNoContent {
