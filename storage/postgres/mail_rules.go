@@ -282,7 +282,6 @@ func normalizeMailRuleInput(input directory.MailRuleInput) (directory.MailRuleIn
 	if len(input.Conditions) == 0 || len(input.Conditions) > 5 {
 		return directory.MailRuleInput{}, directory.ErrMailRuleInvalid
 	}
-	seenConditions := make(map[string]struct{}, len(input.Conditions))
 	for i := range input.Conditions {
 		condition := &input.Conditions[i]
 		condition.Field = strings.TrimSpace(condition.Field)
@@ -298,10 +297,6 @@ func normalizeMailRuleInput(input directory.MailRuleInput) (directory.MailRuleIn
 			}
 			condition.Value = address.Pack(false)
 		}
-		if _, exists := seenConditions[condition.Field]; exists {
-			return directory.MailRuleInput{}, directory.ErrMailRuleInvalid
-		}
-		seenConditions[condition.Field] = struct{}{}
 	}
 	if len(input.MatchSubject) > 500 {
 		return directory.MailRuleInput{}, directory.ErrMailRuleInvalid

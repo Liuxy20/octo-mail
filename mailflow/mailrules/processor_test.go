@@ -304,6 +304,26 @@ func TestRuleMatchMode(t *testing.T) {
 			}
 		})
 	}
+
+	repeatedAll := rule{matchMode: "all", conditions: []directory.MailRuleCondition{
+		{Field: "body", Operator: "contains", Value: "invoice"},
+		{Field: "body", Operator: "contains", Value: "today"},
+	}}
+	if !repeatedAll.matches(message) {
+		t.Fatal("all mode did not match repeated body conditions")
+	}
+	repeatedAll.conditions[1].Value = "tomorrow"
+	if repeatedAll.matches(message) {
+		t.Fatal("all mode matched when one repeated body condition did not match")
+	}
+
+	repeatedAny := rule{matchMode: "any", conditions: []directory.MailRuleCondition{
+		{Field: "to", Operator: "contains", Value: "missing@example.com"},
+		{Field: "to", Operator: "contains", Value: "agent@example.com"},
+	}}
+	if !repeatedAny.matches(message) {
+		t.Fatal("any mode did not match repeated recipient conditions")
+	}
 }
 
 func TestNegativeRecipientConditionRequiresRecipientData(t *testing.T) {

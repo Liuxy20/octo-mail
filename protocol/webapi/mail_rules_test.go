@@ -238,6 +238,50 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 	if !ok || len(normalizedConditions) != 1 || normalizedConditions[0].(map[string]any)["value"] != "customer@example.net" {
 		t.Fatalf("normalized sender conditions = %#v", normalizedSenderRule["conditions"])
 	}
+	repeatedBodyConditions := []map[string]any{
+		{"field": "body", "operator": "contains", "value": "alpha"},
+		{"field": "body", "operator": "contains", "value": "beta"},
+		{"field": "body", "operator": "contains", "value": "gamma"},
+		{"field": "body", "operator": "contains", "value": "delta"},
+		{"field": "body", "operator": "contains", "value": "epsilon"},
+	}
+	status, repeatedRule := do(http.MethodPost, base, map[string]any{
+		"name": "repeated body conditions", "matchMode": "all",
+		"conditions": repeatedBodyConditions, "forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusCreated {
+		t.Fatalf("create repeated-condition rule = %d %#v", status, repeatedRule)
+	}
+	repeatedConditions, ok := repeatedRule["conditions"].([]any)
+	if !ok || len(repeatedConditions) != 5 {
+		t.Fatalf("created repeated conditions = %#v", repeatedRule["conditions"])
+	}
+	status, repeatedRule = do(http.MethodPatch, base+"/"+repeatedRule["id"].(string), map[string]any{
+		"matchMode": "any",
+		"conditions": []map[string]any{
+			{"field": "to", "operator": "contains", "value": "first@example.net"},
+			{"field": "to", "operator": "contains", "value": "second@example.net"},
+		},
+	}, ownerAuth)
+	if status != http.StatusOK || repeatedRule["matchMode"] != "any" {
+		t.Fatalf("update repeated-condition rule = %d %#v", status, repeatedRule)
+	}
+	repeatedConditions, ok = repeatedRule["conditions"].([]any)
+	if !ok || len(repeatedConditions) != 2 {
+		t.Fatalf("updated repeated conditions = %#v", repeatedRule["conditions"])
+	}
+	repeatedRuleID := repeatedRule["id"].(string)
+	tooManyConditions := append([]map[string]any{}, repeatedBodyConditions...)
+	tooManyConditions = append(tooManyConditions, map[string]any{
+		"field": "body", "operator": "contains", "value": "zeta",
+	})
+	status, invalid = do(http.MethodPost, base, map[string]any{
+		"name": "too many repeated conditions", "matchMode": "all",
+		"conditions": tooManyConditions, "forwardTargets": []string{"x@example.net"},
+	}, ownerAuth)
+	if status != http.StatusBadRequest || invalid["error"].(map[string]any)["code"] != "invalid_rule" {
+		t.Fatalf("too many repeated conditions = %d %#v", status, invalid)
+	}
 	status, invalid = do(http.MethodPost, base, map[string]any{
 		"name": "invalid sender", "conditions": []map[string]any{{
 			"field": "from", "operator": "equals", "value": "not an address",
@@ -250,6 +294,10 @@ func TestAgentMailRuleOwnerCRUDAndIsolation(t *testing.T) {
 	status, _ = do(http.MethodDelete, base+"/"+normalizedSenderRule["id"].(string), nil, ownerAuth)
 	if status != http.StatusNoContent {
 		t.Fatalf("delete normalized sender rule = %d", status)
+	}
+	status, _ = do(http.MethodDelete, base+"/"+repeatedRuleID, nil, ownerAuth)
+	if status != http.StatusNoContent {
+		t.Fatalf("delete repeated-condition rule = %d", status)
 	}
 	status, _ = do(http.MethodDelete, base+"/"+ruleID, nil, ownerAuth)
 	if status != http.StatusNoContent {
