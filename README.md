@@ -118,7 +118,7 @@ docker compose exec -T octo-mail octo-mail junk evaluate-global \
   /tmp/junk-corpus/eval/ham /tmp/junk-corpus/eval/spam \
   --json /tmp/junk-evaluation.json --csv /tmp/junk-evaluation.csv
 
-# Export aggregate counters for a replacement package.
+# Export aggregate counters for a custom build.
 docker compose exec -T octo-mail octo-mail junk export-global \
   custom-v1 /tmp/shared-junk-v1.csv.gz
 ```
@@ -134,11 +134,13 @@ identifiers and aggregate Ham/Spam counts, not raw messages. At startup, an
 empty shared model imports it once; an existing shared model is never
 overwritten.
 
-Deployments upgrading with an existing shared model should evaluate it again
-because deployment-wide identity-header features are no longer used. Keep
-shared classification disabled during retraining or replacement when needed.
-The offline `junk evaluate-global` command remains available while runtime
-classification is disabled.
+Deployments upgrading with an existing shared model should retrain it from raw
+samples in a separate empty database rather than relabel pre-upgrade samples in
+place, because deployment-wide identity-header features are no longer used. A
+custom package must replace the embedded file before rebuilding the binary.
+Keep shared classification disabled during that process when needed. The
+offline `junk evaluate-global` command remains available while runtime
+classification is disabled and reports that runtime state separately.
 
 `OCTO_MAIL_SHARED_JUNK_ENABLED` defaults to `1`. Set it to `0` to skip default
 model import and shared Bayesian content classification without deleting stored

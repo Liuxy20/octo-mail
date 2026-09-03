@@ -186,89 +186,148 @@ func addCJKFeatures(words map[string]struct{}) {
 		}
 		return original[i] < original[j]
 	})
-	added := 0
-	for _, word := range original {
-		if added >= maxCJKFeatures {
-			return
+	firstSubject := len(original)
+	for i, word := range original {
+		if strings.HasPrefix(word, "Subject:") {
+			firstSubject = i
+			break
 		}
-		prefix, text := "", word
-		if i := strings.IndexByte(word, ':'); i > 0 {
-			prefix, text = word[:i+1], word[i+1:]
+	}
+	remaining := addCJKFeatureGroup(words, original[:firstSubject], maxCJKFeatures)
+	addCJKFeatureGroup(words, original[firstSubject:], remaining)
+}
+
+// addCJKFeatureGroup shares the remaining budget across all eligible source
+// tokens instead of allowing the first few tokens to consume it. The caller
+// passes message-content tokens before Subject tokens, preserving body priority.
+func addCJKFeatureGroup(words map[string]struct{}, source []string, budget int) int {
+	eligible := 0
+	for _, word := range source {
+		if hasCJKNgram(word) {
+			eligible++
 		}
-		// Keep only the last three CJK runes while scanning. A maliciously long
-		// unbroken token must not allocate a second rune slice proportional to its
-		// size. Retain features from both ends of an overlong token so prefix or
-		// hidden-HTML padding cannot discard all of the real text that follows.
-		run := make([]rune, 0, 3)
-		half := maxCJKFeaturesPerToken / 2
-		var head, tail []string
-		var headSet, tailSet map[string]struct{}
-		tailNext := 0
-		collect := func(feature string) {
-			if _, exists := words[feature]; exists {
-				return
-			}
-			if head == nil {
-				head = make([]string, 0, half)
-				headSet = make(map[string]struct{}, half)
-			}
-			if _, exists := headSet[feature]; exists {
-				return
-			}
-			if len(head) < half {
-				head = append(head, feature)
-				headSet[feature] = struct{}{}
-				return
-			}
-			if _, exists := tailSet[feature]; exists {
-				return
-			}
-			if tail == nil {
-				tail = make([]string, 0, half)
-				tailSet = make(map[string]struct{}, half)
-			}
-			if len(tail) < half {
-				tail = append(tail, feature)
-				tailSet[feature] = struct{}{}
-				return
-			}
-			delete(tailSet, tail[tailNext])
-			tail[tailNext] = feature
-			tailSet[feature] = struct{}{}
-			tailNext = (tailNext + 1) % half
+	}
+	for _, word := range source {
+		if budget == 0 || eligible == 0 {
+			break
 		}
-		for _, r := range text {
-			if !isCJK(r) {
-				run = run[:0]
-				continue
-			}
-			run = append(run, r)
-			if len(run) >= 2 {
-				collect(prefix + "cjk:" + string(run[len(run)-2:]))
-			}
-			if len(run) >= 3 {
-				collect(prefix + "cjk:" + string(run[len(run)-3:]))
-				run = run[len(run)-2:]
-			}
+		if !hasCJKNgram(word) {
+			continue
 		}
-		selected := head
-		if len(tail) == half {
-			selected = append(selected, tail[tailNext:]...)
-			selected = append(selected, tail[:tailNext]...)
-		} else {
-			selected = append(selected, tail...)
+		limit := budget / eligible
+		if limit < 1 {
+			limit = 1
 		}
-		for _, feature := range selected {
-			if added >= maxCJKFeatures {
-				return
+		if limit > maxCJKFeaturesPerToken {
+			limit = maxCJKFeaturesPerToken
+		}
+		for _, feature := range boundedCJKFeatures(word, limit, words) {
+			if budget == 0 {
+				break
 			}
 			if _, exists := words[feature]; exists {
 				continue
 			}
 			words[feature] = struct{}{}
-			added++
+			budget--
+		}
+		eligible--
+	}
+	return budget
+}
+
+func hasCJKNgram(word string) bool {
+	if i := strings.IndexByte(word, ':'); i > 0 {
+		word = word[i+1:]
+	}
+	consecutive := 0
+	for _, r := range word {
+		if isCJK(r) {
+			consecutive++
+			if consecutive == 2 {
+				return true
+			}
+		} else {
+			consecutive = 0
 		}
 	}
+	return false
+}
+
+func boundedCJKFeatures(word string, limit int, existing map[string]struct{}) []string {
+	if limit <= 0 {
+		return nil
+	}
+	prefix, text := "", word
+	if i := strings.IndexByte(word, ':'); i > 0 {
+		prefix, text = word[:i+1], word[i+1:]
+	}
+	// Keep only the last three CJK runes while scanning. A maliciously long
+	// unbroken token must not allocate a second rune slice proportional to its
+	// size. Retain features from both ends of an overlong token so prefix or
+	// hidden-HTML padding cannot discard all of the real text that follows.
+	run := make([]rune, 0, 3)
+	headLimit := limit / 2
+	tailLimit := limit - headLimit
+	head := make([]string, 0, headLimit)
+	tail := make([]string, 0, tailLimit)
+	seen := make(map[string]struct{}, limit)
+	tailSet := make(map[string]struct{}, tailLimit)
+	tailNext := 0
+	collect := func(feature string) {
+		if _, exists := existing[feature]; exists {
+			return
+		}
+		if _, exists := seen[feature]; exists {
+			return
+		}
+		if len(head) < headLimit {
+			head = append(head, feature)
+			seen[feature] = struct{}{}
+			return
+		}
+		if _, exists := tailSet[feature]; exists {
+			return
+		}
+		if len(tail) < tailLimit {
+			tail = append(tail, feature)
+			tailSet[feature] = struct{}{}
+			seen[feature] = struct{}{}
+			return
+		}
+		if tailLimit == 0 {
+			return
+		}
+		old := tail[tailNext]
+		delete(tailSet, old)
+		delete(seen, old)
+		tail[tailNext] = feature
+		tailSet[feature] = struct{}{}
+		seen[feature] = struct{}{}
+		tailNext = (tailNext + 1) % tailLimit
+	}
+	for _, r := range text {
+		if !isCJK(r) {
+			run = run[:0]
+			continue
+		}
+		run = append(run, r)
+		if len(run) >= 2 {
+			collect(prefix + "cjk:" + string(run[len(run)-2:]))
+		}
+		if len(run) >= 3 {
+			collect(prefix + "cjk:" + string(run[len(run)-3:]))
+			run = run[len(run)-2:]
+		}
+	}
+	selected := head
+	if len(tail) == tailLimit && tailLimit > 0 {
+		selected = append(selected, tail[tailNext:]...)
+		selected = append(selected, tail[:tailNext]...)
+	} else {
+		selected = append(selected, tail...)
+	}
+	return selected
 }
 
 func isCJK(r rune) bool {

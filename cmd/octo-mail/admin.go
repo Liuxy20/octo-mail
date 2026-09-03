@@ -125,6 +125,9 @@ func cmdJunkEvaluateGlobal(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateSharedJunkConfig(); err != nil {
+		return err
+	}
 	hamPaths, err := collectEMLPaths([]string{opts.hamPath})
 	if err != nil {
 		return err
@@ -159,6 +162,7 @@ func cmdJunkEvaluateGlobal(args []string) error {
 	if err != nil {
 		return err
 	}
+	report.RuntimeEnabled = cfg.sharedJunkEnabled
 	if err := writeJunkEvaluationCSV(opts.csvPath, report.Results); err != nil {
 		return fmt.Errorf("write evaluation csv: %w", err)
 	}

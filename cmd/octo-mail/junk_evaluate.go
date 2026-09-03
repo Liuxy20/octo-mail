@@ -50,6 +50,7 @@ type junkEvaluationReport struct {
 	SchemaVersion              int                     `json:"schemaVersion"`
 	GeneratedAt                time.Time               `json:"generatedAt"`
 	Model                      junkfilter.GlobalStats  `json:"model"`
+	RuntimeEnabled             bool                    `json:"runtimeEnabled"`
 	ConfiguredThreshold        float64                 `json:"configuredThreshold"`
 	Summary                    junkEvaluationSummary   `json:"summary"`
 	ZeroHamFalsePositiveCutoff *junkCandidateThreshold `json:"zeroHamFalsePositiveCutoff,omitempty"`

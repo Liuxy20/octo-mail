@@ -18,23 +18,25 @@ Date: 2026-09-03
 
 ## Bundled model
 
-- Version: `2026-09-03-v4`
-- Compressed size: 3.1 MiB
-- Training totals: 7,212 Ham / 7,960 Spam
-- Features: 83,235 deterministic SHA-256 identifiers
+- Version: `2026-09-03-v5`
+- Compressed size: 2.85 MiB
+- Training totals: 7,232 Ham / 7,960 Spam
+- Features: 83,617 deterministic SHA-256 identifiers
 - Package SHA-256:
-  `5629bc3b5ddb81c499a6f16eed8f53741097d8b2369b970ee09146ec92e50bfe`
-- De-duplicated evaluation matrix at threshold `0.9999`: 2/1,488 Ham false
-  positives (0.13%) and 1,071/1,971 Spam detected (54.34%).
+  `68bccb33d80000055a732b8d79028b8718f31e5d02a824088bff0f94218ebd07`
+- Independent holdout at threshold `0.9999`: 0/500 Ham false positives and
+  305/707 Spam detected (43.14%).
+- Expanded stress panel: 1/920 Ham false positives (0.11%) and 387/993 Spam
+  detected (38.97%).
 - Short-Chinese regression: 0/20 Ham false positives and 19/20 Spam detected
   (95%).
 - The bundled regression panel keeps representative Chinese and English
   verification, security, billing, HR, IT, collaboration, and delivery mail in
   Inbox while routing the representative Chinese and English Spam cases to
   Junk.
-- CJK header-padding regressions: body signals survive distinct identity-header
-  and folded Subject padding. Per-token feature limits also preserve body
-  signals under plain-text and hidden-HTML CJK padding.
+- CJK padding regressions: body signals survive distinct identity-header and
+  folded Subject padding. Fair per-token allocation also preserves body signals
+  under single- and multi-token plain-text and hidden-HTML CJK padding.
 
 The model is bundled at `junkfilter/models/shared-junk-v1.csv.gz` and imported
 only when deployment-wide model storage is empty.

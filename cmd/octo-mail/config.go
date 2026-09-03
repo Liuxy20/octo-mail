@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -93,8 +94,8 @@ func checkReporterConfig(cfg config) error {
 // admin listener on a non-loopback address). Called once in run() after the other
 // check* functions. Warnings need the logger; errors abort startup.
 func validate(cfg config, log *slog.Logger) error {
-	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_SHARED_JUNK_ENABLED")); raw != "" && raw != "0" && raw != "1" {
-		return fmt.Errorf("OCTO_MAIL_SHARED_JUNK_ENABLED must be 0 or 1")
+	if err := validateSharedJunkConfig(); err != nil {
+		return err
 	}
 	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_MAX_SIZE")); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
@@ -202,11 +203,17 @@ func validate(cfg config, log *slog.Logger) error {
 			}
 		}
 	}
-	for _, k := range []string{"OCTO_MAIL_SHARED_JUNK_THRESHOLD"} {
-		if v := os.Getenv(k); v != "" {
-			if _, err := strconv.ParseFloat(v, 64); err != nil {
-				log.Warn("ignoring unparseable float env value; using default", "env", k, "value", v)
-			}
+	return nil
+}
+
+func validateSharedJunkConfig() error {
+	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_SHARED_JUNK_ENABLED")); raw != "" && raw != "0" && raw != "1" {
+		return fmt.Errorf("OCTO_MAIL_SHARED_JUNK_ENABLED must be 0 or 1")
+	}
+	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD")); raw != "" {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 || parsed > 1 {
+			return fmt.Errorf("OCTO_MAIL_SHARED_JUNK_THRESHOLD must be a number greater than 0 and at most 1")
 		}
 	}
 	return nil
@@ -488,7 +495,7 @@ func parseTrimmedList(value string) []string {
 }
 
 func envFloat(k string, def float64) float64 {
-	if v := os.Getenv(k); v != "" {
+	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
 		}

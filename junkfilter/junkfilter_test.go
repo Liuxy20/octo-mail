@@ -18,11 +18,26 @@ import (
 )
 
 func distinctCJKText(n int) string {
+	return distinctCJKTextFrom(0, n)
+}
+
+func distinctCJKTextFrom(offset, n int) string {
 	runes := make([]rune, n)
 	for i := range runes {
-		runes[i] = rune(0x4e00 + i)
+		runes[i] = rune(0x4e00 + offset + i)
 	}
 	return string(runes)
+}
+
+func separatedCJKText(tokens, runesPerToken int) string {
+	var b strings.Builder
+	for i := 0; i < tokens; i++ {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(distinctCJKTextFrom(i*runesPerToken, runesPerToken))
+	}
+	return b.String()
 }
 
 func foldedCJKSubject(lines, runesPerLine int) string {
@@ -473,18 +488,24 @@ func TestCJKFeaturesMatchRelatedMessagesAndStayBounded(t *testing.T) {
 		t.Fatalf("related Chinese spam not detected: %#v", result)
 	}
 
-	long := []byte("Subject: 中文\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + strings.Repeat("中", 10000) + "\r\n")
+	var before int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM junk_global_words`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	long := []byte("Subject: 中文\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + separatedCJKText(12, 300) + "\r\n")
 	if _, err := mgr.TrainGlobalSample(ctx, "long-cjk", true, long); err != nil {
 		t.Fatal(err)
 	}
-	var count int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM junk_global_words`).Scan(&count); err != nil {
+	var after int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM junk_global_words`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	// The corpus above has a small fixed vocabulary. The long run must not add
-	// more than the explicit feature cap (duplicates make the actual count lower).
-	if count > 2200 {
-		t.Fatalf("CJK feature count = %d, want bounded growth", count)
+	// The distinct run produces far more candidates than the message-level cap.
+	// Allow a few base/header features while proving the cap is both reached and
+	// enforced; repeated identical runes would not exercise it.
+	delta := after - before
+	if delta < 2000 || delta > 2112 {
+		t.Fatalf("long CJK message added %d features, want approximately the 2048-feature cap", delta)
 	}
 }
 
@@ -729,11 +750,11 @@ func TestGlobalModelPackageExportImportRoundTrip(t *testing.T) {
 
 func TestBundledGlobalModelWhenPresent(t *testing.T) {
 	const (
-		wantVersion = "2026-09-03-v4"
-		wantHams    = int64(7212)
+		wantVersion = "2026-09-03-v5"
+		wantHams    = int64(7232)
 		wantSpams   = int64(7960)
-		wantWords   = int64(83235)
-		wantSHA256  = "5629bc3b5ddb81c499a6f16eed8f53741097d8b2369b970ee09146ec92e50bfe"
+		wantWords   = int64(83617)
+		wantSHA256  = "68bccb33d80000055a732b8d79028b8718f31e5d02a824088bff0f94218ebd07"
 	)
 	model, err := os.ReadFile("models/shared-junk-v1.csv.gz")
 	if err != nil {
@@ -815,6 +836,24 @@ func TestBundledGlobalModelWhenPresent(t *testing.T) {
 			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
 				"Subject: 服务账单与发票通知\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
 				"本期应付费用已经结算，电子账单、付款记录和发票可在官方客户门户查询。本邮件不会要求提供银行卡密码。\r\n"),
+		},
+		{
+			name: "chinese utility bill",
+			raw: []byte("From: billing@utility.example\r\nTo: user@example.net\r\n" +
+				"Subject: 水电费缴费通知\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"本月水电费共计三百二十七元，请于本月底前通过物业缴费系统完成缴纳，逾期可能产生滞纳金。\r\n"),
+		},
+		{
+			name: "chinese monthly utility statement",
+			raw: []byte("From: billing@utility.example\r\nTo: user@example.net\r\n" +
+				"Subject: 本月水电费账单\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"您本月的水电费账单已生成，应缴金额三百二十七元，请登录物业服务平台查看用量明细。\r\n"),
+		},
+		{
+			name: "chinese gas bill",
+			raw: []byte("From: billing@utility.example\r\nTo: user@example.net\r\n" +
+				"Subject: 燃气费账单提醒\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"您本期燃气账单已出，请登录官方生活缴费服务查看抄表记录、应缴金额和付款期限。\r\n"),
 		},
 		{
 			name: "chinese system maintenance",
@@ -976,4 +1015,28 @@ func TestBundledGlobalModelWhenPresent(t *testing.T) {
 			t.Fatalf("classification = %#v, want Junk=true", result)
 		}
 	})
+
+	for name, body := range map[string]string{
+		"plain text": separatedCJKText(8, 200) + "。恭喜中奖，现金大奖等待领取。无需征信即可办理大额贷款，当天审核立即到账。" +
+			"注册博彩平台领取新人彩金，充值返利，立即扫码付款。请先汇款缴纳税费并发送银行卡密码和短信验证码。",
+		"hidden html": "<div style=\"display:none\">" + separatedCJKText(8, 200) + "</div><p>恭喜中奖，现金大奖等待领取。" +
+			"无需征信即可办理大额贷款，当天审核立即到账。注册博彩平台领取新人彩金，充值返利，立即扫码付款。" +
+			"请先汇款缴纳税费并发送银行卡密码和短信验证码。</p>",
+	} {
+		t.Run("cjk spam with multiple "+name+" padding tokens", func(t *testing.T) {
+			contentType := "text/plain"
+			if name == "hidden html" {
+				contentType = "text/html"
+			}
+			raw := []byte("From: offer@random.example\r\nTo: user@example.net\r\n" +
+				"Subject: 普通通知\r\nMIME-Version: 1.0\r\nContent-Type: " + contentType + "; charset=utf-8\r\n\r\n" + body + "\r\n")
+			result, err := mgr.ClassifyGlobalDetailed(ctx, raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Junk {
+				t.Fatalf("classification = %#v, want Junk=true", result)
+			}
+		})
+	}
 }

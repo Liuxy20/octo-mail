@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -47,6 +48,14 @@ func TestParseJunkEvaluateArgs(t *testing.T) {
 	}
 	if _, err := parseJunkEvaluateArgs([]string{"evaluate-global", "ham", "spam", "--wat", "x"}); err == nil {
 		t.Fatal("unknown option accepted")
+	}
+}
+
+func TestJunkEvaluateGlobalRejectsInvalidSharedConfig(t *testing.T) {
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", "NaN")
+	err := cmdJunkEvaluateGlobal([]string{"evaluate-global", "missing-ham", "missing-spam"})
+	if err == nil || !strings.Contains(err.Error(), "OCTO_MAIL_SHARED_JUNK_THRESHOLD") {
+		t.Fatalf("invalid shared Junk threshold error = %v", err)
 	}
 }
 

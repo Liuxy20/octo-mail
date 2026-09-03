@@ -53,11 +53,26 @@ func TestGlobalClassificationWithoutUsableFeaturesIsInsignificant(t *testing.T) 
 }
 
 func distinctCJKText(n int) string {
+	return distinctCJKTextFrom(0, n)
+}
+
+func distinctCJKTextFrom(offset, n int) string {
 	runes := make([]rune, n)
 	for i := range runes {
-		runes[i] = rune(0x4e00 + i)
+		runes[i] = rune(0x4e00 + offset + i)
 	}
 	return string(runes)
+}
+
+func separatedCJKPadding(tokens, runesPerToken int) string {
+	var b strings.Builder
+	for i := 0; i < tokens; i++ {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(distinctCJKTextFrom(i*runesPerToken, runesPerToken))
+	}
+	return b.String()
 }
 
 func foldedCJKSubject(lines, runesPerLine int) string {
@@ -128,15 +143,22 @@ func TestGlobalCJKFeaturesPrioritizeBodyOverSubject(t *testing.T) {
 
 func TestGlobalCJKFeaturesCannotBeStarvedByBodyPadding(t *testing.T) {
 	mgr := NewManager(nil, DefaultParams)
-	padding := distinctCJKText(1300)
 	for name, test := range map[string][2]string{
 		"plain text": {
 			"text/plain",
-			padding + "。恭喜中奖，请立即领取现金大奖。",
+			distinctCJKText(1300) + "。恭喜中奖，请立即领取现金大奖。",
 		},
 		"hidden html": {
 			"text/html",
-			"<div style=\"display:none\">" + padding + "</div><p>恭喜中奖，请立即领取现金大奖。</p>",
+			"<div style=\"display:none\">" + distinctCJKText(1300) + "</div><p>恭喜中奖，请立即领取现金大奖。</p>",
+		},
+		"multiple plain-text tokens": {
+			"text/plain",
+			separatedCJKPadding(8, 200) + "。恭喜中奖，请立即领取现金大奖。",
+		},
+		"multiple hidden-html tokens": {
+			"text/html",
+			"<div style=\"display:none\">" + separatedCJKPadding(8, 200) + "</div><p>恭喜中奖，请立即领取现金大奖。</p>",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -156,5 +178,31 @@ func TestGlobalCJKFeaturesCannotBeStarvedByBodyPadding(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBoundedCJKFeaturesRetainsHeadAndTailAtPerTokenLimit(t *testing.T) {
+	text := distinctCJKText(1300)
+	features := boundedCJKFeatures(text, maxCJKFeaturesPerToken, map[string]struct{}{})
+	if len(features) != maxCJKFeaturesPerToken {
+		t.Fatalf("feature count = %d, want %d", len(features), maxCJKFeaturesPerToken)
+	}
+	runes := []rune(text)
+	for _, want := range []string{
+		"cjk:" + string(runes[:2]),
+		"cjk:" + string(runes[:3]),
+		"cjk:" + string(runes[len(runes)-2:]),
+		"cjk:" + string(runes[len(runes)-3:]),
+	} {
+		found := false
+		for _, feature := range features {
+			if feature == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("bounded feature set is missing %q", want)
+		}
 	}
 }

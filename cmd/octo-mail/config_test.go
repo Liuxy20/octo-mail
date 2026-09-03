@@ -122,9 +122,24 @@ func TestSharedJunkThresholdConfig(t *testing.T) {
 		t.Fatalf("default shared junk threshold = %v, want 0.9999", got)
 	}
 
-	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", "0.9995")
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", " 0.9995 ")
 	if got := loadConfig().sharedJunkThreshold; got != 0.9995 {
 		t.Fatalf("configured shared junk threshold = %v, want 0.9995", got)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY", strings.Repeat("k", 32))
+	for _, value := range []string{"invalid", "0", "-0.1", "1.1", "NaN", "+Inf"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", value)
+			if err := validate(loadConfig(), log); err == nil {
+				t.Fatalf("invalid OCTO_MAIL_SHARED_JUNK_THRESHOLD=%q accepted", value)
+			}
+		})
+	}
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", "1")
+	if err := validate(loadConfig(), log); err != nil {
+		t.Fatalf("valid OCTO_MAIL_SHARED_JUNK_THRESHOLD rejected: %v", err)
 	}
 }
 
