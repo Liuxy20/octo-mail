@@ -1,6 +1,6 @@
 # Verification: Shared Junk Baseline and Sender Allowlist
 
-Date: 2026-08-25
+Date: 2026-09-03
 
 ## Scope verified
 
@@ -18,23 +18,26 @@ Date: 2026-08-25
 
 ## Bundled model
 
-- Version: `2026-08-26-v2`
-- Compressed size: 2.5 MiB
-- Training totals: 625 Ham / 1,259 Spam
-- Features: 76,438 SHA-256 identifiers; raw messages are not packaged
+- Version: `2026-09-03-v4`
+- Compressed size: 3.1 MiB
+- Training totals: 7,212 Ham / 7,960 Spam
+- Features: 83,235 deterministic SHA-256 identifiers
 - Package SHA-256:
-  `42ec9fe41331a1357cbff75cde2a9628189054525461437b557ce75e1ce9a086`
-- Original frozen evaluation at threshold `0.9999`: 0/420 Ham false positives
-  and 387/420 Spam detected (92.14%).
-- Short-Chinese regression evaluation: 0/20 collaboration Ham false positives
-  and 18/20 Spam detected. The reported short meeting example is classified as
-  Ham.
-- Expanded stress evaluation: 0/920 Ham false positives and 785/993 Spam
-  detected (79.05%).
+  `5629bc3b5ddb81c499a6f16eed8f53741097d8b2369b970ee09146ec92e50bfe`
+- De-duplicated evaluation matrix at threshold `0.9999`: 2/1,488 Ham false
+  positives (0.13%) and 1,071/1,971 Spam detected (54.34%).
+- Short-Chinese regression: 0/20 Ham false positives and 19/20 Spam detected
+  (95%).
+- The bundled regression panel keeps representative Chinese and English
+  verification, security, billing, HR, IT, collaboration, and delivery mail in
+  Inbox while routing the representative Chinese and English Spam cases to
+  Junk.
+- CJK header-padding regressions: body signals survive distinct identity-header
+  and folded Subject padding. Per-token feature limits also preserve body
+  signals under plain-text and hidden-HTML CJK padding.
 
-The generated model is an ignored internal release input at
-`junkfilter/models/shared-junk-v1.csv.gz`; a release build must place it in the
-build context before compiling.
+The model is bundled at `junkfilter/models/shared-junk-v1.csv.gz` and imported
+only when deployment-wide model storage is empty.
 
 ## Commands
 

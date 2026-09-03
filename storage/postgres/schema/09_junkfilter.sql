@@ -1,7 +1,7 @@
 -- ---------------------------------------------------------------------------
 -- Junk (bayesian spam) filter — deployment baseline and sender allowlist
 -- ---------------------------------------------------------------------------
--- An operator-curated deployment baseline supplies content classification for
+-- A deployment-wide baseline supplies content classification for
 -- every account. Runtime mailbox actions do not train private word statistics.
 -- This state MUST be shared across nodes, so the counts live in PostgreSQL
 -- rather than per-node files.
@@ -24,12 +24,11 @@ CREATE TABLE IF NOT EXISTS junk_totals (
 );
 
 -- The deployment-wide classifier is deliberately not attached to a tenant or
--- to the reserved system account. Its corpus is curated by an operator and is
--- used as a prior for every recipient account. Keeping it in separate tables
+-- to the reserved system account. Its aggregate model is used as a baseline
+-- for every recipient account. Keeping it in separate tables
 -- makes the cross-tenant boundary explicit and prevents account_id=0 or another
 -- magic account from becoming an accidental capability.
--- word is a SHA-256 feature identifier for the global model. This lets the
--- release package carry aggregate counters without readable message tokens.
+-- word is a deterministic SHA-256 feature identifier for the global model.
 CREATE TABLE IF NOT EXISTS junk_global_words (
     word text PRIMARY KEY,
     ham  bigint NOT NULL DEFAULT 0,

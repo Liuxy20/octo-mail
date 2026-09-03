@@ -93,6 +93,9 @@ func checkReporterConfig(cfg config) error {
 // admin listener on a non-loopback address). Called once in run() after the other
 // check* functions. Warnings need the logger; errors abort startup.
 func validate(cfg config, log *slog.Logger) error {
+	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_SHARED_JUNK_ENABLED")); raw != "" && raw != "0" && raw != "1" {
+		return fmt.Errorf("OCTO_MAIL_SHARED_JUNK_ENABLED must be 0 or 1")
+	}
 	if raw := strings.TrimSpace(os.Getenv("OCTO_MAIL_MAX_SIZE")); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -319,6 +322,7 @@ type config struct {
 	maxHops     int // inbound Received-header loop limit (0 = smtpd default)
 	greylist    bool
 
+	sharedJunkEnabled   bool
 	sharedJunkThreshold float64
 
 	// Inbound decision-engine tuning (all optional; zero uses Decider defaults).
@@ -419,6 +423,7 @@ func loadConfig() config {
 		maxHops:     int(envInt64("OCTO_MAIL_MAX_HOPS", 50)),
 		greylist:    os.Getenv("OCTO_MAIL_GREYLIST") == "1",
 
+		sharedJunkEnabled:   envBoolDefault("OCTO_MAIL_SHARED_JUNK_ENABLED", true),
 		sharedJunkThreshold: envFloat("OCTO_MAIL_SHARED_JUNK_THRESHOLD", junkfilter.DefaultSharedThreshold),
 
 		greylistDelay:   envDuration("OCTO_MAIL_GREYLIST_DELAY", 0),
@@ -513,6 +518,14 @@ func envDefault(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBoolDefault(k string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	return v == "1"
 }
 
 // envLower reads an env var and returns it trimmed and lowercased — used for

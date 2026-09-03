@@ -24,3 +24,24 @@ under the terms of the MIT License. See:
 For a full inventory of vendored modules and their licenses, see the license
 files under vendor/ (e.g. `find vendor -iname 'LICENSE*' -o -iname 'NOTICE*'`)
 or run `go mod download -x` / inspect go.mod.
+
+------------------------------------------------------------------------------
+Bundled shared junk model
+------------------------------------------------------------------------------
+
+The default aggregate junk model includes features generated from project-owned
+synthetic messages and these redistributable sources:
+
+- LLM-Generated Phishing Email Dataset, Apache License 2.0
+  https://huggingface.co/datasets/Dizzzy0x00/LLMGen-Phishing-Email-Dataset
+- ActiveCampaign/Postmark Transactional Email Templates, MIT License
+  https://github.com/ActiveCampaign/postmark-templates
+- MailPace templates, MIT License
+  https://github.com/mailpace/templates
+- Mailgun Transactional Email Templates, MIT License
+  https://github.com/mailgun/transactional-email-templates
+- Keycloak Simplified Chinese email messages, Apache License 2.0
+  https://github.com/keycloak/keycloak
+
+The bundled artifact contains aggregate deterministic feature identifiers and
+class counters. It does not include the source messages.

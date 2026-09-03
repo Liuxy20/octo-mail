@@ -8,6 +8,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +16,30 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/junkfilter"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func distinctCJKText(n int) string {
+	runes := make([]rune, n)
+	for i := range runes {
+		runes[i] = rune(0x4e00 + i)
+	}
+	return string(runes)
+}
+
+func foldedCJKSubject(lines, runesPerLine int) string {
+	text := []rune(distinctCJKText(lines * runesPerLine))
+	var b strings.Builder
+	for line := 0; line < lines; line++ {
+		if line == 0 {
+			b.WriteString("Subject: ")
+		} else {
+			b.WriteByte(' ')
+		}
+		start := line * runesPerLine
+		b.WriteString(string(text[start : start+runesPerLine]))
+		b.WriteString("\r\n")
+	}
+	return b.String()
+}
 
 func modelPackage(t *testing.T, version string, hams, spams int64, words map[string][2]int64) []byte {
 	t.Helper()
@@ -359,6 +384,70 @@ func TestGlobalTrainingIsIdempotentAndRelabelable(t *testing.T) {
 	}
 }
 
+func TestGlobalModelExcludesIdentityHeaders(t *testing.T) {
+	ctx := context.Background()
+	pool := openJunkPool(t, ctx)
+	defer pool.Close()
+	mgr := junkfilter.NewManager(pool, junkfilter.DefaultParams)
+
+	raw := []byte("From: globalfrommarker@example.test\r\n" +
+		"To: globaltomarker@example.test\r\n" +
+		"Cc: globalccmarker@example.test\r\n" +
+		"Reply-To: globalreplymarker@example.test\r\n" +
+		"Sender: globalsendermarker@example.test\r\n" +
+		"Return-Path: <globalreturnmarker@example.test>\r\n" +
+		"Subject: globalsubjectmarker\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+		"weekly meeting agenda\r\n")
+	if _, err := mgr.TrainGlobalSample(ctx, "identity-header-sample", true, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, word := range []string{
+		"From:globalfrommarker",
+		"To:globaltomarker",
+		"Cc:globalccmarker",
+		"Reply-To:globalreplymarker",
+		"Sender:globalsendermarker",
+		"Return-Path:globalreturnmarker",
+	} {
+		var count int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM junk_global_words WHERE word=$1`, modelFeature(word)).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("global model stored identity-header feature %q", word)
+		}
+	}
+
+	for _, word := range []string{"Subject:globalsubjectmarker", "meeting"} {
+		var count int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM junk_global_words WHERE word=$1`, modelFeature(word)).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("global model feature %q count = %d, want 1", word, count)
+		}
+	}
+
+	const accountID = int64(77)
+	if err := mgr.Train(ctx, accountID, true, raw); err != nil {
+		t.Fatal(err)
+	}
+	var personalFrom int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM junk_words WHERE account_id=$1 AND word=$2`,
+		accountID, "From:globalfrommarker").Scan(&personalFrom); err != nil {
+		t.Fatal(err)
+	}
+	if personalFrom != 1 {
+		t.Fatalf("legacy personal model From feature count = %d, want 1", personalFrom)
+	}
+}
+
 func TestCJKFeaturesMatchRelatedMessagesAndStayBounded(t *testing.T) {
 	ctx := context.Background()
 	pool := openJunkPool(t, ctx)
@@ -498,6 +587,63 @@ func TestGlobalModelPackageFailureRollsBack(t *testing.T) {
 	}
 }
 
+func TestGlobalModelPackageRejectsRowsBeyondDeclaredLimit(t *testing.T) {
+	ctx := context.Background()
+	pool := openJunkPool(t, ctx)
+	defer pool.Close()
+	mgr := junkfilter.NewManager(pool, junkfilter.DefaultParams)
+
+	// Declare only one row so the early row limit, rather than the final exact-count
+	// check, must reject the package before reading the remaining records.
+	words := make(map[string][2]int64, 1001)
+	for i := 0; i < 1001; i++ {
+		words[modelFeature(fmt.Sprintf("excess-%d", i))] = [2]int64{1, 1}
+	}
+	model := modelPackage(t, "excess", 200, 200, words)
+	zr, err := gzip.NewReader(bytes.NewReader(model))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plain bytes.Buffer
+	if _, err := plain.ReadFrom(zr); err != nil {
+		t.Fatal(err)
+	}
+	if err := zr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader := csv.NewReader(bytes.NewReader(plain.Bytes()))
+	reader.FieldsPerRecord = -1
+	records, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records[0][5] = "1"
+	var encoded bytes.Buffer
+	zw := gzip.NewWriter(&encoded)
+	cw := csv.NewWriter(zw)
+	cw.WriteAll(records)
+	if err := cw.Error(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := mgr.ImportGlobalModelIfEmpty(ctx, bytes.NewReader(encoded.Bytes())); err == nil {
+		t.Fatal("model with excess rows imported")
+	} else if !strings.Contains(err.Error(), "exceeds declared feature count 1") {
+		t.Fatalf("excess-row error = %q, want declared-word limit error", err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT (SELECT count(*) FROM junk_global_words) + (SELECT count(*) FROM junk_global_totals)`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed import left %d shared model rows", count)
+	}
+}
+
 func TestConcurrentGlobalModelBootstrapImportsOnce(t *testing.T) {
 	ctx := context.Background()
 	pool := openJunkPool(t, ctx)
@@ -582,6 +728,24 @@ func TestGlobalModelPackageExportImportRoundTrip(t *testing.T) {
 }
 
 func TestBundledGlobalModelWhenPresent(t *testing.T) {
+	const (
+		wantVersion = "2026-09-03-v4"
+		wantHams    = int64(7212)
+		wantSpams   = int64(7960)
+		wantWords   = int64(83235)
+		wantSHA256  = "5629bc3b5ddb81c499a6f16eed8f53741097d8b2369b970ee09146ec92e50bfe"
+	)
+	model, err := os.ReadFile("models/shared-junk-v1.csv.gz")
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skip("default shared model is not present in this build")
+		}
+		t.Fatal(err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(model)); got != wantSHA256 {
+		t.Fatalf("bundled model SHA-256 = %s, want %s", got, wantSHA256)
+	}
+
 	ctx := context.Background()
 	pool := openJunkPool(t, ctx)
 	defer pool.Close()
@@ -591,11 +755,9 @@ func TestBundledGlobalModelWhenPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Version == "" {
-		t.Skip("private release model is not present in this source checkout")
-	}
-	if !imported || info.Hams < 200 || info.Spams < 200 || info.Words == 0 {
-		t.Fatalf("bundled model import = %v, %#v", imported, info)
+	wantInfo := junkfilter.ModelInfo{Version: wantVersion, Hams: wantHams, Spams: wantSpams, Words: wantWords}
+	if !imported || info != wantInfo {
+		t.Fatalf("bundled model import = %v, %#v; want true, %#v", imported, info, wantInfo)
 	}
 	var readable int
 	if err := pool.QueryRow(ctx,
@@ -603,7 +765,7 @@ func TestBundledGlobalModelWhenPresent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if readable != 0 {
-		t.Fatalf("bundled model contains %d readable feature identifiers", readable)
+		t.Fatalf("bundled model contains %d non-hash feature identifiers", readable)
 	}
 	second, _, err := mgr.BootstrapDefaultModel(ctx)
 	if err != nil {
@@ -612,4 +774,206 @@ func TestBundledGlobalModelWhenPresent(t *testing.T) {
 	if second {
 		t.Fatal("bundled model imported twice")
 	}
+
+	for _, test := range []struct {
+		name string
+		raw  []byte
+		junk bool
+	}{
+		{
+			name: "verification code",
+			raw: []byte("From: alerts@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 登录验证码\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"您的登录验证码为 482915，五分钟内有效。如非本人操作，请忽略本邮件。\r\n"),
+		},
+		{
+			name: "project meeting",
+			raw: []byte("From: colleague@company.example\r\nTo: user@example.net\r\n" +
+				"Subject: 项目周会安排\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"项目周会安排在明天下午三点，请提前阅读需求文档并准备进度说明。\r\n"),
+		},
+		{
+			name: "chinese security review",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 安全检查结果\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"系统发现一次异常登录并完成复核，相关访问来自已登记设备，当前没有需要立即处理的风险。您可自行打开官方应用查看安全记录。\r\n"),
+		},
+		{
+			name: "chinese password changed",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 登录密码修改完成\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"您的账户密码刚刚修改成功，安全日志已经更新。如由本人操作则无需处理；否则请直接通过应用内帮助中心核查。\r\n"),
+		},
+		{
+			name: "chinese payroll",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 本期薪资发放完成\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"本月工资已经完成发放，薪资和代扣明细可在员工自助系统查看。如有疑问，请按照内部流程联系薪酬服务团队。\r\n"),
+		},
+		{
+			name: "chinese billing",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 服务账单与发票通知\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"本期应付费用已经结算，电子账单、付款记录和发票可在官方客户门户查询。本邮件不会要求提供银行卡密码。\r\n"),
+		},
+		{
+			name: "chinese system maintenance",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 系统维护安排\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"信息技术团队将在今晚进行例行维护，部分页面可能短暂不可用。请提前保存工作，维护进度以内网状态页为准。\r\n"),
+		},
+		{
+			name: "chinese order delivery",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: 订单配送进度\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"您的订单已经发货，预计两个工作日内送达。请从订单历史查看物流信息，本通知不要求额外付款。\r\n"),
+		},
+		{
+			name: "password reset",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Password reset requested\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"We received a request to reset your password. Use this secure one-time link within 20 minutes. " +
+				"If you did not request it, ignore this email.\r\n"),
+		},
+		{
+			name: "new sign-in alert",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: New sign-in to your account\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"A new sign-in was detected from a recognized browser. Review account activity in the official application if this was not you.\r\n"),
+		},
+		{
+			name: "one-time code",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Your verification code\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Your one-time verification code is 482915. It expires in five minutes. Never share this code.\r\n"),
+		},
+		{
+			name: "bank statement",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Monthly bank statement available\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Your monthly account statement is ready. Sign in to online banking using your saved bookmark to review it.\r\n"),
+		},
+		{
+			name: "invoice",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Invoice available\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Invoice 10482 for your current subscription is available in the billing portal. Payment is due next Friday.\r\n"),
+		},
+		{
+			name: "payment receipt",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Payment receipt\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"We received your payment. Your receipt and transaction reference are available in your account.\r\n"),
+		},
+		{
+			name: "order shipped",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Order shipped\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Your order has shipped and is expected to arrive Friday. Track the package from your order history.\r\n"),
+		},
+		{
+			name: "payroll update",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Payroll update\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Your salary payment has been processed. The payslip is available in the employee self-service portal.\r\n"),
+		},
+		{
+			name: "medical appointment",
+			raw: []byte("From: notification@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Medical appointment reminder\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"This is a reminder for your appointment tomorrow at 10:30. Reply to the clinic if you need to reschedule.\r\n"),
+		},
+		{
+			name: "api token expiration",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Your API token expires in 14 days\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"The API credential used by the reporting integration expires in fourteen days. " +
+				"Generate a successor in developer settings and rotate the stored deployment credential before that date.\r\n"),
+		},
+		{
+			name: "timesheet reminder",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Reminder: timesheet due today\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Please complete and submit this week's time entry in the employee system by close of business. " +
+				"Check project codes and recorded hours before submitting.\r\n"),
+		},
+		{
+			name: "laptop encryption check",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Scheduled laptop encryption check\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Corporate IT will run the scheduled disk encryption verification tonight. " +
+				"Leave the managed laptop powered on and connected to the company network.\r\n"),
+		},
+		{
+			name: "failed invoice payment",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Payment failed for invoice 88123\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"We were unable to charge the payment method saved for invoice 88123. " +
+				"Review billing settings in the official customer portal or speak with your account manager.\r\n"),
+		},
+		{
+			name: "password changed",
+			raw: []byte("From: notice@service.example\r\nTo: user@example.net\r\n" +
+				"Subject: Password changed successfully\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Your account password was updated successfully. If you performed this change, no further action is necessary. " +
+				"Otherwise contact the official help desk.\r\n"),
+		},
+		{
+			name: "loan and prize spam",
+			raw: []byte("From: offer@random.example\r\nTo: user@example.net\r\n" +
+				"Subject: 中奖奖金 无抵押贷款 娱乐城送彩金\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"恭喜中奖，现金大奖等待领取。无需征信即可办理大额贷款，当天审核立即到账。" +
+				"注册博彩平台领取新人彩金，充值返利，立即扫码付款。请先汇款缴纳税费并发送身份证银行卡密码和短信验证码。\r\n"),
+			junk: true,
+		},
+		{
+			name: "mailbox phishing",
+			raw: []byte("From: security@random.example\r\nTo: user@example.net\r\n" +
+				"Subject: Urgent mailbox suspension and lottery prize\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+				"Your mailbox account will be permanently closed today. Verify your password and banking information " +
+				"through the attached login form immediately. You also won a guaranteed cash jackpot. " +
+				"Pay the processing fee with gift cards or cryptocurrency to claim the prize. Limited offer, act now.\r\n"),
+			junk: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := mgr.ClassifyGlobalDetailed(ctx, test.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Junk != test.junk {
+				t.Fatalf("classification = %#v, want Junk=%v", result, test.junk)
+			}
+		})
+	}
+
+	t.Run("cjk spam with padded identity header", func(t *testing.T) {
+		displayName := distinctCJKText(1300)
+		raw := []byte("From: " + displayName + " <sender@example.test>\r\nTo: user@example.net\r\n" +
+			"Subject: 中奖奖金 无抵押贷款 娱乐城送彩金\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+			"恭喜中奖，现金大奖等待领取。无需征信即可办理大额贷款，当天审核立即到账。" +
+			"注册博彩平台领取新人彩金，充值返利，立即扫码付款。请先汇款缴纳税费并发送银行卡密码和短信验证码。\r\n")
+		result, err := mgr.ClassifyGlobalDetailed(ctx, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Junk {
+			t.Fatalf("classification = %#v, want Junk=true", result)
+		}
+	})
+
+	t.Run("cjk spam with padded folded subject", func(t *testing.T) {
+		raw := []byte("From: offer@random.example\r\nTo: user@example.net\r\n" +
+			foldedCJKSubject(40, 60) +
+			"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+			"恭喜中奖，现金大奖等待领取。无需征信即可办理大额贷款，当天审核立即到账。" +
+			"注册博彩平台领取新人彩金，充值返利，立即扫码付款。请先汇款缴纳税费并发送银行卡密码和短信验证码。\r\n")
+		result, err := mgr.ClassifyGlobalDetailed(ctx, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Junk {
+			t.Fatalf("classification = %#v, want Junk=true", result)
+		}
+	})
 }

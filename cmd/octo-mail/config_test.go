@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -124,6 +125,42 @@ func TestSharedJunkThresholdConfig(t *testing.T) {
 	t.Setenv("OCTO_MAIL_SHARED_JUNK_THRESHOLD", "0.9995")
 	if got := loadConfig().sharedJunkThreshold; got != 0.9995 {
 		t.Fatalf("configured shared junk threshold = %v, want 0.9995", got)
+	}
+}
+
+func TestSharedJunkEnabledConfig(t *testing.T) {
+	for _, test := range []struct {
+		value   string
+		enabled bool
+	}{
+		{value: "", enabled: true},
+		{value: " ", enabled: true},
+		{value: "\t", enabled: true},
+		{value: "\n", enabled: true},
+		{value: "0", enabled: false},
+		{value: " 0", enabled: false},
+		{value: "1", enabled: true},
+		{value: "1 ", enabled: true},
+		{value: "1\r", enabled: true},
+	} {
+		t.Run(strconv.Quote(test.value), func(t *testing.T) {
+			t.Setenv("OCTO_MAIL_SHARED_JUNK_ENABLED", test.value)
+			if got := loadConfig().sharedJunkEnabled; got != test.enabled {
+				t.Fatalf("shared junk enabled = %v, want %v", got, test.enabled)
+			}
+		})
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	t.Setenv("OCTO_MAIL_AUTO_REPLY_CHAIN_KEY", strings.Repeat("k", 32))
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_ENABLED", " ")
+	if err := validate(loadConfig(), log); err != nil {
+		t.Fatalf("whitespace-only OCTO_MAIL_SHARED_JUNK_ENABLED rejected: %v", err)
+	}
+
+	t.Setenv("OCTO_MAIL_SHARED_JUNK_ENABLED", "invalid")
+	if err := validate(loadConfig(), log); err == nil {
+		t.Fatal("invalid OCTO_MAIL_SHARED_JUNK_ENABLED value accepted")
 	}
 }
 

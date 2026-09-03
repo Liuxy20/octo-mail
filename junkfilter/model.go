@@ -24,12 +24,17 @@ const (
 	defaultModelPath = "models/shared-junk-v1.csv.gz"
 )
 
-// modelFiles contains the private release input when the model package is
-// present in the build context. Source checkouts carry only models/README.md;
-// the aggregate model itself is deliberately not committed to the public repo.
+// modelFiles contains files used by the bundled default model.
 //
 //go:embed models
 var modelFiles embed.FS
+
+// HasBundledDefaultModel reports whether this build contains the optional
+// default shared-model package.
+func HasBundledDefaultModel() bool {
+	_, err := fs.Stat(modelFiles, defaultModelPath)
+	return err == nil
+}
 
 // ModelInfo describes a portable shared Bayesian model package.
 type ModelInfo struct {
@@ -42,7 +47,14 @@ type ModelInfo struct {
 // BootstrapDefaultModel imports the model shipped with the binary when the
 // deployment-wide model is empty. Existing operator training always wins.
 func (m *Manager) BootstrapDefaultModel(ctx context.Context) (bool, ModelInfo, error) {
-	model, err := modelFiles.Open(defaultModelPath)
+	if !m.SharedEnabled {
+		return false, ModelInfo{}, nil
+	}
+	return m.bootstrapDefaultModel(ctx, modelFiles)
+}
+
+func (m *Manager) bootstrapDefaultModel(ctx context.Context, files fs.FS) (bool, ModelInfo, error) {
+	model, err := files.Open(defaultModelPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, ModelInfo{}, nil
 	}
@@ -112,6 +124,9 @@ func (m *Manager) ImportGlobalModelIfEmpty(ctx context.Context, r io.Reader) (im
 			}
 			if err != nil {
 				return fmt.Errorf("read shared junk model row %d: %w", rows+1, err)
+			}
+			if rows >= info.Words {
+				return fmt.Errorf("shared junk model exceeds declared feature count %d", info.Words)
 			}
 			if len(record) != 3 || !validModelFeature(record[0]) {
 				return fmt.Errorf("invalid shared junk model row %d", rows+1)

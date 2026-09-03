@@ -158,15 +158,24 @@ func run() error {
 	// opening listeners. A malformed release package then fails startup cleanly
 	// without leaving a coordinator waiting on the pool during deferred Close.
 	junkMgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams)
+	junkMgr.SharedEnabled = cfg.sharedJunkEnabled
 	junkMgr.SharedThreshold = cfg.sharedJunkThreshold
 	defer junkMgr.Close()
-	imported, modelInfo, err := junkMgr.BootstrapDefaultModel(ctx)
-	if err != nil {
-		return fmt.Errorf("bootstrap default junk model: %w", err)
-	}
-	if imported {
-		log.Info("default shared junk model imported", "version", modelInfo.Version,
-			"ham", modelInfo.Hams, "spam", modelInfo.Spams, "words", modelInfo.Words)
+	if !cfg.sharedJunkEnabled {
+		log.InfoContext(ctx, "shared Bayesian junk classification disabled")
+	} else if !junkfilter.HasBundledDefaultModel() {
+		log.InfoContext(ctx, "default shared junk model not bundled")
+	} else {
+		imported, modelInfo, err := junkMgr.BootstrapDefaultModel(ctx)
+		if err != nil {
+			return fmt.Errorf("bootstrap default junk model: %w", err)
+		}
+		if imported {
+			log.InfoContext(ctx, "default shared junk model imported", "version", modelInfo.Version,
+				"ham", modelInfo.Hams, "spam", modelInfo.Spams, "words", modelInfo.Words)
+		} else {
+			log.InfoContext(ctx, "default shared junk model not imported", "reason", "shared model already populated")
+		}
 	}
 
 	if err := s.StartCoordinator(ctx); err != nil {

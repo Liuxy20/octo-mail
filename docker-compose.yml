@@ -69,6 +69,8 @@ services:
       OCTO_MAIL_S3_FORCE_PATH_STYLE: "${OCTO_MAIL_S3_FORCE_PATH_STYLE:-1}"
       OCTO_MAIL_S3_ACCESS: "minioadmin"
       OCTO_MAIL_S3_SECRET: "minioadmin"
+      OCTO_MAIL_SHARED_JUNK_ENABLED: "${OCTO_MAIL_SHARED_JUNK_ENABLED:-1}"
+      OCTO_MAIL_SHARED_JUNK_THRESHOLD: "${OCTO_MAIL_SHARED_JUNK_THRESHOLD:-0.9999}"
       # Listen addresses (container-internal; mapped below).
       OCTO_MAIL_SMTP_ADDR: ":25"
       OCTO_MAIL_SUBMISSION_ADDR: ":587"

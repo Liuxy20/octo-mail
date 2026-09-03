@@ -1,5 +1,5 @@
 // Package junkfilter is octo-mail's deployment-wide Bayesian spam classifier.
-// Operator-curated aggregate statistics provide the same reviewed baseline to
+// Deployment-wide aggregate statistics provide the same reviewed baseline to
 // every account. Runtime mailbox actions do not train account-local content
 // models. Shared statistics live in PostgreSQL so every stateless node observes
 // the same model. The message tokenizer is reused from the junk library; only
@@ -49,11 +49,25 @@ const (
 	// two similar Chinese messages can match without adopting Rspamd's ~5x OSB
 	// token expansion for every language.
 	maxCJKFeatures = 2048
+	// Bound each source token independently as well. A single sender-controlled
+	// CJK run (including hidden HTML text) must not consume the whole message
+	// budget before the remaining body tokens are considered.
+	maxCJKFeaturesPerToken = 256
 	// DefaultSharedThreshold is deliberately conservative because one false
 	// positive affects every mailbox in the deployment. Operators may tune this
 	// after evaluating a frozen, representative holdout set.
 	DefaultSharedThreshold = 0.9999
 )
+
+var globalIdentityHeaderPrefixes = [...]string{
+	"From:",
+	"To:",
+	"Cc:",
+	"Bcc:",
+	"Reply-To:",
+	"Sender:",
+	"Return-Path:",
+}
 
 type wordCount struct {
 	ham  float64
@@ -86,6 +100,7 @@ type GlobalStats struct {
 type Manager struct {
 	Pool            *pgxpool.Pool
 	Params          junk.Params
+	SharedEnabled   bool    // whether deployment-wide Bayesian classification is active
 	SharedThreshold float64 // shared-only probability >= SharedThreshold is junk
 
 	log mlog.Log
@@ -96,6 +111,7 @@ func NewManager(pool *pgxpool.Pool, params junk.Params) *Manager {
 	return &Manager{
 		Pool:            pool,
 		Params:          params,
+		SharedEnabled:   true,
 		SharedThreshold: DefaultSharedThreshold,
 		log:             mlog.New("junkfilter", slog.Default()),
 	}
@@ -107,6 +123,15 @@ func NewManager(pool *pgxpool.Pool, params junk.Params) *Manager {
 // badContentType reports the junk-library signal that the message's Content-Type
 // is malformed — a strong spam indicator the caller treats as certain-spam.
 func (m *Manager) tokenize(raw []byte) (words map[string]struct{}, badContentType bool, err error) {
+	words, badContentType, err = m.tokenizeBase(raw)
+	if err != nil || badContentType {
+		return words, badContentType, err
+	}
+	addCJKFeatures(words)
+	return words, false, nil
+}
+
+func (m *Manager) tokenizeBase(raw []byte) (words map[string]struct{}, badContentType bool, err error) {
 	f := &junk.Filter{Params: m.Params}
 	part, perr := message.EnsurePart(m.log.Logger, false, bytes.NewReader(raw), int64(len(raw)))
 	if perr != nil && errors.Is(perr, message.ErrBadContentType) {
@@ -119,8 +144,26 @@ func (m *Manager) tokenize(raw []byte) (words map[string]struct{}, badContentTyp
 	if terr != nil {
 		return map[string]struct{}{}, false, nil
 	}
-	addCJKFeatures(w)
 	return w, false, nil
+}
+
+// tokenizeGlobal excludes sender and recipient identity headers from the
+// deployment-wide model. Subject and message-content features remain eligible.
+func (m *Manager) tokenizeGlobal(raw []byte) (words map[string]struct{}, badContentType bool, err error) {
+	words, badContentType, err = m.tokenizeBase(raw)
+	if err != nil || badContentType {
+		return words, badContentType, err
+	}
+	for word := range words {
+		for _, prefix := range globalIdentityHeaderPrefixes {
+			if strings.HasPrefix(word, prefix) {
+				delete(words, word)
+				break
+			}
+		}
+	}
+	addCJKFeatures(words)
+	return words, false, nil
 }
 
 // addCJKFeatures augments Mox's tokens with adjacent CJK rune pairs/triples.
@@ -132,26 +175,67 @@ func addCJKFeatures(words map[string]struct{}) {
 	for word := range words {
 		original = append(original, word)
 	}
-	// Map iteration order is randomized. Keep the capped feature set stable so
-	// training and later classification of the same message cannot select
-	// different CJK features merely because they ran at different times.
-	sort.Strings(original)
+	// Map iteration order is randomized. Keep the capped feature set stable and
+	// process message-content tokens before Subject tokens. A sender-controlled,
+	// folded Subject must not consume the shared budget before body signals.
+	sort.Slice(original, func(i, j int) bool {
+		iSubject := strings.HasPrefix(original[i], "Subject:")
+		jSubject := strings.HasPrefix(original[j], "Subject:")
+		if iSubject != jSubject {
+			return !iSubject
+		}
+		return original[i] < original[j]
+	})
 	added := 0
 	for _, word := range original {
+		if added >= maxCJKFeatures {
+			return
+		}
 		prefix, text := "", word
 		if i := strings.IndexByte(word, ':'); i > 0 {
 			prefix, text = word[:i+1], word[i+1:]
 		}
-		// Keep only the last three CJK runes. A maliciously long unbroken CJK
-		// token must not allocate a second rune slice proportional to its size.
+		// Keep only the last three CJK runes while scanning. A maliciously long
+		// unbroken token must not allocate a second rune slice proportional to its
+		// size. Retain features from both ends of an overlong token so prefix or
+		// hidden-HTML padding cannot discard all of the real text that follows.
 		run := make([]rune, 0, 3)
-		add := func(feature string) bool {
+		half := maxCJKFeaturesPerToken / 2
+		var head, tail []string
+		var headSet, tailSet map[string]struct{}
+		tailNext := 0
+		collect := func(feature string) {
 			if _, exists := words[feature]; exists {
-				return true
+				return
 			}
-			words[feature] = struct{}{}
-			added++
-			return added < maxCJKFeatures
+			if head == nil {
+				head = make([]string, 0, half)
+				headSet = make(map[string]struct{}, half)
+			}
+			if _, exists := headSet[feature]; exists {
+				return
+			}
+			if len(head) < half {
+				head = append(head, feature)
+				headSet[feature] = struct{}{}
+				return
+			}
+			if _, exists := tailSet[feature]; exists {
+				return
+			}
+			if tail == nil {
+				tail = make([]string, 0, half)
+				tailSet = make(map[string]struct{}, half)
+			}
+			if len(tail) < half {
+				tail = append(tail, feature)
+				tailSet[feature] = struct{}{}
+				return
+			}
+			delete(tailSet, tail[tailNext])
+			tail[tailNext] = feature
+			tailSet[feature] = struct{}{}
+			tailNext = (tailNext + 1) % half
 		}
 		for _, r := range text {
 			if !isCJK(r) {
@@ -159,15 +243,30 @@ func addCJKFeatures(words map[string]struct{}) {
 				continue
 			}
 			run = append(run, r)
-			if len(run) >= 2 && !add(prefix+"cjk:"+string(run[len(run)-2:])) {
-				return
+			if len(run) >= 2 {
+				collect(prefix + "cjk:" + string(run[len(run)-2:]))
 			}
 			if len(run) >= 3 {
-				if !add(prefix + "cjk:" + string(run[len(run)-3:])) {
-					return
-				}
+				collect(prefix + "cjk:" + string(run[len(run)-3:]))
 				run = run[len(run)-2:]
 			}
+		}
+		selected := head
+		if len(tail) == half {
+			selected = append(selected, tail[tailNext:]...)
+			selected = append(selected, tail[:tailNext]...)
+		} else {
+			selected = append(selected, tail...)
+		}
+		for _, feature := range selected {
+			if added >= maxCJKFeatures {
+				return
+			}
+			if _, exists := words[feature]; exists {
+				continue
+			}
+			words[feature] = struct{}{}
+			added++
 		}
 	}
 }
@@ -197,12 +296,21 @@ func (m *Manager) ClassifyDetailed(ctx context.Context, _ int64, raw []byte) (Cl
 // only chooses Inbox versus Junk; malformed Content-Type remains the existing
 // parser signal but does not gain reject authority.
 func (m *Manager) ClassifyGlobalDetailed(ctx context.Context, raw []byte) (Classification, error) {
-	words, badCT, err := m.tokenize(raw)
+	if !m.SharedEnabled {
+		return Classification{Probability: 0.5}, nil
+	}
+	words, badCT, err := m.tokenizeGlobal(raw)
 	if err != nil {
 		return Classification{}, err
 	}
 	if badCT {
 		return Classification{Probability: 1, Significant: true, Junk: true}, nil
+	}
+	// A malformed message can leave the best-effort parser with no usable
+	// features. Treat that as an explicit non-result instead of reporting a
+	// significant neutral classification. Delivery remains fail-open to Inbox.
+	if len(words) == 0 {
+		return Classification{Probability: 0.5}, nil
 	}
 	global, err := m.loadGlobal(ctx, words)
 	if err != nil {
@@ -246,7 +354,7 @@ func (m *Manager) GlobalStats(ctx context.Context) (GlobalStats, error) {
 	if err != nil {
 		return GlobalStats{}, err
 	}
-	stats.Active = stats.Hams >= globalMinClassLearns && stats.Spams >= globalMinClassLearns
+	stats.Active = m.SharedEnabled && stats.Hams >= globalMinClassLearns && stats.Spams >= globalMinClassLearns
 	return stats, nil
 }
 
@@ -262,9 +370,8 @@ func (m *Manager) loadGlobal(ctx context.Context, words map[string]struct{}) (co
 		return corpus{}, err
 	}
 	result.hams, result.spams = float64(hams), float64(spams)
-	// The bundled model stores only hashed feature identifiers, not readable
-	// snippets from training email. Keep the original token as the in-memory key
-	// because probability() iterates the message's original token set.
+	// Stored global features use deterministic hashes. Keep the original token as
+	// the in-memory key because probability() iterates the message token set.
 	wl := make([]string, 0, len(words))
 	originalByFeature := make(map[string]string, len(words))
 	for word := range words {
@@ -481,7 +588,7 @@ func (m *Manager) TrainGlobalSample(ctx context.Context, sampleID string, ham bo
 	if strings.TrimSpace(sampleID) == "" {
 		return false, errors.New("global junk training requires a sample id")
 	}
-	words, badCT, err := m.tokenize(raw)
+	words, badCT, err := m.tokenizeGlobal(raw)
 	if err != nil {
 		return false, err
 	}
